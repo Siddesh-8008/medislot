@@ -22,6 +22,8 @@ env:
   AWS_REGION: ap-south-1
   ENVIRONMENT: dev
   NETWORK_STACK_NAME: medislot-dev-network
+  IAM_STACK_NAME: medislot-dev-iam
+  DATA_STACK_NAME: medislot-dev-data
 
 jobs:
   deploy-network:
@@ -38,108 +40,278 @@ jobs:
           role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Create CloudFormation Change Set
-        id: changeset
+      - name: Deploy network stack using Change Set
         shell: bash
         run: |
           set -euo pipefail
 
           TEMPLATE="cloudformation/network-stack.yaml"
-          CHANGE_SET_NAME="medislot-network-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          STACK="$NETWORK_STACK_NAME"
+          CHANGE_SET="medislot-network-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
 
-          if [[ ! -f "$TEMPLATE" ]]; then
-            echo "Template not found: $TEMPLATE"
-            echo "Check that network-stack.yaml is saved in cloudformation/."
+          test -f "$TEMPLATE" || {
+            echo "Missing template: $TEMPLATE"
             exit 1
-          fi
+          }
 
           if aws cloudformation describe-stacks \
-            --stack-name "$NETWORK_STACK_NAME" \
-            --region "$AWS_REGION" >/dev/null 2>&1; then
-            CHANGE_SET_TYPE="UPDATE"
+            --stack-name "$STACK" --region "$AWS_REGION" >/dev/null 2>&1; then
+            TYPE=UPDATE
           else
-            CHANGE_SET_TYPE="CREATE"
+            TYPE=CREATE
           fi
 
-          echo "change_set_name=$CHANGE_SET_NAME" >> "$GITHUB_OUTPUT"
-          echo "change_set_type=$CHANGE_SET_TYPE" >> "$GITHUB_OUTPUT"
-
           aws cloudformation create-change-set \
-            --stack-name "$NETWORK_STACK_NAME" \
+            --stack-name "$STACK" \
             --template-body "file://$TEMPLATE" \
-            --parameters \
-              "ParameterKey=Environment,ParameterValue=$ENVIRONMENT" \
+            --parameters "ParameterKey=Environment,ParameterValue=$ENVIRONMENT" \
+            --change-set-name "$CHANGE_SET" \
+            --change-set-type "$TYPE" \
             --capabilities CAPABILITY_NAMED_IAM \
-            --change-set-name "$CHANGE_SET_NAME" \
-            --change-set-type "$CHANGE_SET_TYPE" \
-            --description "MediSlot network deployment from GitHub Actions" \
             --region "$AWS_REGION"
 
-          aws cloudformation wait change-set-create-complete \
-            --stack-name "$NETWORK_STACK_NAME" \
-            --change-set-name "$CHANGE_SET_NAME" \
-            --region "$AWS_REGION" || true
-
-          aws cloudformation describe-change-set \
-            --stack-name "$NETWORK_STACK_NAME" \
-            --change-set-name "$CHANGE_SET_NAME" \
-            --region "$AWS_REGION" \
-            --query '{Status:Status,ExecutionStatus:ExecutionStatus,Reason:StatusReason,Changes:Changes[*].ResourceChange.{Action:Action,LogicalResourceId:LogicalResourceId,ResourceType:ResourceType}}' \
-            --output json
-
-      - name: Execute CloudFormation Change Set
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          CHANGE_SET_NAME="${{ steps.changeset.outputs.change_set_name }}"
-
-          STATUS=$(aws cloudformation describe-change-set \
-            --stack-name "$NETWORK_STACK_NAME" \
-            --change-set-name "$CHANGE_SET_NAME" \
-            --region "$AWS_REGION" \
-            --query 'Status' \
-            --output text)
-
-          if [[ "$STATUS" != "CREATE_COMPLETE" ]]; then
+          if ! aws cloudformation wait change-set-create-complete \
+            --stack-name "$STACK" \
+            --change-set-name "$CHANGE_SET" \
+            --region "$AWS_REGION"; then
             REASON=$(aws cloudformation describe-change-set \
-              --stack-name "$NETWORK_STACK_NAME" \
-              --change-set-name "$CHANGE_SET_NAME" \
+              --stack-name "$STACK" \
+              --change-set-name "$CHANGE_SET" \
               --region "$AWS_REGION" \
-              --query 'StatusReason' \
-              --output text)
+              --query StatusReason --output text 2>/dev/null || true)
 
-            if [[ "$REASON" == *"didn't contain changes"* || "$REASON" == *"No updates are to be performed"* ]]; then
-              echo "No infrastructure changes detected. Nothing to deploy."
+            if [[ "$REASON" == *"didn't contain changes"* || \
+                  "$REASON" == *"No updates are to be performed"* ]]; then
+              echo "No network changes to deploy."
               exit 0
             fi
 
-            echo "Change Set creation failed: $REASON"
+            echo "Network Change Set failed: $REASON"
             exit 1
           fi
 
+          aws cloudformation describe-change-set \
+            --stack-name "$STACK" --change-set-name "$CHANGE_SET" \
+            --region "$AWS_REGION" \
+            --query 'Changes[*].ResourceChange.{Action:Action,Type:ResourceType,Id:LogicalResourceId}' \
+            --output table
+
           aws cloudformation execute-change-set \
-            --stack-name "$NETWORK_STACK_NAME" \
-            --change-set-name "$CHANGE_SET_NAME" \
+            --stack-name "$STACK" --change-set-name "$CHANGE_SET" \
             --region "$AWS_REGION"
 
-          if [[ "${{ steps.changeset.outputs.change_set_type }}" == "CREATE" ]]; then
+          if [[ "$TYPE" == CREATE ]]; then
             aws cloudformation wait stack-create-complete \
-              --stack-name "$NETWORK_STACK_NAME" \
-              --region "$AWS_REGION"
+              --stack-name "$STACK" --region "$AWS_REGION"
           else
             aws cloudformation wait stack-update-complete \
-              --stack-name "$NETWORK_STACK_NAME" \
-              --region "$AWS_REGION"
+              --stack-name "$STACK" --region "$AWS_REGION"
           fi
 
-      - name: Display network stack outputs
-        if: success()
-        shell: bash
+      - name: Show network stack outputs
         run: |
           aws cloudformation describe-stacks \
             --stack-name "$NETWORK_STACK_NAME" \
             --region "$AWS_REGION" \
             --query 'Stacks[0].Outputs[*].[OutputKey,OutputValue]' \
             --output table
-#
+
+  deploy-iam:
+    name: Deploy IAM Stack
+    needs: deploy-network
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials using OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy IAM stack using Change Set
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TEMPLATE="cloudformation/iam-stack.yaml"
+          STACK="$IAM_STACK_NAME"
+          CHANGE_SET="medislot-iam-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+          test -f "$TEMPLATE" || {
+            echo "Missing template: $TEMPLATE"
+            exit 1
+          }
+
+          if aws cloudformation describe-stacks \
+            --stack-name "$STACK" --region "$AWS_REGION" >/dev/null 2>&1; then
+            TYPE=UPDATE
+          else
+            TYPE=CREATE
+          fi
+
+          aws cloudformation create-change-set \
+            --stack-name "$STACK" \
+            --template-body "file://$TEMPLATE" \
+            --parameters "ParameterKey=Environment,ParameterValue=$ENVIRONMENT" \
+            --change-set-name "$CHANGE_SET" \
+            --change-set-type "$TYPE" \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --region "$AWS_REGION"
+
+          if ! aws cloudformation wait change-set-create-complete \
+            --stack-name "$STACK" --change-set-name "$CHANGE_SET" \
+            --region "$AWS_REGION"; then
+            REASON=$(aws cloudformation describe-change-set \
+              --stack-name "$STACK" --change-set-name "$CHANGE_SET" \
+              --region "$AWS_REGION" \
+              --query StatusReason --output text 2>/dev/null || true)
+
+            if [[ "$REASON" == *"didn't contain changes"* || \
+                  "$REASON" == *"No updates are to be performed"* ]]; then
+              echo "No IAM changes to deploy."
+              exit 0
+            fi
+
+            echo "IAM Change Set failed: $REASON"
+            exit 1
+          fi
+
+          aws cloudformation describe-change-set \
+            --stack-name "$STACK" --change-set-name "$CHANGE_SET" \
+            --region "$AWS_REGION" \
+            --query 'Changes[*].ResourceChange.{Action:Action,Type:ResourceType,Id:LogicalResourceId}' \
+            --output table
+
+          aws cloudformation execute-change-set \
+            --stack-name "$STACK" --change-set-name "$CHANGE_SET" \
+            --region "$AWS_REGION"
+
+          if [[ "$TYPE" == CREATE ]]; then
+            aws cloudformation wait stack-create-complete \
+              --stack-name "$STACK" --region "$AWS_REGION"
+          else
+            aws cloudformation wait stack-update-complete \
+              --stack-name "$STACK" --region "$AWS_REGION"
+          fi
+
+      - name: Show IAM stack outputs
+        run: |
+          aws cloudformation describe-stacks \
+            --stack-name "$IAM_STACK_NAME" \
+            --region "$AWS_REGION" \
+            --query 'Stacks[0].Outputs[*].[OutputKey,OutputValue]' \
+            --output table
+
+  deploy-data:
+    name: Deploy Data Stack
+    needs:
+      - deploy-network
+      - deploy-iam
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials using OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Check database password secret
+        shell: bash
+        env:
+          DB_MASTER_PASSWORD: ${{ secrets.DB_MASTER_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$DB_MASTER_PASSWORD" ]]; then
+            echo "GitHub Secret DB_MASTER_PASSWORD is missing."
+            exit 1
+          fi
+          if [[ ${#DB_MASTER_PASSWORD} -lt 12 ]]; then
+            echo "DB_MASTER_PASSWORD must contain at least 12 characters."
+            exit 1
+          fi
+
+      - name: Deploy data stack using Change Set
+        shell: bash
+        env:
+          DB_MASTER_PASSWORD: ${{ secrets.DB_MASTER_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          TEMPLATE="cloudformation/data-stack.yaml"
+          STACK="$DATA_STACK_NAME"
+          CHANGE_SET="medislot-data-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+          test -f "$TEMPLATE" || {
+            echo "Missing template: $TEMPLATE"
+            exit 1
+          }
+
+          if aws cloudformation describe-stacks \
+            --stack-name "$STACK" --region "$AWS_REGION" >/dev/null 2>&1; then
+            TYPE=UPDATE
+          else
+            TYPE=CREATE
+          fi
+
+          aws cloudformation create-change-set \
+            --stack-name "$STACK" \
+            --template-body "file://$TEMPLATE" \
+            --parameters \
+              "ParameterKey=Environment,ParameterValue=$ENVIRONMENT" \
+              "ParameterKey=DBMasterUsername,ParameterValue=medislotadmin" \
+              "ParameterKey=DBMasterPassword,ParameterValue=$DB_MASTER_PASSWORD,UsePreviousValue=false" \
+            --change-set-name "$CHANGE_SET" \
+            --change-set-type "$TYPE" \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --region "$AWS_REGION"
+
+          if ! aws cloudformation wait change-set-create-complete \
+            --stack-name "$STACK" --change-set-name "$CHANGE_SET" \
+            --region "$AWS_REGION"; then
+            REASON=$(aws cloudformation describe-change-set \
+              --stack-name "$STACK" --change-set-name "$CHANGE_SET" \
+              --region "$AWS_REGION" \
+              --query StatusReason --output text 2>/dev/null || true)
+
+            if [[ "$REASON" == *"didn't contain changes"* || \
+                  "$REASON" == *"No updates are to be performed"* ]]; then
+              echo "No data changes to deploy."
+              exit 0
+            fi
+
+            echo "Data Change Set failed: $REASON"
+            exit 1
+          fi
+
+          aws cloudformation describe-change-set \
+            --stack-name "$STACK" --change-set-name "$CHANGE_SET" \
+            --region "$AWS_REGION" \
+            --query 'Changes[*].ResourceChange.{Action:Action,Type:ResourceType,Id:LogicalResourceId}' \
+            --output table
+
+          aws cloudformation execute-change-set \
+            --stack-name "$STACK" --change-set-name "$CHANGE_SET" \
+            --region "$AWS_REGION"
+
+          if [[ "$TYPE" == CREATE ]]; then
+            aws cloudformation wait stack-create-complete \
+              --stack-name "$STACK" --region "$AWS_REGION"
+          else
+            aws cloudformation wait stack-update-complete \
+              --stack-name "$STACK" --region "$AWS_REGION"
+          fi
+
+      - name: Show data stack outputs
+        run: |
+          aws cloudformation describe-stacks \
+            --stack-name "$DATA_STACK_NAME" \
+            --region "$AWS_REGION" \
+            --query 'Stacks[0].Outputs[*].[OutputKey,OutputValue]' \
+            --output table

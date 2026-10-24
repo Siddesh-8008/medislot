@@ -1,0 +1,313 @@
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  MediSlot data infrastructure including private RDS MySQL,
+  DynamoDB tables for booking coordination and authentication,
+  and private S3 buckets.
+
+Parameters:
+  Environment:
+    Type: String
+    AllowedValues:
+      - dev
+      - test
+      - prod
+    Default: dev
+
+  DBMasterUsername:
+    Type: String
+    Default: medislotadmin
+    MinLength: 1
+    MaxLength: 16
+    AllowedPattern: '[a-zA-Z][a-zA-Z0-9]*'
+    Description: RDS master username. Do not use this account for application queries.
+
+  DBMasterPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 12
+    MaxLength: 41
+    Description: Supply securely through the deployment workflow; never commit the value.
+
+Resources:
+  # -----------------------------
+  # RDS MySQL
+  # -----------------------------
+  DatabaseSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: MediSlot private database subnets
+      SubnetIds:
+        - Fn::ImportValue:
+            Fn::Sub: MediSlot-${Environment}-PrivateSubnet1Id
+        - Fn::ImportValue:
+            Fn::Sub: MediSlot-${Environment}-PrivateSubnet2Id
+      Tags:
+        - Key: Project
+          Value: MediSlot
+        - Key: Environment
+          Value: !Ref Environment
+
+  MediSlotDatabase:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: !Sub medislot-${Environment}-mysql
+      Engine: mysql
+      DBInstanceClass: db.t3.micro
+      AllocatedStorage: 20
+      StorageType: gp3
+      StorageEncrypted: true
+      DBName: medislot
+      MasterUsername: !Ref DBMasterUsername
+      MasterUserPassword: !Ref DBMasterPassword
+      DBSubnetGroupName: !Ref DatabaseSubnetGroup
+      VPCSecurityGroups:
+        - Fn::ImportValue:
+            Fn::Sub: MediSlot-${Environment}-DatabaseSecurityGroupId
+      PubliclyAccessible: false
+      MultiAZ: false
+      BackupRetentionPeriod: 1
+      AutoMinorVersionUpgrade: true
+      DeletionProtection: !If
+        - IsProduction
+        - true
+        - false
+      Tags:
+        - Key: Project
+          Value: MediSlot
+        - Key: Environment
+          Value: !Ref Environment
+
+  # -----------------------------
+  # DynamoDB: seat-level booking
+  # -----------------------------
+  AppointmentSlotsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub medislot-${Environment}-appointment-slots
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: SlotSeatId
+          AttributeType: S
+        - AttributeName: OfferStatus
+          AttributeType: S
+        - AttributeName: OfferExpiresAt
+          AttributeType: N
+      KeySchema:
+        - AttributeName: SlotSeatId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: OfferExpiryIndex
+          KeySchema:
+            - AttributeName: OfferStatus
+              KeyType: HASH
+            - AttributeName: OfferExpiresAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Project
+          Value: MediSlot
+        - Key: Environment
+          Value: !Ref Environment
+
+  # -----------------------------
+  # DynamoDB: patient waitlist
+  # -----------------------------
+  WaitlistTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub medislot-${Environment}-waitlist
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: SlotSeatId
+          AttributeType: S
+        - AttributeName: JoinedAtPatientId
+          AttributeType: S
+        - AttributeName: PatientId
+          AttributeType: S
+        - AttributeName: CreatedAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: SlotSeatId
+          KeyType: HASH
+        - AttributeName: JoinedAtPatientId
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: PatientWaitlistIndex
+          KeySchema:
+            - AttributeName: PatientId
+              KeyType: HASH
+            - AttributeName: CreatedAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Project
+          Value: MediSlot
+        - Key: Environment
+          Value: !Ref Environment
+
+  # -----------------------------
+  # DynamoDB: refresh-token records
+  # -----------------------------
+  RefreshTokensTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub medislot-${Environment}-refresh-tokens
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: UserId
+          AttributeType: S
+        - AttributeName: TokenId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: UserId
+          KeyType: HASH
+        - AttributeName: TokenId
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ExpiresAtEpoch
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Project
+          Value: MediSlot
+        - Key: Environment
+          Value: !Ref Environment
+
+  # -----------------------------
+  # DynamoDB: notification deduplication
+  # -----------------------------
+  NotificationDispatchLogTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub medislot-${Environment}-notification-dispatch-log
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: DispatchId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: DispatchId
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ExpiresAtEpoch
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Project
+          Value: MediSlot
+        - Key: Environment
+          Value: !Ref Environment
+
+  # -----------------------------
+  # S3: doctor photos
+  # -----------------------------
+  DoctorPhotosBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub medislot-${Environment}-doctor-photos-${AWS::AccountId}-${AWS::Region}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      Tags:
+        - Key: Project
+          Value: MediSlot
+        - Key: Environment
+          Value: !Ref Environment
+
+  # -----------------------------
+  # S3: Lambda deployment artifacts
+  # -----------------------------
+  LambdaArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub medislot-${Environment}-lambda-artifacts-${AWS::AccountId}-${AWS::Region}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      Tags:
+        - Key: Project
+          Value: MediSlot
+        - Key: Environment
+          Value: !Ref Environment
+
+Conditions:
+  IsProduction: !Equals
+    - !Ref Environment
+    - prod
+
+Outputs:
+  DatabaseEndpoint:
+    Description: RDS MySQL endpoint hostname
+    Value: !GetAtt MediSlotDatabase.Endpoint.Address
+    Export:
+      Name: !Sub MediSlot-${Environment}-DatabaseEndpoint
+
+  DatabasePort:
+    Description: RDS MySQL port
+    Value: !GetAtt MediSlotDatabase.Endpoint.Port
+    Export:
+      Name: !Sub MediSlot-${Environment}-DatabasePort
+
+  DatabaseName:
+    Description: Application database name
+    Value: medislot
+    Export:
+      Name: !Sub MediSlot-${Environment}-DatabaseName
+
+  AppointmentSlotsTableName:
+    Value: !Ref AppointmentSlotsTable
+    Export:
+      Name: !Sub MediSlot-${Environment}-AppointmentSlotsTableName
+
+  WaitlistTableName:
+    Value: !Ref WaitlistTable
+    Export:
+      Name: !Sub MediSlot-${Environment}-WaitlistTableName
+
+  RefreshTokensTableName:
+    Value: !Ref RefreshTokensTable
+    Export:
+      Name: !Sub MediSlot-${Environment}-RefreshTokensTableName
+
+  NotificationDispatchLogTableName:
+    Value: !Ref NotificationDispatchLogTable
+    Export:
+      Name: !Sub MediSlot-${Environment}-NotificationDispatchLogTableName
+
+  DoctorPhotosBucketName:
+    Value: !Ref DoctorPhotosBucket
+    Export:
+      Name: !Sub MediSlot-${Environment}-DoctorPhotosBucketName
+
+  LambdaArtifactsBucketName:
+    Value: !Ref LambdaArtifactsBucket
+    Export:
+      Name: !Sub MediSlot-${Environment}-LambdaArtifactsBucketName

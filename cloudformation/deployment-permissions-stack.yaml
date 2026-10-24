@@ -1,0 +1,45 @@
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  MediSlot deployment permissions managed as infrastructure code.
+  Grants the GitHub Actions role permission to manage CloudFormation
+  Change Sets and inspect stack deployment status.
+
+Parameters:
+  GitHubActionsRoleName:
+    Type: String
+    Default: MediSlotGitHubActionsRole
+    Description: Existing IAM role assumed by GitHub Actions through OIDC.
+
+Resources:
+  GitHubActionsCloudFormationPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: MediSlotCloudFormationDeploymentPolicy
+      Roles:
+        - !Ref GitHubActionsRoleName
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: ManageMediSlotCloudFormationStacks
+            Effect: Allow
+            Action:
+              - cloudformation:CreateChangeSet
+              - cloudformation:DescribeChangeSet
+              - cloudformation:ExecuteChangeSet
+              - cloudformation:DeleteChangeSet
+              - cloudformation:DescribeStacks
+              - cloudformation:DescribeStackEvents
+              - cloudformation:DescribeStackResources
+              - cloudformation:ListStackResources
+              - cloudformation:GetTemplate
+              - cloudformation:ValidateTemplate
+            Resource: '*'
+
+Outputs:
+  DeploymentRoleName:
+    Description: IAM role receiving the deployment permissions.
+    Value: !Ref GitHubActionsRoleName
+  DeploymentPolicyName:
+    Description: Name of the managed inline deployment policy.
+    Value: !Ref GitHubActionsCloudFormationPolicy
