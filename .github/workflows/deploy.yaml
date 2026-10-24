@@ -115,19 +115,12 @@ jobs:
             "medislot-${ENVIRONMENT}-network" \
             "Environment=${ENVIRONMENT}"
 
-          # Create deployment-only random credentials; never print their values.
-          if aws ssm get-parameter \
+          # Create the database password in SSM if it does not exist.
+          # Do not retrieve or print the decrypted password.
+          if ! aws ssm get-parameter \
             --name "/medislot/${ENVIRONMENT}/db/password" \
-            --with-decryption \
             --region "$AWS_REGION" >/dev/null 2>&1; then
 
-            DB_PASSWORD="$(aws ssm get-parameter \
-              --name "/medislot/${ENVIRONMENT}/db/password" \
-              --with-decryption \
-              --query 'Parameter.Value' \
-              --output text \
-              --region "$AWS_REGION")"
-          else
             DB_PASSWORD="$(python -c 'import secrets,string; a=string.ascii_letters+string.digits+"!_-+="; print("".join(secrets.choice(a) for _ in range(32)))')"
 
             aws ssm put-parameter \
@@ -135,8 +128,11 @@ jobs:
               --type SecureString \
               --value "$DB_PASSWORD" \
               --region "$AWS_REGION" >/dev/null
+
+            unset DB_PASSWORD
           fi
 
+          # Create the JWT signing secret in SSM if it does not exist.
           if ! aws ssm get-parameter \
             --name "/medislot/${ENVIRONMENT}/auth/jwt-secret" \
             --region "$AWS_REGION" >/dev/null 2>&1; then
@@ -152,13 +148,12 @@ jobs:
             unset JWT_SECRET
           fi
 
+          # CloudFormation reads the database password using an SSM
+          # SecureString dynamic reference in data-stack.yaml.
           python scripts/deploy_stack.py \
             cloudformation/data-stack.yaml \
             "medislot-${ENVIRONMENT}-data" \
-            "Environment=${ENVIRONMENT}" \
-            "DBPassword=${DB_PASSWORD}"
-
-          unset DB_PASSWORD
+            "Environment=${ENVIRONMENT}"
 
       - name: Package and upload Lambda code
         shell: bash
