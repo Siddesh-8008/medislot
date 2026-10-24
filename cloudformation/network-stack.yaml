@@ -59,9 +59,7 @@ Resources:
     Properties:
       VpcId: !Ref MediSlotVPC
       CidrBlock: !Ref PublicSubnetCidr
-      AvailabilityZone: !Select
-        - 0
-        - !GetAZs ''
+      AvailabilityZone: !Select [0, !GetAZs '']
       MapPublicIpOnLaunch: true
       Tags:
         - Key: Name
@@ -72,9 +70,7 @@ Resources:
     Properties:
       VpcId: !Ref MediSlotVPC
       CidrBlock: !Ref PrivateSubnet1Cidr
-      AvailabilityZone: !Select
-        - 0
-        - !GetAZs ''
+      AvailabilityZone: !Select [0, !GetAZs '']
       MapPublicIpOnLaunch: false
       Tags:
         - Key: Name
@@ -85,9 +81,7 @@ Resources:
     Properties:
       VpcId: !Ref MediSlotVPC
       CidrBlock: !Ref PrivateSubnet2Cidr
-      AvailabilityZone: !Select
-        - 1
-        - !GetAZs ''
+      AvailabilityZone: !Select [1, !GetAZs '']
       MapPublicIpOnLaunch: false
       Tags:
         - Key: Name
@@ -138,15 +132,15 @@ Resources:
   ApplicationSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Security group for the MediSlot web application EC2 instance.
+      GroupDescription: Security group for the public MediSlot web application.
       VpcId: !Ref MediSlotVPC
       SecurityGroupIngress:
-        - Description: Public HTTP access for the web application.
+        - Description: Public HTTP access.
           IpProtocol: tcp
           FromPort: 80
           ToPort: 80
           CidrIp: 0.0.0.0/0
-        - Description: Public HTTPS access for the web application.
+        - Description: Public HTTPS access.
           IpProtocol: tcp
           FromPort: 443
           ToPort: 443
@@ -167,10 +161,10 @@ Resources:
   DatabaseSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Allow MySQL only from the MediSlot Lambda security group.
+      GroupDescription: Allow MySQL only from MediSlot Lambda functions.
       VpcId: !Ref MediSlotVPC
       SecurityGroupIngress:
-        - Description: MySQL access from authorized Lambda functions.
+        - Description: MySQL from authorized Lambda functions.
           IpProtocol: tcp
           FromPort: 3306
           ToPort: 3306
@@ -178,6 +172,21 @@ Resources:
       Tags:
         - Key: Name
           Value: !Sub 'medislot-${Environment}-database-sg'
+
+  EndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: HTTPS access from MediSlot Lambda functions to interface endpoints.
+      VpcId: !Ref MediSlotVPC
+      SecurityGroupIngress:
+        - Description: HTTPS from Lambda functions.
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !GetAtt LambdaSecurityGroup.GroupId
+      Tags:
+        - Key: Name
+          Value: !Sub 'medislot-${Environment}-endpoint-sg'
 
   S3GatewayEndpoint:
     Type: AWS::EC2::VPCEndpoint
@@ -196,6 +205,71 @@ Resources:
       ServiceName: !Sub 'com.amazonaws.${AWS::Region}.dynamodb'
       RouteTableIds:
         - !Ref PrivateRouteTable
+
+  SSMInterfaceEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref MediSlotVPC
+      VpcEndpointType: Interface
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssm'
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref EndpointSecurityGroup
+
+  CloudWatchLogsInterfaceEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref MediSlotVPC
+      VpcEndpointType: Interface
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.logs'
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref EndpointSecurityGroup
+
+  SQSInterfaceEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref MediSlotVPC
+      VpcEndpointType: Interface
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.sqs'
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref EndpointSecurityGroup
+
+  SNSInterfaceEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref MediSlotVPC
+      VpcEndpointType: Interface
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.sns'
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref EndpointSecurityGroup
+
+  EventBridgeInterfaceEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref MediSlotVPC
+      VpcEndpointType: Interface
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.events'
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref EndpointSecurityGroup
 
 Outputs:
   VPCId:
@@ -217,28 +291,39 @@ Outputs:
       Name: !Sub 'MediSlot-${Environment}-PrivateSubnet1Id'
 
   PrivateSubnet2Id:
-    Description: Second private subnet for Multi-AZ database subnet configuration.
+    Description: Second private subnet for Lambda and RDS.
     Value: !Ref PrivateSubnet2
     Export:
       Name: !Sub 'MediSlot-${Environment}-PrivateSubnet2Id'
 
   ApplicationSecurityGroupId:
+    Description: Security group for the public web application.
     Value: !GetAtt ApplicationSecurityGroup.GroupId
     Export:
       Name: !Sub 'MediSlot-${Environment}-ApplicationSecurityGroupId'
 
   LambdaSecurityGroupId:
+    Description: Security group for VPC-connected Lambda functions.
     Value: !GetAtt LambdaSecurityGroup.GroupId
     Export:
       Name: !Sub 'MediSlot-${Environment}-LambdaSecurityGroupId'
 
   DatabaseSecurityGroupId:
+    Description: Security group for RDS MySQL.
     Value: !GetAtt DatabaseSecurityGroup.GroupId
     Export:
       Name: !Sub 'MediSlot-${Environment}-DatabaseSecurityGroupId'
 
+  EndpointSecurityGroupId:
+    Description: Security group for interface VPC endpoints.
+    Value: !GetAtt EndpointSecurityGroup.GroupId
+    Export:
+      Name: !Sub 'MediSlot-${Environment}-EndpointSecurityGroupId'
+
   PublicRouteTableId:
+    Description: Public subnet route table.
     Value: !Ref PublicRouteTable
 
   PrivateRouteTableId:
+    Description: Shared private subnet route table.
     Value: !Ref PrivateRouteTable
