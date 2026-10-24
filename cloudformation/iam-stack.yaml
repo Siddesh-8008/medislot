@@ -1,0 +1,72 @@
+
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  MediSlot IAM deployment permissions for GitHub Actions.
+  Lambda execution roles remain managed by auth-stack.yaml.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - test
+      - prod
+
+  GitHubActionsRoleName:
+    Type: String
+    Default: MediSlotGitHubActionsRole
+
+Resources:
+  MediSlotGitHubActionsDeploymentPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub MediSlot-${Environment}-GitHubActionsDeploymentPolicy
+      Roles:
+        - !Ref GitHubActionsRoleName
+
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+
+          # Manage the four MediSlot CloudFormation stacks.
+          - Sid: ManageMediSlotChangeSets
+            Effect: Allow
+            Action:
+              - cloudformation:CreateChangeSet
+              - cloudformation:DescribeChangeSet
+              - cloudformation:ExecuteChangeSet
+              - cloudformation:DeleteChangeSet
+              - cloudformation:DescribeStacks
+              - cloudformation:DescribeStackEvents
+              - cloudformation:DescribeStackResources
+              - cloudformation:GetTemplate
+            Resource:
+              - !Sub arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/medislot-${Environment}-iam/*
+              - !Sub arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/medislot-${Environment}-network/*
+              - !Sub arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/medislot-${Environment}-data/*
+              - !Sub arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/medislot-${Environment}-auth/*
+
+          # Read stack state and validate templates.
+          - Sid: InspectCloudFormation
+            Effect: Allow
+            Action:
+              - cloudformation:ValidateTemplate
+              - cloudformation:DescribeStackResources
+            Resource: "*"
+
+          # Read deployment account identity.
+          - Sid: ReadCallerIdentity
+            Effect: Allow
+            Action:
+              - sts:GetCallerIdentity
+            Resource: "*"
+
+Outputs:
+  DeploymentRoleName:
+    Description: GitHub Actions deployment role receiving the policy.
+    Value: !Ref GitHubActionsRoleName
+
+  DeploymentPolicyName:
+    Description: Name of the attached deployment policy.
+    Value: !Ref MediSlotGitHubActionsDeploymentPolicy
