@@ -415,3 +415,4 @@ Outputs:
     Value: !Sub 'https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/auth/login'
   AuthorizerFunctionName: {Value: !Ref AuthorizerFunction}
   RdsConnectionCheckFunctionName: {Value: !Ref RdsConnectionCheckFunction}
+#
