@@ -78,12 +78,12 @@ Resources:
         - Key: Project
           Value: MediSlot
 
+
   ApiGatewayAccount:
     Type: AWS::ApiGateway::Account
-    DependsOn:
-      - ApiGatewayCloudWatchRole
     Properties:
       CloudWatchRoleArn: !GetAtt ApiGatewayCloudWatchRole.Arn
+
 
 Outputs:
   DeploymentRoleName:
