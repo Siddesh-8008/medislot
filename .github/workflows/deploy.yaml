@@ -1,0 +1,144 @@
+
+name: MediSlot Infrastructure Deployment
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feature/milestone-2
+    paths:
+      - "cloudformation/**"
+      - ".github/workflows/deploy.yaml"
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: medislot-infrastructure-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ap-south-1
+  ENVIRONMENT: dev
+  NETWORK_STACK_NAME: medislot-dev-network
+
+jobs:
+  deploy-network:
+    name: Deploy Network Stack
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials using OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Create CloudFormation Change Set
+        id: changeset
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TEMPLATE="cloudformation/network-stack.yaml"
+          CHANGE_SET_NAME="medislot-network-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+          if [[ ! -f "$TEMPLATE" ]]; then
+            echo "Template not found: $TEMPLATE"
+            echo "Check that network-stack.yaml is saved in cloudformation/."
+            exit 1
+          fi
+
+          if aws cloudformation describe-stacks \
+            --stack-name "$NETWORK_STACK_NAME" \
+            --region "$AWS_REGION" >/dev/null 2>&1; then
+            CHANGE_SET_TYPE="UPDATE"
+          else
+            CHANGE_SET_TYPE="CREATE"
+          fi
+
+          echo "change_set_name=$CHANGE_SET_NAME" >> "$GITHUB_OUTPUT"
+          echo "change_set_type=$CHANGE_SET_TYPE" >> "$GITHUB_OUTPUT"
+
+          aws cloudformation create-change-set \
+            --stack-name "$NETWORK_STACK_NAME" \
+            --template-body "file://$TEMPLATE" \
+            --parameters \
+              "ParameterKey=Environment,ParameterValue=$ENVIRONMENT" \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --change-set-name "$CHANGE_SET_NAME" \
+            --change-set-type "$CHANGE_SET_TYPE" \
+            --description "MediSlot network deployment from GitHub Actions" \
+            --region "$AWS_REGION"
+
+          aws cloudformation wait change-set-create-complete \
+            --stack-name "$NETWORK_STACK_NAME" \
+            --change-set-name "$CHANGE_SET_NAME" \
+            --region "$AWS_REGION" || true
+
+          aws cloudformation describe-change-set \
+            --stack-name "$NETWORK_STACK_NAME" \
+            --change-set-name "$CHANGE_SET_NAME" \
+            --region "$AWS_REGION" \
+            --query '{Status:Status,ExecutionStatus:ExecutionStatus,Reason:StatusReason,Changes:Changes[*].ResourceChange.{Action:Action,LogicalResourceId:LogicalResourceId,ResourceType:ResourceType}}' \
+            --output json
+
+      - name: Execute CloudFormation Change Set
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          CHANGE_SET_NAME="${{ steps.changeset.outputs.change_set_name }}"
+
+          STATUS=$(aws cloudformation describe-change-set \
+            --stack-name "$NETWORK_STACK_NAME" \
+            --change-set-name "$CHANGE_SET_NAME" \
+            --region "$AWS_REGION" \
+            --query 'Status' \
+            --output text)
+
+          if [[ "$STATUS" != "CREATE_COMPLETE" ]]; then
+            REASON=$(aws cloudformation describe-change-set \
+              --stack-name "$NETWORK_STACK_NAME" \
+              --change-set-name "$CHANGE_SET_NAME" \
+              --region "$AWS_REGION" \
+              --query 'StatusReason' \
+              --output text)
+
+            if [[ "$REASON" == *"didn't contain changes"* || "$REASON" == *"No updates are to be performed"* ]]; then
+              echo "No infrastructure changes detected. Nothing to deploy."
+              exit 0
+            fi
+
+            echo "Change Set creation failed: $REASON"
+            exit 1
+          fi
+
+          aws cloudformation execute-change-set \
+            --stack-name "$NETWORK_STACK_NAME" \
+            --change-set-name "$CHANGE_SET_NAME" \
+            --region "$AWS_REGION"
+
+          if [[ "${{ steps.changeset.outputs.change_set_type }}" == "CREATE" ]]; then
+            aws cloudformation wait stack-create-complete \
+              --stack-name "$NETWORK_STACK_NAME" \
+              --region "$AWS_REGION"
+          else
+            aws cloudformation wait stack-update-complete \
+              --stack-name "$NETWORK_STACK_NAME" \
+              --region "$AWS_REGION"
+          fi
+
+      - name: Display network stack outputs
+        if: success()
+        shell: bash
+        run: |
+          aws cloudformation describe-stacks \
+            --stack-name "$NETWORK_STACK_NAME" \
+            --region "$AWS_REGION" \
+            --query 'Stacks[0].Outputs[*].[OutputKey,OutputValue]' \
+            --output table
