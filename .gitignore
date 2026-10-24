@@ -1,0 +1,28 @@
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Generated Lambda packages
+build/
+dist/
+*.zip
+
+# Test and coverage output
+.coverage
+htmlcov/
+
+# IDE and OS
+.vscode/
+.DS_Store
+Thumbs.db
