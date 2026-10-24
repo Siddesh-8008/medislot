@@ -142,3 +142,4 @@ jobs:
             --region "$AWS_REGION" \
             --query 'Stacks[0].Outputs[*].[OutputKey,OutputValue]' \
             --output table
+#
