@@ -1,0 +1,273 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  MediSlot deployment permissions managed as infrastructure code.
+  Grants the GitHub Actions OIDC role what it needs to deploy the network,
+  IAM and data stacks (and the Milestone 2 Lambda/API/SSM resources) through
+  CloudFormation Change Sets. Deploy this stack ONCE with an admin identity -
+  the pipeline role cannot (and should not be able to) edit its own permissions.
+
+Parameters:
+  GitHubActionsRoleName:
+    Type: String
+    Default: MediSlotGitHubActionsRole
+    Description: Existing IAM role assumed by GitHub Actions through OIDC.
+
+Resources:
+  # ---------------------------------------------------------------
+  # 1. CloudFormation + the infrastructure in network-stack / data-stack
+  # ---------------------------------------------------------------
+  CloudFormationAndInfraPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: MediSlotDeploy-CloudFormationAndInfra
+      Roles:
+        - !Ref GitHubActionsRoleName
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: ManageMediSlotStacksAndChangeSets
+            Effect: Allow
+            Action:
+              - cloudformation:CreateChangeSet
+              - cloudformation:DescribeChangeSet
+              - cloudformation:ExecuteChangeSet
+              - cloudformation:DeleteChangeSet
+              - cloudformation:ListChangeSets
+              - cloudformation:DescribeStacks
+              - cloudformation:DescribeStackEvents
+              - cloudformation:DescribeStackResources
+              - cloudformation:ListStackResources
+              - cloudformation:GetTemplate
+              - cloudformation:GetTemplateSummary
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/medislot-*/*'
+              - !Sub 'arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:changeSet/medislot-*/*'
+
+          - Sid: CloudFormationAccountLevelReads
+            Effect: Allow
+            Action:
+              - cloudformation:ValidateTemplate
+              - cloudformation:ListStacks
+              - cloudformation:ListExports
+            Resource: '*'
+
+          - Sid: NetworkResources
+            Effect: Allow
+            Action:
+              - ec2:CreateVpc
+              - ec2:DeleteVpc
+              - ec2:ModifyVpcAttribute
+              - ec2:CreateSubnet
+              - ec2:DeleteSubnet
+              - ec2:ModifySubnetAttribute
+              - ec2:CreateInternetGateway
+              - ec2:DeleteInternetGateway
+              - ec2:AttachInternetGateway
+              - ec2:DetachInternetGateway
+              - ec2:CreateRouteTable
+              - ec2:DeleteRouteTable
+              - ec2:CreateRoute
+              - ec2:DeleteRoute
+              - ec2:AssociateRouteTable
+              - ec2:DisassociateRouteTable
+              - ec2:CreateSecurityGroup
+              - ec2:DeleteSecurityGroup
+              - ec2:AuthorizeSecurityGroupIngress
+              - ec2:AuthorizeSecurityGroupEgress
+              - ec2:RevokeSecurityGroupIngress
+              - ec2:RevokeSecurityGroupEgress
+              - ec2:CreateVpcEndpoint
+              - ec2:ModifyVpcEndpoint
+              - ec2:DeleteVpcEndpoints
+              - ec2:CreateTags
+              - ec2:DeleteTags
+              - ec2:Describe*
+            Resource: '*'
+
+          - Sid: DatabaseInstance
+            Effect: Allow
+            Action:
+              - rds:CreateDBInstance
+              - rds:ModifyDBInstance
+              - rds:DeleteDBInstance
+              - rds:CreateDBSubnetGroup
+              - rds:ModifyDBSubnetGroup
+              - rds:DeleteDBSubnetGroup
+              - rds:AddTagsToResource
+              - rds:RemoveTagsFromResource
+              - rds:ListTagsForResource
+              - rds:Describe*
+            Resource: '*'
+
+          - Sid: RdsServiceLinkedRole
+            Effect: Allow
+            Action: iam:CreateServiceLinkedRole
+            Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/aws-service-role/rds.amazonaws.com/*'
+            Condition:
+              StringEquals:
+                iam:AWSServiceName: rds.amazonaws.com
+
+          - Sid: DynamoDbTables
+            Effect: Allow
+            Action:
+              - dynamodb:CreateTable
+              - dynamodb:DeleteTable
+              - dynamodb:UpdateTable
+              - dynamodb:DescribeTable
+              - dynamodb:DescribeContinuousBackups
+              - dynamodb:UpdateContinuousBackups
+              - dynamodb:DescribeTimeToLive
+              - dynamodb:UpdateTimeToLive
+              - dynamodb:TagResource
+              - dynamodb:UntagResource
+              - dynamodb:ListTagsOfResource
+            Resource: !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/medislot-*'
+
+          - Sid: S3Buckets
+            Effect: Allow
+            Action:
+              - s3:CreateBucket
+              - s3:DeleteBucket
+              - s3:ListBucket
+              - s3:GetBucketLocation
+              - s3:GetBucketPublicAccessBlock
+              - s3:PutBucketPublicAccessBlock
+              - s3:GetEncryptionConfiguration
+              - s3:PutEncryptionConfiguration
+              - s3:GetBucketVersioning
+              - s3:PutBucketVersioning
+              - s3:GetBucketTagging
+              - s3:PutBucketTagging
+              - s3:GetBucketPolicy
+              - s3:PutBucketPolicy
+              - s3:DeleteBucketPolicy
+            Resource: !Sub 'arn:${AWS::Partition}:s3:::medislot-*'
+
+  # ---------------------------------------------------------------
+  # 2. IAM roles, SSM parameters, Lambda, API Gateway (Milestone 2 Wed/Thu)
+  # ---------------------------------------------------------------
+  IamSsmAndAppPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: MediSlotDeploy-IamSsmAndApp
+      Roles:
+        - !Ref GitHubActionsRoleName
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: ManageMediSlotLambdaRoles
+            Effect: Allow
+            Action:
+              - iam:CreateRole
+              - iam:DeleteRole
+              - iam:GetRole
+              - iam:UpdateRole
+              - iam:UpdateAssumeRolePolicy
+              - iam:PutRolePolicy
+              - iam:DeleteRolePolicy
+              - iam:GetRolePolicy
+              - iam:ListRolePolicies
+              - iam:ListAttachedRolePolicies
+              - iam:TagRole
+              - iam:UntagRole
+            # Note the hyphen: this does NOT match MediSlotGitHubActionsRole,
+            # so the pipeline cannot rewrite its own permissions.
+            Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/MediSlot-*'
+
+          - Sid: AttachOnlyApprovedPoliciesToLambdaRoles
+            Effect: Allow
+            Action:
+              - iam:AttachRolePolicy
+              - iam:DetachRolePolicy
+            Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/MediSlot-*'
+            Condition:
+              ArnLike:
+                iam:PolicyARN:
+                  - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambda*'
+                  - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/MediSlot-*'
+
+          - Sid: PassMediSlotRolesToServices
+            Effect: Allow
+            Action: iam:PassRole
+            Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/MediSlot-*'
+            Condition:
+              StringEquals:
+                iam:PassedToService:
+                  - lambda.amazonaws.com
+                  - apigateway.amazonaws.com
+
+          - Sid: ManageMediSlotParameters
+            Effect: Allow
+            Action:
+              - ssm:PutParameter
+              - ssm:GetParameter
+              - ssm:GetParameters
+              - ssm:GetParametersByPath
+              - ssm:DeleteParameter
+              - ssm:DeleteParameters
+              - ssm:AddTagsToResource
+              - ssm:RemoveTagsFromResource
+              - ssm:ListTagsForResource
+            Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/medislot/*'
+
+          - Sid: DescribeParameters
+            Effect: Allow
+            Action: ssm:DescribeParameters
+            Resource: '*'
+
+          - Sid: ManageMediSlotFunctions
+            Effect: Allow
+            Action:
+              - lambda:CreateFunction
+              - lambda:DeleteFunction
+              - lambda:UpdateFunctionCode
+              - lambda:UpdateFunctionConfiguration
+              - lambda:GetFunction
+              - lambda:GetFunctionConfiguration
+              - lambda:AddPermission
+              - lambda:RemovePermission
+              - lambda:PublishVersion
+              - lambda:TagResource
+              - lambda:UntagResource
+              - lambda:ListTags
+              - lambda:InvokeFunction
+            Resource: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:medislot-*'
+
+          - Sid: ManageMediSlotLogGroups
+            Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:DeleteLogGroup
+              - logs:PutRetentionPolicy
+              - logs:TagResource
+              - logs:UntagResource
+              - logs:ListTagsForResource
+            Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/medislot-*'
+
+          - Sid: DescribeLogGroups
+            Effect: Allow
+            Action: logs:DescribeLogGroups
+            Resource: '*'
+
+          - Sid: ManageApiGateway
+            Effect: Allow
+            Action:
+              - apigateway:GET
+              - apigateway:POST
+              - apigateway:PUT
+              - apigateway:PATCH
+              - apigateway:DELETE
+              - apigateway:TagResource
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}::/restapis'
+              - !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}::/restapis/*'
+              - !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}::/tags/*'
+
+Outputs:
+  DeploymentRoleName:
+    Description: IAM role receiving the deployment permissions.
+    Value: !Ref GitHubActionsRoleName
+  CloudFormationAndInfraPolicyArn:
+    Value: !Ref CloudFormationAndInfraPolicy
+  IamSsmAndAppPolicyArn:
+    Value: !Ref IamSsmAndAppPolicy
