@@ -86,9 +86,16 @@ Resources:
     Properties:
       GroupDescription: MySQL ingress only from Lambda security group.
       VpcId: !Ref MediSlotVPC
-      SecurityGroupIngress:
-        - {Description: MySQL from application Lambda, IpProtocol: tcp, FromPort: 3306, ToPort: 3306, SourceSecurityGroupId: !GetAtt LambdaSecurityGroup.GroupId}
       Tags: [{Key: Name, Value: !Sub 'medislot-${Environment}-database-sg'}]
+  DatabaseIngressFromLambda:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !GetAtt DatabaseSecurityGroup.GroupId
+      Description: MySQL from application Lambda
+      IpProtocol: tcp
+      FromPort: 3306
+      ToPort: 3306
+      SourceSecurityGroupId: !GetAtt LambdaSecurityGroup.GroupId
   EndpointSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
