@@ -24,74 +24,6 @@ Resources:
           - Effect: Allow
             Action: [ec2:CreateNetworkInterface, ec2:DescribeNetworkInterfaces, ec2:DeleteNetworkInterface, ec2:AssignPrivateIpAddresses, ec2:UnassignPrivateIpAddresses]
             Resource: '*'
-  RegisterRole:
-    Type: AWS::IAM::Role
-    Properties:
-      RoleName: !Sub 'MediSlot-${Environment}-RegisterRole'
-      AssumeRolePolicyDocument: {Version: '2012-10-17', Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: sts:AssumeRole}]}
-      ManagedPolicyArns: [!Ref LambdaExecutionBasePolicy]
-      Policies:
-        - PolicyName: RegisterRuntimeAccess
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - {Effect: Allow, Action: [ssm:GetParameter], Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/medislot/${Environment}/*'}
-              - {Effect: Allow, Action: [kms:Decrypt], Resource: '*'}
-  DoctorRegisterRole:
-    Type: AWS::IAM::Role
-    Properties:
-      RoleName: !Sub 'MediSlot-${Environment}-DoctorRegisterRole'
-      AssumeRolePolicyDocument: {Version: '2012-10-17', Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: sts:AssumeRole}]}
-      ManagedPolicyArns: [!Ref LambdaExecutionBasePolicy]
-      Policies:
-        - PolicyName: DoctorRegisterRuntimeAccess
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - {Effect: Allow, Action: [ssm:GetParameter], Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/medislot/${Environment}/*'}
-              - {Effect: Allow, Action: [kms:Decrypt], Resource: '*'}
-  LoginRole:
-    Type: AWS::IAM::Role
-    Properties:
-      RoleName: !Sub 'MediSlot-${Environment}-LoginRole'
-      AssumeRolePolicyDocument: {Version: '2012-10-17', Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: sts:AssumeRole}]}
-      ManagedPolicyArns: [!Ref LambdaExecutionBasePolicy]
-      Policies:
-        - PolicyName: LoginRuntimeAccess
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - {Effect: Allow, Action: [ssm:GetParameter], Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/medislot/${Environment}/*'}
-              - {Effect: Allow, Action: [dynamodb:GetItem, dynamodb:PutItem], Resource: !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/MediSlot-${Environment}-AuthTokens'}
-              - {Effect: Allow, Action: [kms:Decrypt], Resource: '*'}
-  RefreshRole:
-    Type: AWS::IAM::Role
-    Properties:
-      RoleName: !Sub 'MediSlot-${Environment}-RefreshRole'
-      AssumeRolePolicyDocument: {Version: '2012-10-17', Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: sts:AssumeRole}]}
-      ManagedPolicyArns: [!Ref LambdaExecutionBasePolicy]
-      Policies:
-        - PolicyName: RefreshRuntimeAccess
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - {Effect: Allow, Action: [ssm:GetParameter], Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/medislot/${Environment}/*'}
-              - {Effect: Allow, Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem], Resource: !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/MediSlot-${Environment}-AuthTokens'}
-              - {Effect: Allow, Action: [kms:Decrypt], Resource: '*'}
-  LogoutRole:
-    Type: AWS::IAM::Role
-    Properties:
-      RoleName: !Sub 'MediSlot-${Environment}-LogoutRole'
-      AssumeRolePolicyDocument: {Version: '2012-10-17', Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: sts:AssumeRole}]}
-      ManagedPolicyArns: [!Ref LambdaExecutionBasePolicy]
-      Policies:
-        - PolicyName: LogoutRuntimeAccess
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - {Effect: Allow, Action: [ssm:GetParameter], Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/medislot/${Environment}/*'}
-              - {Effect: Allow, Action: [dynamodb:PutItem, dynamodb:UpdateItem], Resource: !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/MediSlot-${Environment}-AuthTokens'}
-              - {Effect: Allow, Action: [kms:Decrypt], Resource: '*'}
   AuthorizerRole:
     Type: AWS::IAM::Role
     Properties:
@@ -106,80 +38,30 @@ Resources:
               - {Effect: Allow, Action: [ssm:GetParameter], Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/medislot/${Environment}/auth/jwt-secret'}
               - {Effect: Allow, Action: [dynamodb:GetItem], Resource: !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/MediSlot-${Environment}-AuthTokens'}
               - {Effect: Allow, Action: [kms:Decrypt], Resource: '*'}
-  RegisterFunction:
+  AuthenticationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'MediSlot-${Environment}-AuthenticationRole'
+      AssumeRolePolicyDocument: {Version: '2012-10-17', Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: sts:AssumeRole}]}
+      ManagedPolicyArns: [!Ref LambdaExecutionBasePolicy]
+      Policies:
+        - PolicyName: AuthenticationRuntimeAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - {Effect: Allow, Action: [ssm:GetParameter], Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/medislot/${Environment}/*'}
+              - {Effect: Allow, Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem], Resource: !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/MediSlot-${Environment}-AuthTokens'}
+              - {Effect: Allow, Action: [kms:Decrypt], Resource: '*'}
+  AuthenticationFunction:
     Type: AWS::Lambda::Function
     Properties:
-      FunctionName: !Sub 'medislot-${Environment}-register'
+      FunctionName: !Sub 'medislot-${Environment}-authentication'
       Runtime: python3.12
       Handler: lambda_function.handler
-      Role: !GetAtt RegisterRole.Arn
+      Role: !GetAtt AuthenticationRole.Arn
       Timeout: 15
       MemorySize: 256
-      Code: {S3Bucket: !Ref ArtifactBucket, S3Key: !Sub '${ArtifactPrefix}/register.zip'}
-      VpcConfig:
-        SecurityGroupIds: [!ImportValue {Fn::Sub: 'MediSlot-${Environment}-LambdaSecurityGroupId'}]
-        SubnetIds:
-          - Fn::ImportValue: !Sub 'MediSlot-${Environment}-PrivateSubnet1Id'
-          - Fn::ImportValue: !Sub 'MediSlot-${Environment}-PrivateSubnet2Id'
-      Environment: {Variables: {ENVIRONMENT: !Ref Environment, ROLE: PATIENT}}
-  DoctorRegisterFunction:
-    Type: AWS::Lambda::Function
-    Properties:
-      FunctionName: !Sub 'medislot-${Environment}-register-doctor'
-      Runtime: python3.12
-      Handler: lambda_function.handler
-      Role: !GetAtt DoctorRegisterRole.Arn
-      Timeout: 15
-      MemorySize: 256
-      Code: {S3Bucket: !Ref ArtifactBucket, S3Key: !Sub '${ArtifactPrefix}/register.zip'}
-      VpcConfig:
-        SecurityGroupIds: [!ImportValue {Fn::Sub: 'MediSlot-${Environment}-LambdaSecurityGroupId'}]
-        SubnetIds:
-          - Fn::ImportValue: !Sub 'MediSlot-${Environment}-PrivateSubnet1Id'
-          - Fn::ImportValue: !Sub 'MediSlot-${Environment}-PrivateSubnet2Id'
-      Environment: {Variables: {ENVIRONMENT: !Ref Environment, ROLE: DOCTOR}}
-  LoginFunction:
-    Type: AWS::Lambda::Function
-    Properties:
-      FunctionName: !Sub 'medislot-${Environment}-login'
-      Runtime: python3.12
-      Handler: lambda_function.handler
-      Role: !GetAtt LoginRole.Arn
-      Timeout: 15
-      MemorySize: 256
-      Code: {S3Bucket: !Ref ArtifactBucket, S3Key: !Sub '${ArtifactPrefix}/login.zip'}
-      VpcConfig:
-        SecurityGroupIds: [!ImportValue {Fn::Sub: 'MediSlot-${Environment}-LambdaSecurityGroupId'}]
-        SubnetIds:
-          - Fn::ImportValue: !Sub 'MediSlot-${Environment}-PrivateSubnet1Id'
-          - Fn::ImportValue: !Sub 'MediSlot-${Environment}-PrivateSubnet2Id'
-      Environment: {Variables: {ENVIRONMENT: !Ref Environment}}
-  RefreshFunction:
-    Type: AWS::Lambda::Function
-    Properties:
-      FunctionName: !Sub 'medislot-${Environment}-refresh'
-      Runtime: python3.12
-      Handler: lambda_function.handler
-      Role: !GetAtt RefreshRole.Arn
-      Timeout: 15
-      MemorySize: 256
-      Code: {S3Bucket: !Ref ArtifactBucket, S3Key: !Sub '${ArtifactPrefix}/refresh.zip'}
-      VpcConfig:
-        SecurityGroupIds: [!ImportValue {Fn::Sub: 'MediSlot-${Environment}-LambdaSecurityGroupId'}]
-        SubnetIds:
-          - Fn::ImportValue: !Sub 'MediSlot-${Environment}-PrivateSubnet1Id'
-          - Fn::ImportValue: !Sub 'MediSlot-${Environment}-PrivateSubnet2Id'
-      Environment: {Variables: {ENVIRONMENT: !Ref Environment}}
-  LogoutFunction:
-    Type: AWS::Lambda::Function
-    Properties:
-      FunctionName: !Sub 'medislot-${Environment}-logout'
-      Runtime: python3.12
-      Handler: lambda_function.handler
-      Role: !GetAtt LogoutRole.Arn
-      Timeout: 15
-      MemorySize: 256
-      Code: {S3Bucket: !Ref ArtifactBucket, S3Key: !Sub '${ArtifactPrefix}/logout.zip'}
+      Code: {S3Bucket: !Ref ArtifactBucket, S3Key: !Sub '${ArtifactPrefix}/authentication.zip'}
       VpcConfig:
         SecurityGroupIds: [!ImportValue {Fn::Sub: 'MediSlot-${Environment}-LambdaSecurityGroupId'}]
         SubnetIds:
@@ -326,7 +208,7 @@ Resources:
       ResourceId: !Ref PatientRegisterSubroute
       HttpMethod: POST
       AuthorizationType: NONE
-      Integration: {Type: AWS_PROXY, IntegrationHttpMethod: POST, Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${RegisterFunction.Arn}/invocations'}
+      Integration: {Type: AWS_PROXY, IntegrationHttpMethod: POST, Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AuthenticationFunction.Arn}/invocations'}
   RegisterDoctorMethod:
     Type: AWS::ApiGateway::Method
     Properties:
@@ -334,7 +216,7 @@ Resources:
       ResourceId: !Ref DoctorRegisterSubroute
       HttpMethod: POST
       AuthorizationType: NONE
-      Integration: {Type: AWS_PROXY, IntegrationHttpMethod: POST, Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DoctorRegisterFunction.Arn}/invocations'}
+      Integration: {Type: AWS_PROXY, IntegrationHttpMethod: POST, Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AuthenticationFunction.Arn}/invocations'}
   LoginMethod:
     Type: AWS::ApiGateway::Method
     Properties:
@@ -342,7 +224,7 @@ Resources:
       ResourceId: !Ref LoginResource
       HttpMethod: POST
       AuthorizationType: NONE
-      Integration: {Type: AWS_PROXY, IntegrationHttpMethod: POST, Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LoginFunction.Arn}/invocations'}
+      Integration: {Type: AWS_PROXY, IntegrationHttpMethod: POST, Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AuthenticationFunction.Arn}/invocations'}
   RefreshMethod:
     Type: AWS::ApiGateway::Method
     Properties:
@@ -350,7 +232,7 @@ Resources:
       ResourceId: !Ref RefreshResource
       HttpMethod: POST
       AuthorizationType: NONE
-      Integration: {Type: AWS_PROXY, IntegrationHttpMethod: POST, Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${RefreshFunction.Arn}/invocations'}
+      Integration: {Type: AWS_PROXY, IntegrationHttpMethod: POST, Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AuthenticationFunction.Arn}/invocations'}
   LogoutMethod:
     Type: AWS::ApiGateway::Method
     Properties:
@@ -359,22 +241,10 @@ Resources:
       HttpMethod: POST
       AuthorizationType: CUSTOM
       AuthorizerId: !Ref ApiAuthorizer
-      Integration: {Type: AWS_PROXY, IntegrationHttpMethod: POST, Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LogoutFunction.Arn}/invocations'}
-  RegisterPatientInvokePermission:
+      Integration: {Type: AWS_PROXY, IntegrationHttpMethod: POST, Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AuthenticationFunction.Arn}/invocations'}
+  AuthenticationInvokePermission:
     Type: AWS::Lambda::Permission
-    Properties: {FunctionName: !Ref RegisterFunction, Action: lambda:InvokeFunction, Principal: apigateway.amazonaws.com, SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*/POST/auth/register/patient'}
-  RegisterDoctorInvokePermission:
-    Type: AWS::Lambda::Permission
-    Properties: {FunctionName: !Ref DoctorRegisterFunction, Action: lambda:InvokeFunction, Principal: apigateway.amazonaws.com, SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*/POST/auth/register/doctor'}
-  LoginInvokePermission:
-    Type: AWS::Lambda::Permission
-    Properties: {FunctionName: !Ref LoginFunction, Action: lambda:InvokeFunction, Principal: apigateway.amazonaws.com, SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*/POST/auth/login'}
-  RefreshInvokePermission:
-    Type: AWS::Lambda::Permission
-    Properties: {FunctionName: !Ref RefreshFunction, Action: lambda:InvokeFunction, Principal: apigateway.amazonaws.com, SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*/POST/auth/refresh'}
-  LogoutInvokePermission:
-    Type: AWS::Lambda::Permission
-    Properties: {FunctionName: !Ref LogoutFunction, Action: lambda:InvokeFunction, Principal: apigateway.amazonaws.com, SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*/POST/auth/logout'}
+    Properties: {FunctionName: !Ref AuthenticationFunction, Action: lambda:InvokeFunction, Principal: apigateway.amazonaws.com, SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*/POST/auth/*'}
   ProtectedInvokePermission:
     Type: AWS::Lambda::Permission
     Properties: {FunctionName: !Ref ProtectedFunction, Action: lambda:InvokeFunction, Principal: apigateway.amazonaws.com, SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*/GET/*'}
@@ -390,7 +260,7 @@ Resources:
       - LogoutMethod
     Properties:
       RestApiId: !Ref RestApi
-      Description: !Sub 'MediSlot ${Environment} auth API deployment'
+      Description: !Sub 'MediSlot ${Environment} auth API deployment ${ArtifactPrefix}'
   ApiStage:
     Type: AWS::ApiGateway::Stage
     Properties:
@@ -413,6 +283,7 @@ Outputs:
     Value: !Sub 'https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/auth/register/doctor'
   LoginUrl:
     Value: !Sub 'https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/auth/login'
+  AuthenticationFunctionName: {Value: !Ref AuthenticationFunction}
   AuthorizerFunctionName: {Value: !Ref AuthorizerFunction}
   RdsConnectionCheckFunctionName: {Value: !Ref RdsConnectionCheckFunction}
 #

@@ -30,10 +30,46 @@ def dbconn(c):
           password_hash VARCHAR(255) NOT NULL,
           role ENUM('PATIENT','DOCTOR') NOT NULL,
           full_name VARCHAR(150) NOT NULL,
+          first_name VARCHAR(75) NULL,
+          last_name VARCHAR(75) NULL,
+          phone VARCHAR(25) NULL,
+          date_of_birth DATE NULL,
+          gender VARCHAR(30) NULL,
+          address VARCHAR(500) NULL,
+          specialization VARCHAR(120) NULL,
+          license_number VARCHAR(32) NULL,
+          years_experience SMALLINT UNSIGNED NULL,
+          clinic_address VARCHAR(500) NULL,
           is_active BOOLEAN NOT NULL DEFAULT TRUE,
           created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-          updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6)
+          updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+          UNIQUE KEY uq_users_license_number (license_number)
         ) ENGINE=InnoDB""")
+        # Safe additive migration for databases created by earlier MediSlot versions.
+        cur.execute("SHOW COLUMNS FROM users")
+        existing = {row['Field'] for row in cur.fetchall()}
+        additions = {
+          'first_name': 'VARCHAR(75) NULL', 'last_name': 'VARCHAR(75) NULL',
+          'phone': 'VARCHAR(25) NULL', 'date_of_birth': 'DATE NULL',
+          'gender': 'VARCHAR(30) NULL', 'address': 'VARCHAR(500) NULL',
+          'specialization': 'VARCHAR(120) NULL', 'license_number': 'VARCHAR(32) NULL',
+          'years_experience': 'SMALLINT UNSIGNED NULL', 'clinic_address': 'VARCHAR(500) NULL'
+        }
+        for column, definition in additions.items():
+            if column not in existing:
+                try:
+                    cur.execute(f"ALTER TABLE users ADD COLUMN {column} {definition}")
+                except Exception as migration_error:
+                    # Concurrent cold starts may race on the same additive migration.
+                    if getattr(migration_error, "args", [None])[0] != 1060:
+                        raise
+        cur.execute("SHOW INDEX FROM users WHERE Key_name='uq_users_license_number'")
+        if not cur.fetchall():
+            try:
+                cur.execute("CREATE UNIQUE INDEX uq_users_license_number ON users (license_number)")
+            except Exception as migration_error:
+                if getattr(migration_error, "args", [None])[0] != 1061:
+                    raise
     conn.commit()
     return conn
 def table(name):

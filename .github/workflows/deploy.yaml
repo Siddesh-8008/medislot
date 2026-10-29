@@ -14,7 +14,7 @@ on:
       - ".github/workflows/**"
       - "requirements-dev.txt"
       - "README.md"
-      - "schema/**"
+      - "scehma/**"
   workflow_dispatch:
 
 permissions:
@@ -190,7 +190,7 @@ jobs:
           AWS_ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
           BUCKET="medislot-${ENVIRONMENT}-artifacts-${AWS_ACCOUNT_ID}"
 
-          for fn in register login refresh logout authorizer rds_check; do
+          for fn in authentication authorizer rds_check; do
             tmp="$(mktemp -d)"
 
             cp -R "lambdas/${fn}/." "$tmp/"

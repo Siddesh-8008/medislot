@@ -13,3 +13,13 @@ def test_password_policy_examples():
     assert not valid("short1!")
     assert not valid("alllowercase123!")
     assert not valid("ALLUPPERCASE123!")
+
+
+def test_doctor_license_format():
+    import re
+    pattern = re.compile(r"^[A-Z][A-Z ]{1,29}-\d{4}$")
+    assert pattern.fullmatch("TS-1234")
+    assert not pattern.fullmatch("TS-123")
+    assert pattern.fullmatch("TELANGANA-1234")
+    assert pattern.fullmatch("ANDHRA PRADESH-1234")
+    assert not pattern.fullmatch("ts-1234")
