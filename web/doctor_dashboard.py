@@ -1,10 +1,12 @@
 import os, secrets, requests, boto3
+from datetime import timedelta
 from flask import Flask, request, session, redirect, url_for, render_template_string, flash
 app=Flask(__name__)
-app.config.update(SESSION_COOKIE_HTTPONLY=True,SESSION_COOKIE_SECURE=os.environ.get("SESSION_COOKIE_SECURE","false").lower()=="true",SESSION_COOKIE_SAMESITE="Lax")
+app.config.update(PERMANENT_SESSION_LIFETIME=timedelta(days=7),SESSION_COOKIE_HTTPONLY=True,SESSION_COOKIE_SECURE=os.environ.get("SESSION_COOKIE_SECURE","false").lower()=="true",SESSION_COOKIE_SAMESITE="Lax")
 app.secret_key=os.environ.get("FLASK_SESSION_SECRET") or boto3.client("ssm").get_parameter(Name=os.environ.get("SESSION_SECRET_PARAMETER","/medislot/dev/web/session-secret"),WithDecryption=True)["Parameter"]["Value"]
 API_BASE=os.environ["MEDISLOT_API_BASE"].rstrip("/")
 LOGIN_URL=API_BASE+"/auth/login"
+REFRESH_URL=API_BASE+"/auth/refresh"
 
 PAGE=r"""
 <!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
@@ -26,10 +28,38 @@ input,textarea,select,button{font:inherit;padding:9px;width:100%;box-sizing:bord
 <section><h2>Consultation types</h2><form method="post" action="/consultation-types"><label>Name<input name="name" required></label><label>Duration minutes<select name="durationMinutes"><option>15</option><option>30</option><option>45</option><option>60</option><option>90</option><option>120</option></select></label><label>Fee<input name="fee" type="number" min="0" step="0.01" required></label><label>Capacity<input name="capacity" type="number" min="1" max="20" value="1"></label><button>Create consultation type</button></form></section>
 </div>{% endif %}</main></body></html>
 """
+class SessionExpired(Exception):
+    pass
+def refresh_tokens():
+    """Exchange the stored refresh token for a new access token. Returns True on success."""
+    rt=session.get("refresh_token")
+    if not rt: return False
+    try:
+        r=requests.post(REFRESH_URL,json={"refreshToken":rt},timeout=25)
+        payload=r.json() if r.ok else {}
+    except (requests.RequestException,ValueError):
+        return False
+    if not payload.get("accessToken"): return False
+    session["access_token"]=payload["accessToken"]
+    if payload.get("refreshToken"): session["refresh_token"]=payload["refreshToken"]
+    return True
 def api(method,path,**kwargs):
     headers=kwargs.pop("headers",{})
-    if session.get("access_token"): headers["Authorization"]="Bearer "+session["access_token"]
-    return requests.request(method,API_BASE+path,headers=headers,timeout=25,**kwargs)
+    def send():
+        h=dict(headers)
+        if session.get("access_token"): h["Authorization"]="Bearer "+session["access_token"]
+        return requests.request(method,API_BASE+path,headers=h,timeout=25,**kwargs)
+    r=send()
+    if r.status_code==401 and session.get("refresh_token"):
+        # Access token expired (15 min): get a new one silently and retry once.
+        if not refresh_tokens(): raise SessionExpired()
+        r=send()
+    return r
+@app.errorhandler(SessionExpired)
+def session_expired(e):
+    session.clear()
+    session["messages"]=["Your session expired. Please sign in again."]
+    return redirect("/")
 @app.get("/")
 def home():
     schedule=session.pop("schedule",None)
@@ -49,7 +79,7 @@ def login():
     except ValueError: payload={}
     if r.ok and payload.get("accessToken"):
         role=payload.get("role","DOCTOR")
-        session.clear()
+        session.clear(); session.permanent=True
         if role!="DOCTOR":
             session["messages"]=["Doctor account required."]
         else:

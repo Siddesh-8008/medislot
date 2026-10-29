@@ -3,6 +3,7 @@ from decimal import Decimal
 from datetime import datetime, date, time, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import boto3
+import pymysql
 from boto3.dynamodb.conditions import Key
 from botocore.exceptions import ClientError
 from common import config, dbconn, body, response, emit, correlation
@@ -18,15 +19,29 @@ def ctx_user(event):
 
 def route(event):
     p=event.get("pathParameters") or {}
-    path=p.get("proxy")
-    if path is None:
-        path=event.get("path") or event.get("rawPath") or ""
-        path=re.sub(r"^/dev(?=/|$)","",path)
-        path=re.sub(r"^/api/v1","",path)
+    proxy=p.get("proxy")
+    if proxy is not None:
+        # The API resource is /doctors/{proxy+}, so proxy omits the "/doctors" prefix.
+        return "/doctors/" + str(proxy).strip("/")
+    path=event.get("path") or event.get("rawPath") or ""
+    path=re.sub(r"^/dev(?=/|$)","",path)
+    path=re.sub(r"^/api/v1","",path)
     return "/" + str(path).strip("/")
 
+def _json_default(o):
+    # DynamoDB returns Decimal; MySQL returns Decimal/datetime/date/time/timedelta.
+    if isinstance(o,Decimal):
+        return int(o) if o==o.to_integral_value() else float(o)
+    if isinstance(o,(datetime,date,time)):
+        return o.isoformat()
+    if isinstance(o,timedelta):
+        total=int(o.total_seconds()); return "%02d:%02d:%02d"%(total//3600,total%3600//60,total%60)
+    return str(o)
+
 def out(status, data):
-    return response(status,data)
+    return {"statusCode":status,
+            "headers":{"content-type":"application/json","cache-control":"no-store"},
+            "body":json.dumps(data,default=_json_default)}
 
 def parse_body(event):
     v=body(event)
@@ -209,9 +224,17 @@ def handler(event, context):
                     tz=ZoneInfo(dr["timezone"])
                     start_utc=datetime.combine(day,time.min,tzinfo=tz).astimezone(timezone.utc).replace(tzinfo=None)
                     end_utc=datetime.combine(day+timedelta(days=1),time.min,tzinfo=tz).astimezone(timezone.utc).replace(tzinfo=None)
-                    cur.execute("""SELECT appointment_id,patient_id,consultation_type_id,slot_id,start_at,end_at,fee_snapshot,status
-                        FROM appointments WHERE doctor_id=%s AND start_at >= %s AND start_at < %s ORDER BY start_at""",(uid,start_utc,end_utc))
-                    appointments=cur.fetchall()
+                    try:
+                        cur.execute("""SELECT appointment_id,patient_id,consultation_type_id,slot_id,start_at,end_at,fee_snapshot,status
+                            FROM appointments WHERE doctor_id=%s AND start_at >= %s AND start_at < %s ORDER BY start_at""",(uid,start_utc,end_utc))
+                        appointments=cur.fetchall()
+                    except pymysql.err.ProgrammingError as e:
+                        # 1146 = table doesn't exist yet (appointments arrive with the booking milestone).
+                        if e.args and e.args[0]==1146:
+                            emit("warning","appointments_table_missing",cid)
+                            appointments=[]
+                        else:
+                            raise
                     table=ddb.Table(f"MediSlot-{c['env']}-Slots")
                     items=[]; kwargs={"IndexName":"GSI_DoctorDate","KeyConditionExpression":Key("doctor_date").eq(f"DOCTOR#{uid}#{day.isoformat()}")}
                     try:
