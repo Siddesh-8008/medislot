@@ -1,7 +1,7 @@
 import os, secrets, requests, boto3
 from flask import Flask, request, session, redirect, url_for, render_template_string, flash
 app=Flask(__name__)
-app.config.update(SESSION_COOKIE_HTTPONLY=True,SESSION_COOKIE_SECURE=True,SESSION_COOKIE_SAMESITE="Lax")
+app.config.update(SESSION_COOKIE_HTTPONLY=True,SESSION_COOKIE_SECURE=os.environ.get("SESSION_COOKIE_SECURE","false").lower()=="true",SESSION_COOKIE_SAMESITE="Lax")
 app.secret_key=os.environ.get("FLASK_SESSION_SECRET") or boto3.client("ssm").get_parameter(Name=os.environ.get("SESSION_SECRET_PARAMETER","/medislot/dev/web/session-secret"),WithDecryption=True)["Parameter"]["Value"]
 API_BASE=os.environ["MEDISLOT_API_BASE"].rstrip("/")
 LOGIN_URL=API_BASE+"/auth/login"
@@ -29,18 +29,34 @@ input,textarea,select,button{font:inherit;padding:9px;width:100%;box-sizing:bord
 def api(method,path,**kwargs):
     headers=kwargs.pop("headers",{})
     if session.get("access_token"): headers["Authorization"]="Bearer "+session["access_token"]
-    return requests.request(method,API_BASE+path,headers=headers,timeout=12,**kwargs)
+    return requests.request(method,API_BASE+path,headers=headers,timeout=25,**kwargs)
 @app.get("/")
 def home():
     schedule=session.pop("schedule",None)
     return render_template_string(PAGE,logged_in=bool(session.get("access_token")),messages=session.pop("messages",[]),schedule=schedule)
+@app.get("/login")
+def login_page():
+    return redirect("/")
 @app.post("/login")
 def login():
-    r=requests.post(LOGIN_URL,json={"email":request.form["email"],"password":request.form["password"]},timeout=12)
-    if r.ok and r.json().get("accessToken"):
-        session.clear(); session["access_token"]=r.json()["accessToken"]; session["refresh_token"]=r.json().get("refreshToken"); session["role"]=r.json().get("role","DOCTOR")
-        if session["role"]!="DOCTOR": session.clear(); session["messages"]=["Doctor account required."]
-    else: session["messages"]=["Sign-in failed. Check credentials and API response."]
+    try:
+        r=requests.post(LOGIN_URL,json={"email":request.form["email"],"password":request.form["password"]},timeout=25)
+    except requests.RequestException as e:
+        app.logger.error("login upstream error: %s",e)
+        session["messages"]=[f"Could not reach the MediSlot API ({type(e).__name__}). Check API URL and Lambda logs."]
+        return redirect("/")
+    try: payload=r.json()
+    except ValueError: payload={}
+    if r.ok and payload.get("accessToken"):
+        role=payload.get("role","DOCTOR")
+        session.clear()
+        if role!="DOCTOR":
+            session["messages"]=["Doctor account required."]
+        else:
+            session["access_token"]=payload["accessToken"]; session["refresh_token"]=payload.get("refreshToken"); session["role"]=role
+    else:
+        app.logger.warning("login failed: HTTP %s %s",r.status_code,r.text[:300])
+        session["messages"]=[f"Sign-in failed: HTTP {r.status_code} - {payload.get('message') or r.text[:120]}"]
     return redirect("/")
 @app.get("/logout")
 def logout():

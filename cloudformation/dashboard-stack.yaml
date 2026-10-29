@@ -1,4 +1,3 @@
-
 AWSTemplateFormatVersion: "2010-09-09"
 Description: MediSlot doctor dashboard on Amazon Linux 2023 EC2 behind Nginx.
 
@@ -145,7 +144,7 @@ Resources:
             Group=ec2-user
             WorkingDirectory=/opt/medislot-dashboard
             EnvironmentFile=/etc/medislot-dashboard.env
-            ExecStart=/opt/medislot-dashboard/venv/bin/gunicorn --workers 2 --bind 127.0.0.1:8000 --access-logfile - --error-logfile - doctor_dashboard:app
+            ExecStart=/opt/medislot-dashboard/venv/bin/gunicorn --workers 2 --timeout 60 --bind 127.0.0.1:8000 --access-logfile - --error-logfile - doctor_dashboard:app
             Restart=on-failure
             RestartSec=5
             NoNewPrivileges=true
