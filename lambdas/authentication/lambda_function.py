@@ -28,6 +28,8 @@ def _register(event, context, role, cid):
     email = str(data.get("email", "")).strip().lower()
     password = data.get("password", "")
     phone = str(data.get("phone", "")).strip() or None
+    if phone and len(phone) > 25:
+        return response(400, {"message": "phone must be 25 characters or fewer", "correlationId": cid})
     dob = str(data.get("dateOfBirth", "")).strip() or None
     gender = str(data.get("gender", "")).strip() or None
     address = str(data.get("address", "")).strip() or None
@@ -58,21 +60,30 @@ def _register(event, context, role, cid):
             "correlationId": cid,
         })
 
-    specialization = None
+    specialization_id = None
+    hospital_id = None
     license_number = None
     clinic_address = None
     years = None
     if role == "DOCTOR":
-        specialization = str(data.get("specialization", "")).strip()
+        try:
+            specialization_id = int(data.get("specializationId"))
+            hospital_id = int(data.get("hospitalId"))
+        except (TypeError, ValueError):
+            return response(400, {
+                "message": "hospitalId and specializationId must be valid integer IDs",
+                "correlationId": cid,
+            })
+
+        if hospital_id <= 0 or specialization_id <= 0:
+            return response(400, {
+                "message": "hospitalId and specializationId must be positive integer IDs",
+                "correlationId": cid,
+            })
+
         license_number = str(data.get("licenseNumber", "")).strip().upper()
         clinic_address = str(data.get("clinicAddress", "")).strip() or None
         years = data.get("yearsExperience")
-
-        if not specialization or len(specialization) > 120:
-            return response(400, {
-                "message": "specialization is required for doctor registration",
-                "correlationId": cid,
-            })
         if not LICENSE_RE.fullmatch(license_number):
             return response(400, {
                 "message": "licenseNumber must match state-1234 format (for example, TS-1234 or Telangana-1234)",
@@ -90,14 +101,43 @@ def _register(event, context, role, cid):
                 })
 
     c = config()
+    if role == "DOCTOR":
+        # Validate reference IDs before inserting the account. The FK constraints
+        # remain the final protection against concurrent reference-data changes.
+        conn = dbconn(c)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT hospital_id FROM hospitals WHERE hospital_id = %s AND is_active = 1",
+                    (hospital_id,),
+                )
+                hospital = cur.fetchone()
+                if not hospital:
+                    return response(400, {
+                        "message": "Invalid or inactive hospitalId",
+                        "correlationId": cid,
+                    })
+                cur.execute(
+                    "SELECT specialization_id FROM specializations WHERE specialization_id = %s AND is_active = 1",
+                    (specialization_id,),
+                )
+                specialization = cur.fetchone()
+                if not specialization:
+                    return response(400, {
+                        "message": "Invalid or inactive specializationId",
+                        "correlationId": cid,
+                    })
+        finally:
+            conn.close()
+
     password_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt(rounds=12)).decode()
     conn = dbconn(c)
     try:
         with conn.cursor() as cur:
             # The users table stores identity/authentication fields only.
             cur.execute(
-                "INSERT INTO users (email, password_hash, role) VALUES (%s, %s, %s)",
-                (email, password_hash, role),
+                "INSERT INTO users (email, password_hash, role, phone) VALUES (%s, %s, %s, %s)",
+                (email, password_hash, role, phone),
             )
             user_id = cur.lastrowid
 
@@ -105,17 +145,17 @@ def _register(event, context, role, cid):
             if role == "PATIENT":
                 cur.execute(
                     """INSERT INTO patients
-                       (patient_id, first_name, last_name, phone, date_of_birth, gender, address)
-                       VALUES (%s, %s, %s, %s, %s, %s, %s)""",
-                    (user_id, first, last, phone, dob, gender, address),
+                       (patient_id, first_name, last_name, date_of_birth, gender, address)
+                       VALUES (%s, %s, %s, %s, %s, %s)""",
+                    (user_id, first, last, dob, gender, address),
                 )
             else:
                 cur.execute(
                     """INSERT INTO doctors
-                       (doctor_id, first_name, last_name, phone, specialization,
+                       (doctor_id, first_name, last_name, hospital_id, specialization_id,
                         license_number, years_experience, clinic_address)
                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
-                    (user_id, first, last, phone, specialization,
+                    (user_id, first, last, hospital_id, specialization_id,
                      license_number, years, clinic_address),
                 )
         conn.commit()
@@ -151,10 +191,22 @@ def _login(event, cid):
     c=config(); conn=dbconn(c)
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT user_id,password_hash,role FROM users WHERE email=%s", (email,)); user=cur.fetchone()
+            cur.execute(
+                "SELECT user_id, password_hash, role, is_active FROM users WHERE email=%s",
+                (email,),
+            )
+            user = cur.fetchone()
     finally: conn.close()
-    if not user or not bcrypt.checkpw(password.encode(), user["password_hash"].encode()):
-        emit("warning","login_rejected",cid); return response(401,{"message":"Invalid email or password","correlationId":cid})
+    if (
+        not user
+        or not user.get("is_active", 1)
+        or not bcrypt.checkpw(password.encode(), user["password_hash"].encode())
+    ):
+        emit("warning", "login_rejected", cid)
+        return response(401, {
+            "message": "Invalid email or password, or account is inactive",
+            "correlationId": cid,
+        })
     now=int(time.time()); minutes=int(get_param(f"{c['prefix']}/auth/access-token-minutes")); days=int(get_param(f"{c['prefix']}/auth/refresh-token-days"))
     access=_issue_access(user["user_id"],user["role"],c["jwt"],minutes,now)
     raw=secrets.token_urlsafe(48)

@@ -1,25 +1,28 @@
--- Fresh-install schema for MediSlot identity and role-specific profiles.
--- Run once against an empty `medislot` database. No legacy-data migration is included.
--- Passwords are bcrypt hashes; never store plaintext passwords.
+-- MediSlot identity, doctor profile and reference-data schema.
+-- Fresh install only. Existing deployments should run migration_002_reference_data.sql.
+-- Never store plaintext passwords.
 
 CREATE TABLE IF NOT EXISTS users (
     user_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
     email VARCHAR(254) NOT NULL,
     password_hash VARCHAR(255) NOT NULL,
     role ENUM('PATIENT', 'DOCTOR') NOT NULL,
+    phone VARCHAR(25) NULL,
+    is_active TINYINT(1) NOT NULL DEFAULT 1,
     created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
         ON UPDATE CURRENT_TIMESTAMP(6),
     PRIMARY KEY (user_id),
     UNIQUE KEY uq_users_email (email),
-    KEY ix_users_role (role)
+    UNIQUE KEY uq_users_phone (phone),
+    KEY ix_users_role (role),
+    KEY ix_users_is_active (is_active)
 ) ENGINE=InnoDB;
 
 CREATE TABLE IF NOT EXISTS patients (
     patient_id BIGINT UNSIGNED NOT NULL,
     first_name VARCHAR(75) NOT NULL,
     last_name VARCHAR(75) NOT NULL,
-    phone VARCHAR(25) NULL,
     date_of_birth DATE NULL,
     gender VARCHAR(30) NULL,
     address VARCHAR(500) NULL,
@@ -31,26 +34,115 @@ CREATE TABLE IF NOT EXISTS patients (
         REFERENCES users(user_id) ON DELETE CASCADE
 ) ENGINE=InnoDB;
 
+CREATE TABLE IF NOT EXISTS hospitals (
+    hospital_id INT UNSIGNED NOT NULL,
+    hospital_name VARCHAR(180) NOT NULL,
+    address VARCHAR(500) NOT NULL,
+    city VARCHAR(100) NOT NULL DEFAULT 'Hyderabad',
+    state VARCHAR(100) NOT NULL DEFAULT 'Telangana',
+    phone VARCHAR(25) NULL,
+    is_active TINYINT(1) NOT NULL DEFAULT 1,
+    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+        ON UPDATE CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (hospital_id),
+    UNIQUE KEY uq_hospitals_name (hospital_name),
+    KEY ix_hospitals_active (is_active)
+) ENGINE=InnoDB;
+
+CREATE TABLE IF NOT EXISTS specializations (
+    specialization_id INT UNSIGNED NOT NULL,
+    specialization_name VARCHAR(120) NOT NULL,
+    is_active TINYINT(1) NOT NULL DEFAULT 1,
+    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+        ON UPDATE CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (specialization_id),
+    UNIQUE KEY uq_specializations_name (specialization_name),
+    KEY ix_specializations_active (is_active)
+) ENGINE=InnoDB;
+
 CREATE TABLE IF NOT EXISTS doctors (
     doctor_id BIGINT UNSIGNED NOT NULL,
     first_name VARCHAR(75) NOT NULL,
     last_name VARCHAR(75) NOT NULL,
-    phone VARCHAR(25) NULL,
-    specialization VARCHAR(120) NOT NULL,
+    hospital_id INT UNSIGNED NOT NULL,
+    specialization_id INT UNSIGNED NOT NULL,
     license_number VARCHAR(32) NOT NULL,
     years_experience SMALLINT UNSIGNED NULL,
     clinic_address VARCHAR(500) NULL,
     qualifications TEXT NULL,
     languages_spoken JSON NULL,
-    photo_key VARCHAR(1024) NULL,
     timezone VARCHAR(64) NOT NULL DEFAULT 'Asia/Kolkata',
     created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
         ON UPDATE CURRENT_TIMESTAMP(6),
     PRIMARY KEY (doctor_id),
     UNIQUE KEY uq_doctors_license_number (license_number),
-    KEY ix_doctors_specialization (specialization),
+    KEY ix_doctors_specialization_id (specialization_id),
+    KEY ix_doctors_hospital_id (hospital_id),
     KEY ix_doctors_name (last_name, first_name),
     CONSTRAINT fk_doctors_user FOREIGN KEY (doctor_id)
-        REFERENCES users(user_id) ON DELETE CASCADE
+        REFERENCES users(user_id) ON DELETE CASCADE,
+    CONSTRAINT fk_doctors_hospital FOREIGN KEY (hospital_id)
+        REFERENCES hospitals(hospital_id),
+    CONSTRAINT fk_doctors_specialization FOREIGN KEY (specialization_id)
+        REFERENCES specializations(specialization_id)
 ) ENGINE=InnoDB;
+
+-- Idempotent reference data: rerunning updates names/details without creating duplicates.
+INSERT INTO hospitals
+    (hospital_id, hospital_name, address, city, state, phone, is_active)
+VALUES
+    (1, 'Apollo Hospitals Jubilee Hills', 'Road No. 72, Film Nagar, Jubilee Hills', 'Hyderabad', 'Telangana', NULL, 1),
+    (2, 'Yashoda Hospitals Somajiguda', 'Raj Bhavan Road, Somajiguda', 'Hyderabad', 'Telangana', NULL, 1),
+    (3, 'KIMS Hospitals Secunderabad', 'Minister Road, Secunderabad', 'Hyderabad', 'Telangana', NULL, 1),
+    (4, 'CARE Hospitals Banjara Hills', 'Road No. 1, Banjara Hills', 'Hyderabad', 'Telangana', NULL, 1),
+    (5, 'AIG Hospitals Gachibowli', 'Mindspace Road, Gachibowli', 'Hyderabad', 'Telangana', NULL, 1),
+    (6, 'Continental Hospitals', 'Financial District, Nanakramguda', 'Hyderabad', 'Telangana', NULL, 1),
+    (7, 'Rainbow Children''s Hospital Banjara Hills', 'Road No. 10, Banjara Hills', 'Hyderabad', 'Telangana', NULL, 1),
+    (8, 'NIMS Hyderabad', 'Punjagutta', 'Hyderabad', 'Telangana', NULL, 1),
+    (9, 'Osmania General Hospital', 'Afzal Gunj', 'Hyderabad', 'Telangana', NULL, 1),
+    (10, 'Gandhi Hospital', 'Musheerabad, Secunderabad', 'Hyderabad', 'Telangana', NULL, 1)
+ON DUPLICATE KEY UPDATE
+    hospital_name = VALUES(hospital_name),
+    address = VALUES(address),
+    city = VALUES(city),
+    state = VALUES(state),
+    is_active = VALUES(is_active);
+
+INSERT INTO specializations (specialization_id, specialization_name, is_active)
+VALUES
+    (1, 'Cardiology', 1),
+    (2, 'Dermatology', 1),
+    (3, 'Endocrinology', 1),
+    (4, 'Family Medicine', 1),
+    (5, 'Gastroenterology', 1),
+    (6, 'General Medicine', 1),
+    (7, 'General Surgery', 1),
+    (8, 'Geriatrics', 1),
+    (9, 'Gynecology', 1),
+    (10, 'Hematology', 1),
+    (11, 'Nephrology', 1),
+    (12, 'Neurology', 1),
+    (13, 'Neurosurgery', 1),
+    (14, 'Oncology', 1),
+    (15, 'Ophthalmology', 1),
+    (16, 'Orthopedics', 1),
+    (17, 'Otolaryngology (ENT)', 1),
+    (18, 'Pediatrics', 1),
+    (19, 'Psychiatry', 1),
+    (20, 'Pulmonology', 1),
+    (21, 'Radiology', 1),
+    (22, 'Rheumatology', 1),
+    (23, 'Urology', 1),
+    (24, 'Anesthesiology', 1),
+    (25, 'Emergency Medicine', 1),
+    (26, 'Infectious Disease', 1),
+    (27, 'Physical Medicine and Rehabilitation', 1),
+    (28, 'Plastic Surgery', 1),
+    (29, 'Vascular Surgery', 1),
+    (30, 'Obstetrics', 1)
+ON DUPLICATE KEY UPDATE
+    specialization_name = VALUES(specialization_name),
+    is_active = VALUES(is_active);
