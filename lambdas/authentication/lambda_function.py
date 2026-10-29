@@ -1,4 +1,3 @@
-```python
 import os
 import re
 import time
@@ -787,4 +786,3 @@ def handler(event, context):
                 "correlationId": cid,
             },
         )
-```
