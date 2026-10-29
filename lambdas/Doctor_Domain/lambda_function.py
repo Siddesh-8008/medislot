@@ -226,3 +226,4 @@ def handler(event, context):
     except Exception as e:
         emit("error","doctor_domain_error",cid,error=type(e).__name__,path=path,method=method)
         return out(500,{"message":"Internal server error","correlationId":cid})
+#
