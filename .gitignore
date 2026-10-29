@@ -11,3 +11,5 @@ dist/
 build/
 *.zip
 .DS_Store
+
+web/.env

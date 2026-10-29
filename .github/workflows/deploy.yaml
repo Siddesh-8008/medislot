@@ -1,4 +1,3 @@
-
 name: MediSlot Milestone 2 CI and Deployment
 
 on:
@@ -15,6 +14,8 @@ on:
       - "requirements-dev.txt"
       - "README.md"
       - "scehma/**"
+      - "web/**"
+      - "MILESTONE3.md"
   workflow_dispatch:
 
 permissions:
@@ -31,12 +32,12 @@ env:
   AWS_DEFAULT_REGION: ${{ vars.AWS_REGION || 'ap-south-1' }}
   ENVIRONMENT: ${{ vars.ENVIRONMENT || 'dev' }}
   AWS_DEPLOY_ROLE_ARN: ${{ vars.AWS_DEPLOY_ROLE_ARN || secrets.AWS_DEPLOY_ROLE_ARN }}
+  DASHBOARD_ALLOWED_CLIENT_CIDR: ${{ vars.DASHBOARD_ALLOWED_CLIENT_CIDR }}
 
 jobs:
   ci:
     name: ci
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -57,7 +58,7 @@ jobs:
         run: pytest -q
 
       - name: Python syntax check
-        run: python -m compileall -q lambdas tests
+        run: python -m compileall -q lambdas tests web
 
       - name: Validate CloudFormation templates
         run: |
@@ -82,7 +83,6 @@ jobs:
     needs: ci
     runs-on: ubuntu-latest
     environment: dev
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -92,13 +92,16 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Validate required OIDC configuration
+      - name: Validate required deployment configuration
         shell: bash
         run: |
           set -euo pipefail
-
           if [[ -z "$AWS_DEPLOY_ROLE_ARN" ]]; then
             echo "::error::Set AWS_DEPLOY_ROLE_ARN in GitHub repository variables or secrets."
+            exit 1
+          fi
+          if [[ -z "$DASHBOARD_ALLOWED_CLIENT_CIDR" ]]; then
+            echo "::error::Set the GitHub Actions variable DASHBOARD_ALLOWED_CLIENT_CIDR to your public IP in CIDR format, for example x.x.x.x/32."
             exit 1
           fi
 
@@ -111,13 +114,12 @@ jobs:
       - name: Verify OIDC identity
         run: aws sts get-caller-identity
 
-      # The initial IAM bootstrap must be deployed by an authorized
-      # AWS administrator before this step can run successfully.
+      # Initial IAM bootstrap may require an AWS administrator to authorize this role
+      # to update the IAM permissions stack itself.
       - name: Deploy IAM permissions stack
         shell: bash
         run: |
           set -euo pipefail
-
           python scripts/deploy_stack.py \
             cloudformation/iam-stack.yaml \
             "medislot-${ENVIRONMENT}-iam" \
@@ -128,7 +130,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           python scripts/deploy_stack.py \
             cloudformation/network-stack.yaml \
             "medislot-${ENVIRONMENT}-network" \
@@ -138,45 +139,32 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           DB_PASSWORD_PARAMETER="/medislot/${ENVIRONMENT}/db/password"
           JWT_SECRET_PARAMETER="/medislot/${ENVIRONMENT}/auth/jwt-secret"
+          SESSION_SECRET_PARAMETER="/medislot/${ENVIRONMENT}/web/session-secret"
 
-          if ! aws ssm get-parameter \
-            --name "$DB_PASSWORD_PARAMETER" \
-            --region "$AWS_REGION" >/dev/null 2>&1; then
-
+          if ! aws ssm get-parameter --name "$DB_PASSWORD_PARAMETER" --region "$AWS_REGION" >/dev/null 2>&1; then
             DB_PASSWORD="$(python -c 'import secrets,string; a=string.ascii_letters+string.digits+"!_-+="; print("".join(secrets.choice(a) for _ in range(32)))')"
-
-            aws ssm put-parameter \
-              --name "$DB_PASSWORD_PARAMETER" \
-              --type SecureString \
-              --value "$DB_PASSWORD" \
-              --region "$AWS_REGION" >/dev/null
-
+            aws ssm put-parameter --name "$DB_PASSWORD_PARAMETER" --type SecureString --value "$DB_PASSWORD" --region "$AWS_REGION" >/dev/null
             unset DB_PASSWORD
           fi
 
-          if ! aws ssm get-parameter \
-            --name "$JWT_SECRET_PARAMETER" \
-            --region "$AWS_REGION" >/dev/null 2>&1; then
-
+          if ! aws ssm get-parameter --name "$JWT_SECRET_PARAMETER" --region "$AWS_REGION" >/dev/null 2>&1; then
             JWT_SECRET="$(python -c 'import secrets; print(secrets.token_urlsafe(64))')"
-
-            aws ssm put-parameter \
-              --name "$JWT_SECRET_PARAMETER" \
-              --type SecureString \
-              --value "$JWT_SECRET" \
-              --region "$AWS_REGION" >/dev/null
-
+            aws ssm put-parameter --name "$JWT_SECRET_PARAMETER" --type SecureString --value "$JWT_SECRET" --region "$AWS_REGION" >/dev/null
             unset JWT_SECRET
+          fi
+
+          if ! aws ssm get-parameter --name "$SESSION_SECRET_PARAMETER" --region "$AWS_REGION" >/dev/null 2>&1; then
+            SESSION_SECRET="$(python -c 'import secrets; print(secrets.token_urlsafe(64))')"
+            aws ssm put-parameter --name "$SESSION_SECRET_PARAMETER" --type SecureString --value "$SESSION_SECRET" --region "$AWS_REGION" >/dev/null
+            unset SESSION_SECRET
           fi
 
       - name: Deploy data stack
         shell: bash
         run: |
           set -euo pipefail
-
           python scripts/deploy_stack.py \
             cloudformation/data-stack.yaml \
             "medislot-${ENVIRONMENT}-data" \
@@ -186,31 +174,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           AWS_ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
           BUCKET="medislot-${ENVIRONMENT}-artifacts-${AWS_ACCOUNT_ID}"
-
-          for fn in authentication authorizer rds_check; do
+          for fn in authentication authorizer rds_check doctor_domain slot_materialiser; do
             tmp="$(mktemp -d)"
-
             cp -R "lambdas/${fn}/." "$tmp/"
             cp "lambdas/common.py" "$tmp/common.py"
-
-            pip install --quiet \
-              -r "lambdas/${fn}/requirements.txt" \
-              -t "$tmp"
-
-            (
-              cd "$tmp"
-              zip -qr "$GITHUB_WORKSPACE/${fn}.zip" .
-            )
-
-            aws s3 cp \
-              "$GITHUB_WORKSPACE/${fn}.zip" \
-              "s3://${BUCKET}/lambda/${GITHUB_SHA}/${fn}.zip" \
-              --sse AES256 \
-              --region "$AWS_REGION"
-
+            pip install --quiet -r "lambdas/${fn}/requirements.txt" -t "$tmp"
+            (cd "$tmp" && zip -qr "$GITHUB_WORKSPACE/${fn}.zip" .)
+            aws s3 cp "$GITHUB_WORKSPACE/${fn}.zip" "s3://${BUCKET}/lambda/${GITHUB_SHA}/${fn}.zip" --sse AES256 --region "$AWS_REGION"
             rm -rf "$tmp" "$GITHUB_WORKSPACE/${fn}.zip"
           done
 
@@ -218,9 +190,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
-
           python scripts/deploy_stack.py \
             cloudformation/auth-stack.yaml \
             "medislot-${ENVIRONMENT}-auth" \
@@ -228,31 +198,59 @@ jobs:
             "ArtifactBucket=medislot-${ENVIRONMENT}-artifacts-${ACCOUNT}" \
             "ArtifactPrefix=lambda/${GITHUB_SHA}"
 
-      - name: Print deployed API outputs
+      - name: Package and upload doctor dashboard
         shell: bash
         run: |
           set -euo pipefail
+          ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
+          BUCKET="medislot-${ENVIRONMENT}-artifacts-${ACCOUNT}"
+          KEY="dashboard/${GITHUB_SHA}/dashboard.zip"
+          (cd web && zip -q "$GITHUB_WORKSPACE/dashboard.zip" doctor_dashboard.py requirements.txt)
+          aws s3 cp "$GITHUB_WORKSPACE/dashboard.zip" "s3://${BUCKET}/${KEY}" --sse AES256 --region "$AWS_REGION"
+          echo "DASHBOARD_ARTIFACT_BUCKET=$BUCKET" >> "$GITHUB_ENV"
+          echo "DASHBOARD_ARTIFACT_KEY=$KEY" >> "$GITHUB_ENV"
 
-          aws cloudformation describe-stacks \
+      - name: Deploy dashboard stack
+        shell: bash
+        run: |
+          set -euo pipefail
+          API_URL="$(aws cloudformation describe-stacks \
             --stack-name "medislot-${ENVIRONMENT}-auth" \
-            --region "$AWS_REGION" \
-            --query 'Stacks[0].Outputs[*].[OutputKey,OutputValue]' \
-            --output table
+            --query "Stacks[0].Outputs[?OutputKey=='ApiUrl'].OutputValue | [0]" \
+            --output text --region "$AWS_REGION")"
+          if [[ -z "$API_URL" || "$API_URL" == "None" ]]; then
+            echo "::error::Could not find ApiUrl output on the auth stack."
+            exit 1
+          fi
+          python scripts/deploy_stack.py \
+            cloudformation/dashboard-stack.yaml \
+            "medislot-${ENVIRONMENT}-dashboard" \
+            "Environment=${ENVIRONMENT}" \
+            "DashboardArtifactBucket=${DASHBOARD_ARTIFACT_BUCKET}" \
+            "DashboardArtifactKey=${DASHBOARD_ARTIFACT_KEY}" \
+            "ApiBaseUrl=${API_URL}" \
+            "AllowedClientCidr=${DASHBOARD_ALLOWED_CLIENT_CIDR}"
+
+      - name: Print deployed API and dashboard outputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          for stack in "medislot-${ENVIRONMENT}-auth" "medislot-${ENVIRONMENT}-dashboard"; do
+            echo "Outputs for $stack"
+            aws cloudformation describe-stacks --stack-name "$stack" --region "$AWS_REGION" \
+              --query 'Stacks[0].Outputs[*].[OutputKey,OutputValue]' --output table
+          done
 
       - name: Test RDS connectivity
         shell: bash
         run: |
           set -euo pipefail
-
           aws lambda invoke \
             --function-name "medislot-${ENVIRONMENT}-rds-connection-check" \
             --payload '{"correlationId":"github-actions-smoke-test"}' \
             --cli-binary-format raw-in-base64-out \
-            /tmp/rds-check.json \
-            --region "$AWS_REGION" >/dev/null
-
+            /tmp/rds-check.json --region "$AWS_REGION" >/dev/null
           cat /tmp/rds-check.json
-
           python -c '
           import json
           with open("/tmp/rds-check.json") as f:

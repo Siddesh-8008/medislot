@@ -1,5 +1,7 @@
 -- MediSlot identity, doctor profile and reference-data schema.
--- Fresh install only. Existing deployments should run migration_002_reference_data.sql.
+-- Fresh database install: creates core MediSlot tables and Milestone 3 doctor-domain tables.
+-- Run this file once against an empty medislot database.
+-- Never store plaintext passwords.
 -- Never store plaintext passwords.
 
 CREATE TABLE IF NOT EXISTS users (
@@ -74,6 +76,7 @@ CREATE TABLE IF NOT EXISTS doctors (
     qualifications TEXT NULL,
     languages_spoken JSON NULL,
     timezone VARCHAR(64) NOT NULL DEFAULT 'Asia/Kolkata',
+    photo_key VARCHAR(1024) NULL,
     created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
         ON UPDATE CURRENT_TIMESTAMP(6),
@@ -88,6 +91,60 @@ CREATE TABLE IF NOT EXISTS doctors (
         REFERENCES hospitals(hospital_id),
     CONSTRAINT fk_doctors_specialization FOREIGN KEY (specialization_id)
         REFERENCES specializations(specialization_id)
+) ENGINE=InnoDB;
+
+
+CREATE TABLE IF NOT EXISTS consultation_types (
+    consultation_type_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    doctor_id BIGINT UNSIGNED NOT NULL,
+    name VARCHAR(100) NOT NULL,
+    duration_minutes SMALLINT UNSIGNED NOT NULL,
+    fee DECIMAL(10,2) NOT NULL,
+    capacity SMALLINT UNSIGNED NOT NULL DEFAULT 1,
+    is_active TINYINT(1) NOT NULL DEFAULT 1,
+    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+        ON UPDATE CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (consultation_type_id),
+    UNIQUE KEY uq_consultation_doctor_name (doctor_id, name),
+    KEY ix_consultation_doctor_active (doctor_id, is_active),
+    CONSTRAINT fk_consultation_doctor FOREIGN KEY (doctor_id)
+        REFERENCES doctors(doctor_id)
+) ENGINE=InnoDB;
+
+CREATE TABLE IF NOT EXISTS availability_patterns (
+    pattern_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    doctor_id BIGINT UNSIGNED NOT NULL,
+    consultation_type_id BIGINT UNSIGNED NOT NULL,
+    day_of_week TINYINT UNSIGNED NOT NULL COMMENT 'ISO weekday: 1 Monday through 7 Sunday',
+    start_time TIME NOT NULL,
+    end_time TIME NOT NULL,
+    is_active TINYINT(1) NOT NULL DEFAULT 1,
+    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+        ON UPDATE CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (pattern_id),
+    KEY ix_availability_doctor_day_active (doctor_id, day_of_week, is_active),
+    KEY ix_availability_consultation (consultation_type_id),
+    CONSTRAINT fk_availability_doctor FOREIGN KEY (doctor_id)
+        REFERENCES doctors(doctor_id),
+    CONSTRAINT fk_availability_consultation FOREIGN KEY (consultation_type_id)
+        REFERENCES consultation_types(consultation_type_id),
+    CONSTRAINT chk_availability_day CHECK (day_of_week BETWEEN 1 AND 7),
+    CONSTRAINT chk_availability_time CHECK (end_time > start_time)
+) ENGINE=InnoDB;
+
+CREATE TABLE IF NOT EXISTS blackout_dates (
+    blackout_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    doctor_id BIGINT UNSIGNED NOT NULL,
+    blackout_date DATE NOT NULL,
+    reason VARCHAR(255) NULL,
+    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (blackout_id),
+    UNIQUE KEY uq_blackout_doctor_date (doctor_id, blackout_date),
+    KEY ix_blackout_doctor_date (doctor_id, blackout_date),
+    CONSTRAINT fk_blackout_doctor FOREIGN KEY (doctor_id)
+        REFERENCES doctors(doctor_id)
 ) ENGINE=InnoDB;
 
 -- Idempotent reference data: rerunning updates names/details without creating duplicates.

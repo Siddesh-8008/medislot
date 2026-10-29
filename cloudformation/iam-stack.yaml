@@ -1,19 +1,14 @@
-
 AWSTemplateFormatVersion: "2010-09-09"
 
 Description: >
   MediSlot IAM deployment permissions for GitHub Actions,
-  including the regional API Gateway CloudWatch logging role.
-  Lambda execution roles remain managed by auth-stack.yaml.
+  including dashboard deployment permissions and the regional API Gateway logging role.
 
 Parameters:
   Environment:
     Type: String
     Default: dev
-    AllowedValues:
-      - dev
-      - test
-      - prod
+    AllowedValues: [dev, test, prod]
 
   GitHubActionsRoleName:
     Type: String
@@ -45,6 +40,7 @@ Resources:
               - !Sub arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/medislot-${Environment}-network/*
               - !Sub arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/medislot-${Environment}-data/*
               - !Sub arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/medislot-${Environment}-auth/*
+              - !Sub arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/medislot-${Environment}-dashboard/*
 
           - Sid: InspectCloudFormation
             Effect: Allow
@@ -55,9 +51,83 @@ Resources:
 
           - Sid: ReadCallerIdentity
             Effect: Allow
-            Action:
-              - sts:GetCallerIdentity
+            Action: sts:GetCallerIdentity
             Resource: "*"
+
+          - Sid: ManageDashboardSessionSecret
+            Effect: Allow
+            Action:
+              - ssm:GetParameter
+              - ssm:PutParameter
+              - ssm:DescribeParameters
+            Resource:
+              - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/medislot/${Environment}/web/session-secret
+
+          - Sid: UploadDashboardArtifact
+            Effect: Allow
+            Action:
+              - s3:PutObject
+              - s3:AbortMultipartUpload
+            Resource:
+              - !Sub arn:${AWS::Partition}:s3:::medislot-${Environment}-artifacts-${AWS::AccountId}/dashboard/*
+
+          - Sid: DashboardEC2Operations
+            Effect: Allow
+            Action:
+              - ec2:RunInstances
+              - ec2:TerminateInstances
+              - ec2:DescribeInstances
+              - ec2:DescribeImages
+              - ec2:DescribeInstanceTypes
+              - ec2:DescribeSecurityGroups
+              - ec2:DescribeSubnets
+              - ec2:DescribeVpcs
+              - ec2:CreateSecurityGroup
+              - ec2:DeleteSecurityGroup
+              - ec2:AuthorizeSecurityGroupIngress
+              - ec2:RevokeSecurityGroupIngress
+              - ec2:CreateTags
+              - ec2:DeleteTags
+              - ec2:DescribeTags
+            Resource: "*"
+
+          - Sid: ManageDashboardInstanceRole
+            Effect: Allow
+            Action:
+              - iam:CreateRole
+              - iam:DeleteRole
+              - iam:GetRole
+              - iam:TagRole
+              - iam:UntagRole
+              - iam:PutRolePolicy
+              - iam:DeleteRolePolicy
+              - iam:GetRolePolicy
+              - iam:ListRolePolicies
+              - iam:AttachRolePolicy
+              - iam:DetachRolePolicy
+              - iam:ListAttachedRolePolicies
+            Resource:
+              - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/medislot-${Environment}-dashboard-ec2-role
+
+          - Sid: ManageDashboardInstanceProfile
+            Effect: Allow
+            Action:
+              - iam:CreateInstanceProfile
+              - iam:DeleteInstanceProfile
+              - iam:GetInstanceProfile
+              - iam:AddRoleToInstanceProfile
+              - iam:RemoveRoleFromInstanceProfile
+            Resource:
+              - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:instance-profile/medislot-${Environment}-dashboard-ec2-profile
+
+          - Sid: PassDashboardInstanceRole
+            Effect: Allow
+            Action: iam:PassRole
+            Resource:
+              - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/medislot-${Environment}-dashboard-ec2-role
+            Condition:
+              StringEquals:
+                iam:PassedToService: ec2.amazonaws.com
 
   ApiGatewayCloudWatchRole:
     Type: AWS::IAM::Role
@@ -70,20 +140,17 @@ Resources:
           - Effect: Allow
             Principal:
               Service: apigateway.amazonaws.com
-            Action:
-              - sts:AssumeRole
+            Action: sts:AssumeRole
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs
       Tags:
         - Key: Project
           Value: MediSlot
 
-
   ApiGatewayAccount:
     Type: AWS::ApiGateway::Account
     Properties:
       CloudWatchRoleArn: !GetAtt ApiGatewayCloudWatchRole.Arn
-
 
 Outputs:
   DeploymentRoleName:
@@ -97,4 +164,3 @@ Outputs:
   ApiGatewayCloudWatchRoleArn:
     Description: Regional API Gateway CloudWatch logging role.
     Value: !GetAtt ApiGatewayCloudWatchRole.Arn
-     
