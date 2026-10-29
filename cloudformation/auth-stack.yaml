@@ -292,7 +292,7 @@ Resources:
       State: ENABLED
       ScheduleExpression: rate(1 day)
       FlexibleTimeWindow:
-        Mode: OFF
+        Mode: 'OFF'
       Target:
         Arn: !GetAtt SlotMaterialiserFunction.Arn
         RoleArn: !GetAtt SlotMaterialiserScheduleRole.Arn
