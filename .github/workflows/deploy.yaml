@@ -1,13 +1,11 @@
+
 name: MediSlot Milestone 2 CI and Deployment
 
 on:
   pull_request:
-    branches:
-      - main
-
+    branches: [main]
   push:
-    branches:
-      - main
+    branches: [main]
     paths:
       - "cloudformation/**"
       - "lambdas/**"
@@ -16,8 +14,7 @@ on:
       - ".github/workflows/**"
       - "requirements-dev.txt"
       - "README.md"
-      - "schema/**"
-
+      - "scehma/**"
   workflow_dispatch:
 
 permissions:
@@ -33,10 +30,11 @@ env:
   AWS_REGION: ${{ vars.AWS_REGION || 'ap-south-1' }}
   AWS_DEFAULT_REGION: ${{ vars.AWS_REGION || 'ap-south-1' }}
   ENVIRONMENT: ${{ vars.ENVIRONMENT || 'dev' }}
+  AWS_DEPLOY_ROLE_ARN: ${{ vars.AWS_DEPLOY_ROLE_ARN || secrets.AWS_DEPLOY_ROLE_ARN }}
 
 jobs:
   ci:
-    name: CI - Tests and Validation
+    name: ci
     runs-on: ubuntu-latest
 
     steps:
@@ -50,17 +48,15 @@ jobs:
           cache: pip
 
       - name: Install test dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements-dev.txt
+        run: pip install -r requirements-dev.txt
 
-      - name: Run unit tests
+      - name: Unit tests
         env:
           AWS_REGION: ap-south-1
           AWS_DEFAULT_REGION: ap-south-1
         run: pytest -q
 
-      - name: Check Python syntax
+      - name: Python syntax check
         run: python -m compileall -q lambdas tests
 
       - name: Validate CloudFormation templates
@@ -68,12 +64,12 @@ jobs:
           pip install cfn-lint
           cfn-lint cloudformation/*.yaml
 
-      - name: Scan for exposed secrets
+      - name: Secret scanning
         uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Infrastructure security scan
+      - name: Infrastructure-as-code scanning
         uses: bridgecrewio/checkov-action@v12
         with:
           directory: cloudformation
@@ -81,11 +77,8 @@ jobs:
           soft_fail: true
 
   deploy:
-    name: Deploy to AWS
-    if: >-
-      github.ref == 'refs/heads/main' &&
-      github.event_name != 'pull_request'
-
+    name: deploy
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
     needs: ci
     runs-on: ubuntu-latest
     environment: dev
@@ -99,30 +92,28 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Validate AWS deployment role
+      - name: Validate required OIDC configuration
         shell: bash
-        env:
-          AWS_DEPLOY_ROLE_ARN: ${{ vars.AWS_DEPLOY_ROLE_ARN || secrets.AWS_DEPLOY_ROLE_ARN }}
         run: |
           set -euo pipefail
 
-          if [[ -z "${AWS_DEPLOY_ROLE_ARN:-}" ]]; then
-            echo "::error::Configure AWS_DEPLOY_ROLE_ARN in GitHub repository variables or secrets."
+          if [[ -z "$AWS_DEPLOY_ROLE_ARN" ]]; then
+            echo "::error::Set AWS_DEPLOY_ROLE_ARN in GitHub repository variables or secrets."
             exit 1
           fi
 
       - name: Configure AWS credentials with OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN || secrets.AWS_DEPLOY_ROLE_ARN }}
+          role-to-assume: ${{ env.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Verify AWS identity
+      - name: Verify OIDC identity
         run: aws sts get-caller-identity
 
-      # This assumes the deployment role already has enough permissions
-      # to create/update this IAM stack.
-      - name: Deploy IAM stack
+      # The initial IAM bootstrap must be deployed by an authorized
+      # AWS administrator before this step can run successfully.
+      - name: Deploy IAM permissions stack
         shell: bash
         run: |
           set -euo pipefail
@@ -196,22 +187,16 @@ jobs:
         run: |
           set -euo pipefail
 
-          AWS_ACCOUNT_ID="$(aws sts get-caller-identity \
-            --query Account --output text)"
-
+          AWS_ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
           BUCKET="medislot-${ENVIRONMENT}-artifacts-${AWS_ACCOUNT_ID}"
 
           for fn in authentication authorizer rds_check; do
-            echo "Packaging Lambda: ${fn}"
-
             tmp="$(mktemp -d)"
-            trap 'rm -rf "$tmp"' EXIT
 
             cp -R "lambdas/${fn}/." "$tmp/"
             cp "lambdas/common.py" "$tmp/common.py"
 
-            pip install \
-              --quiet \
+            pip install --quiet \
               -r "lambdas/${fn}/requirements.txt" \
               -t "$tmp"
 
@@ -226,9 +211,7 @@ jobs:
               --sse AES256 \
               --region "$AWS_REGION"
 
-            rm -f "$GITHUB_WORKSPACE/${fn}.zip"
-            rm -rf "$tmp"
-            trap - EXIT
+            rm -rf "$tmp" "$GITHUB_WORKSPACE/${fn}.zip"
           done
 
       - name: Deploy authentication API stack
@@ -236,8 +219,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          ACCOUNT="$(aws sts get-caller-identity \
-            --query Account --output text)"
+          ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
 
           python scripts/deploy_stack.py \
             cloudformation/auth-stack.yaml \
@@ -246,7 +228,7 @@ jobs:
             "ArtifactBucket=medislot-${ENVIRONMENT}-artifacts-${ACCOUNT}" \
             "ArtifactPrefix=lambda/${GITHUB_SHA}"
 
-      - name: Display deployed API outputs
+      - name: Print deployed API outputs
         shell: bash
         run: |
           set -euo pipefail
@@ -273,14 +255,10 @@ jobs:
 
           python -c '
           import json
-
           with open("/tmp/rds-check.json") as f:
               result = json.load(f)
-
           body = result.get("body", {})
-
           if isinstance(body, str):
               body = json.loads(body)
-
           assert body.get("connected") is True, result
           '

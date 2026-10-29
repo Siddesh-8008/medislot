@@ -15,65 +15,133 @@ def _issue_access(user_id, role, secret, minutes, now=None):
 def _register(event, context, role, cid):
     data = body(event)
     if not isinstance(data, dict):
-        return response(400, {"message":"Invalid JSON body", "correlationId":cid})
+        return response(400, {"message": "Invalid JSON body", "correlationId": cid})
+
     first = str(data.get("firstName", "")).strip()
     last = str(data.get("lastName", "")).strip()
-    # Backward compatibility: accept legacy fullName while preferring split fields.
+    # Accept fullName for older clients, but store the split name in the profile table.
     if not first and not last and str(data.get("fullName", "")).strip():
-        legacy_parts = str(data.get("fullName", "")).strip().split(None, 1)
-        first = legacy_parts[0]
-        last = legacy_parts[1] if len(legacy_parts) > 1 else ""
+        parts = str(data.get("fullName", "")).strip().split(None, 1)
+        first = parts[0]
+        last = parts[1] if len(parts) > 1 else ""
+
     email = str(data.get("email", "")).strip().lower()
     password = data.get("password", "")
     phone = str(data.get("phone", "")).strip() or None
     dob = str(data.get("dateOfBirth", "")).strip() or None
     gender = str(data.get("gender", "")).strip() or None
     address = str(data.get("address", "")).strip() or None
-    if not first or not last or len(first)>75 or len(last)>75 or not EMAIL_RE.fullmatch(email) or len(email)>254:
-        return response(400, {"message":"firstName, lastName and a valid email are required", "correlationId":cid})
+
+    if (
+        not first or not last or len(first) > 75 or len(last) > 75
+        or not EMAIL_RE.fullmatch(email) or len(email) > 254
+    ):
+        return response(400, {
+            "message": "firstName, lastName and a valid email are required",
+            "correlationId": cid,
+        })
+
     if not isinstance(password, str):
         password = ""
-    min_len = int(get_param(f"/medislot/{os.environ.get('ENVIRONMENT','dev')}/auth/password-min-length"))
-    if len(password)<min_len or len(password.encode())>72 or not re.search(r"[a-z]",password) or not re.search(r"[A-Z]",password) or not re.search(r"\d",password) or not re.search(r"[^A-Za-z0-9]",password):
-        return response(400, {"message":f"Password must be {min_len}-72 characters and include upper, lower, number and symbol", "correlationId":cid})
-    specialization = license_number = clinic_address = None
+    min_len = int(get_param(
+        f"/medislot/{os.environ.get('ENVIRONMENT', 'dev')}/auth/password-min-length"
+    ))
+    if (
+        len(password) < min_len or len(password.encode()) > 72
+        or not re.search(r"[a-z]", password)
+        or not re.search(r"[A-Z]", password)
+        or not re.search(r"\d", password)
+        or not re.search(r"[^A-Za-z0-9]", password)
+    ):
+        return response(400, {
+            "message": f"Password must be {min_len}-72 characters and include upper, lower, number and symbol",
+            "correlationId": cid,
+        })
+
+    specialization = None
+    license_number = None
+    clinic_address = None
     years = None
     if role == "DOCTOR":
         specialization = str(data.get("specialization", "")).strip()
         license_number = str(data.get("licenseNumber", "")).strip().upper()
         clinic_address = str(data.get("clinicAddress", "")).strip() or None
         years = data.get("yearsExperience")
-        if not specialization or len(specialization)>120:
-            return response(400, {"message":"specialization is required for doctor registration", "correlationId":cid})
+
+        if not specialization or len(specialization) > 120:
+            return response(400, {
+                "message": "specialization is required for doctor registration",
+                "correlationId": cid,
+            })
         if not LICENSE_RE.fullmatch(license_number):
-            return response(400, {"message":"licenseNumber must match state-1234 format (for example, TS-1234 or Telangana-1234)", "correlationId":cid})
+            return response(400, {
+                "message": "licenseNumber must match state-1234 format (for example, TS-1234 or Telangana-1234)",
+                "correlationId": cid,
+            })
         if years is not None:
-            try: years = int(years)
-            except (TypeError, ValueError): years = -1
+            try:
+                years = int(years)
+            except (TypeError, ValueError):
+                years = -1
             if years < 0 or years > 80:
-                return response(400, {"message":"yearsExperience must be between 0 and 80", "correlationId":cid})
+                return response(400, {
+                    "message": "yearsExperience must be between 0 and 80",
+                    "correlationId": cid,
+                })
+
     c = config()
-    hashed = bcrypt.hashpw(password.encode(), bcrypt.gensalt(rounds=12)).decode()
+    password_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt(rounds=12)).decode()
     conn = dbconn(c)
     try:
         with conn.cursor() as cur:
-            cur.execute("""INSERT INTO users(email,password_hash,role,full_name,first_name,last_name,phone,date_of_birth,gender,address,specialization,license_number,years_experience,clinic_address)
-                VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
-                (email,hashed,role,f"{first} {last}",first,last,phone,dob,gender,address,specialization,license_number,years,clinic_address))
-            uid = cur.lastrowid
+            # The users table stores identity/authentication fields only.
+            cur.execute(
+                "INSERT INTO users (email, password_hash, role) VALUES (%s, %s, %s)",
+                (email, password_hash, role),
+            )
+            user_id = cur.lastrowid
+
+            # Profile insert shares the same transaction. If it fails, the user insert rolls back too.
+            if role == "PATIENT":
+                cur.execute(
+                    """INSERT INTO patients
+                       (patient_id, first_name, last_name, phone, date_of_birth, gender, address)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+                    (user_id, first, last, phone, dob, gender, address),
+                )
+            else:
+                cur.execute(
+                    """INSERT INTO doctors
+                       (doctor_id, first_name, last_name, phone, specialization,
+                        license_number, years_experience, clinic_address)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+                    (user_id, first, last, phone, specialization,
+                     license_number, years, clinic_address),
+                )
         conn.commit()
     except Exception as exc:
         conn.rollback()
-        msg = str(exc).lower()
-        if "duplicate entry" in msg:
-            return response(409, {"message":"Unable to register with those details", "correlationId":cid})
-        if "incorrect date" in msg or "invalid date" in msg:
-            return response(400, {"message":"dateOfBirth must use YYYY-MM-DD format", "correlationId":cid})
+        message = str(exc).lower()
+        if "duplicate entry" in message:
+            return response(409, {
+                "message": "Unable to register with those details",
+                "correlationId": cid,
+            })
+        if "incorrect date" in message or "invalid date" in message or "date value" in message:
+            return response(400, {
+                "message": "dateOfBirth must use YYYY-MM-DD format",
+                "correlationId": cid,
+            })
         raise
     finally:
         conn.close()
-    emit("info","registration_succeeded",cid,role=role,userId=str(uid))
-    return response(201, {"userId":str(uid),"role":role,"message":"Registration successful"})
+
+    emit("info", "registration_succeeded", cid, role=role, userId=str(user_id))
+    return response(201, {
+        "userId": str(user_id),
+        "role": role,
+        "message": "Registration successful",
+    })
 
 def _login(event, cid):
     data=body(event)
@@ -83,9 +151,9 @@ def _login(event, cid):
     c=config(); conn=dbconn(c)
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT user_id,password_hash,role,is_active FROM users WHERE email=%s",(email,)); user=cur.fetchone()
+            cur.execute("SELECT user_id,password_hash,role FROM users WHERE email=%s", (email,)); user=cur.fetchone()
     finally: conn.close()
-    if not user or not user["is_active"] or not bcrypt.checkpw(password.encode(),user["password_hash"].encode()):
+    if not user or not bcrypt.checkpw(password.encode(), user["password_hash"].encode()):
         emit("warning","login_rejected",cid); return response(401,{"message":"Invalid email or password","correlationId":cid})
     now=int(time.time()); minutes=int(get_param(f"{c['prefix']}/auth/access-token-minutes")); days=int(get_param(f"{c['prefix']}/auth/refresh-token-days"))
     access=_issue_access(user["user_id"],user["role"],c["jwt"],minutes,now)
