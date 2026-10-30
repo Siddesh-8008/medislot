@@ -1,7 +1,7 @@
 import os, json, secrets, requests, boto3
 from datetime import timedelta, datetime
 from zoneinfo import ZoneInfo
-from flask import Flask, request, session, redirect, url_for, render_template_string, flash
+from flask import Flask, request, session, redirect, url_for, render_template_string, flash, Response
 app=Flask(__name__)
 app.config.update(PERMANENT_SESSION_LIFETIME=timedelta(days=7),SESSION_COOKIE_HTTPONLY=True,SESSION_COOKIE_SECURE=os.environ.get("SESSION_COOKIE_SECURE","false").lower()=="true",SESSION_COOKIE_SAMESITE="Lax")
 app.secret_key=os.environ.get("FLASK_SESSION_SECRET") or boto3.client("ssm").get_parameter(Name=os.environ.get("SESSION_SECRET_PARAMETER","/medislot/dev/web/session-secret"),WithDecryption=True)["Parameter"]["Value"]
@@ -15,6 +15,10 @@ REGISTER_URL=API_BASE+"/auth/register/doctor"
 HOSPITALS=[(1,"Apollo Hospitals Jubilee Hills"),(2,"Yashoda Hospitals Somajiguda"),(3,"KIMS Hospitals Secunderabad"),(4,"CARE Hospitals Banjara Hills"),(5,"AIG Hospitals Gachibowli"),(6,"Continental Hospitals"),(7,"Rainbow Children's Hospital Banjara Hills"),(8,"NIMS Hyderabad"),(9,"Osmania General Hospital"),(10,"Gandhi Hospital")]
 SPECIALIZATIONS=[(1,"Cardiology"),(2,"Dermatology"),(3,"Endocrinology"),(4,"Family Medicine"),(5,"Gastroenterology"),(6,"General Medicine"),(7,"General Surgery"),(8,"Geriatrics"),(9,"Gynecology"),(10,"Hematology"),(11,"Nephrology"),(12,"Neurology"),(13,"Neurosurgery"),(14,"Oncology"),(15,"Ophthalmology"),(16,"Orthopedics"),(17,"Otolaryngology (ENT)"),(18,"Pediatrics"),(19,"Psychiatry"),(20,"Pulmonology"),(21,"Radiology"),(22,"Rheumatology"),(23,"Urology"),(24,"Anesthesiology"),(25,"Emergency Medicine"),(26,"Infectious Disease"),(27,"Physical Medicine and Rehabilitation"),(28,"Plastic Surgery"),(29,"Vascular Surgery"),(30,"Obstetrics")]
 WEEKDAYS=[(1,"Monday"),(2,"Tuesday"),(3,"Wednesday"),(4,"Thursday"),(5,"Friday"),(6,"Saturday"),(7,"Sunday")]
+# The four standard consultation types from the project brief. Duration is fixed per type;
+# capacity is fixed at 1 except Health Camp Session (2 to 10). The doctor only sets the fee.
+CONSULT_TYPES=[dict(name="Quick Consult",duration=15,cap_min=1,cap_max=1),dict(name="Standard Consult",duration=30,cap_min=1,cap_max=1),dict(name="Detailed Consult",duration=60,cap_min=1,cap_max=1),dict(name="Health Camp Session",duration=60,cap_min=2,cap_max=10)]
+CONSULT_BY_NAME={c["name"]:c for c in CONSULT_TYPES}
 # key, label, icon, accent colour, one-line description
 MODULES=[
  ("overview","Overview","home","#0f6b73","Your practice at a glance and what to set up next."),
@@ -147,6 +151,9 @@ tr:last-child td{border-bottom:0}
 .tile{background:var(--paper);border:1px solid var(--line);border-radius:var(--r);padding:24px}
 .tile small{color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:.06em;font-size:12px}
 .tile strong{display:block;font:600 34px var(--serif);margin-top:6px}
+.compact th,.compact td{padding:10px;white-space:normal}
+.preview img{width:100%;height:100%;object-fit:cover;border-radius:50%;display:block}
+.who{display:flex;gap:12px;align-items:center}.av{width:46px;height:46px;border-radius:50%;object-fit:cover;flex:none;background:#ffffff1f}
 .preview{width:132px;height:132px;border-radius:50%;background:#ebe5d6 center/cover;border:4px solid #fff;box-shadow:0 0 0 1.5px var(--line);display:grid;place-items:center;color:var(--muted);margin-bottom:6px;font-size:13px;text-align:center}
 .kv{display:grid;grid-template-columns:auto 1fr;gap:10px 20px;margin:0}.kv dt{color:var(--muted);font-size:14px}.kv dd{margin:0;font-weight:500}
 details{margin-top:24px}summary{cursor:pointer;color:var(--muted);font-weight:600}
@@ -242,7 +249,7 @@ pre{background:#12303a;color:#d6ece9;padding:20px;border-radius:12px;overflow:au
   <nav class="nav" aria-label="Dashboard modules">
    {% for key,label,ic,acc,desc in modules %}<a href="/?m={{key}}" class="{{ 'on' if key==cur }}" style="--acc:{{acc}}"><span class="ico">{{ icon(ic) }}</span>{{label}}</a>{% endfor %}
   </nav>
-  <div class="me"><div><small>Signed in as doctor</small><strong>{{ display_name or 'Doctor' }}</strong></div><a href="/logout">Log out</a></div>
+  <div class="me"><div class="who">{% if photo_url %}<img class="av" src="{{photo_url}}" alt="" onerror="this.remove()">{% endif %}<div><small>Signed in as doctor</small><strong>{{ display_name or 'Doctor' }}</strong></div></div><a href="/logout">Log out</a></div>
  </aside>
  <main class="content">
   {% for key,label,ic,acc,desc in modules if key==cur %}
@@ -272,19 +279,20 @@ pre{background:#12303a;color:#d6ece9;padding:20px;border-radius:12px;overflow:au
 
   {% elif cur=='photo' %}
    <div class="cols"><section class="panel"><h2>Upload a photo</h2><p class="lead">A clear, friendly headshot builds trust. JPEG, PNG or WebP up to 5&nbsp;MB.</p>
-   <form method="post" action="/photo" enctype="multipart/form-data"><div class="preview" id="preview">{{ 'Photo on file' if p.get('photo_key') else 'No photo yet' }}</div>
+   <form method="post" action="/photo" enctype="multipart/form-data"><div class="preview" id="preview">{% if photo_url %}<img src="{{photo_url}}" alt="Your profile photo" onerror="this.parentNode.textContent='Photo saved (preview unavailable)'">{% else %}No photo yet{% endif %}</div>
     <label>Choose an image<input id="photo-input" type="file" name="photo" accept="image/jpeg,image/png,image/webp" required></label><button>Upload photo</button></form></section>
    <aside class="side-note"><h3>Tips</h3><ul><li>Use a square crop with your face centred.</li><li>Good light, plain background.</li><li>Uploading a new photo replaces the old one.</li></ul></aside></div>
 
   {% elif cur=='consultation' %}
-   <div class="cols wide-left"><section class="panel"><h2>New consultation type</h2><p class="lead">Each type gets its own length, fee and capacity. You’ll use them when you set availability.</p>
-   <form method="post" action="/consultation-types"><div class="fgrid">
-    <label class="span2">Name<input name="name" placeholder="e.g. First visit" required></label>
-    <label>Duration<select name="durationMinutes">{% for d in (15,30,45,60,90,120) %}<option value="{{d}}" {{ 'selected' if d==30 }}>{{d}} minutes</option>{% endfor %}</select></label>
+   <div class="cols wide-left"><section class="panel"><h2>New consultation type</h2><p class="lead">Pick one of the four standard types. Its duration and capacity are fixed; you only set the fee.</p>
+   {% if not ctype_options %}<div class="empty"><b>All four standard types are created</b>Next, add your weekly hours under <a href="/?m=availability">Availability</a>.</div>
+   {% else %}<form method="post" action="/consultation-types"><div class="fgrid">
+    <label class="span2">Consultation type<select id="ct-type" name="name" required><option value="" disabled selected>Select a type</option>{% for t in ctype_options %}<option value="{{t.name}}" data-duration="{{t.duration}}" data-min="{{t.cap_min}}" data-max="{{t.cap_max}}">{{t.name}}</option>{% endfor %}</select></label>
+    <label>Duration<input id="ct-duration" value="Fixed by type" readonly tabindex="-1"></label>
     <label>Fee<input name="fee" type="number" min="0" step="0.01" placeholder="500" required></label>
-    <label class="span2">Capacity<input name="capacity" type="number" min="1" max="20" value="1"><span class="hint">How many patients can book the same slot (1–20)</span></label>
-   </div><button>Create consultation type</button></form></section>
-   <aside class="side-note"><h3>How it fits</h3><p>1. Create a consultation type here.</p><p>2. Add weekly hours for it under Availability.</p><p>3. Patients can then book those slots.</p></aside></div>
+    <label class="span2">Slot capacity<input id="ct-capacity" name="capacity" type="number" min="1" max="10" value="1" readonly><span class="hint" id="ct-cap-hint">Fixed at 1 patient per slot. Health Camp Session allows 2 to 10.</span></label>
+   </div><button>Create consultation type</button></form>{% endif %}</section>
+   <aside class="side-note"><h3>Standard types</h3><div class="tbl-wrap" style="background:transparent;border-color:#b9ddd6"><table class="compact" style="font-size:14px"><thead><tr><th style="background:transparent">Type</th><th style="background:transparent">Duration</th><th style="background:transparent">Capacity</th></tr></thead><tbody>{% for t in ctypes_ref %}<tr><td>{{t.name}}</td><td>{{t.duration}} min</td><td>{{ t.cap_min if t.cap_min==t.cap_max else (t.cap_min~' to '~t.cap_max) }}</td></tr>{% endfor %}</tbody></table></div><p style="margin-top:16px">Then add weekly hours for each type under Availability.</p></aside></div>
    <h3 class="list-title">Your consultation types</h3>
    {% if types is none %}<div class="empty"><b>Couldn’t load your list</b>Your changes are still saved. Refresh to try again.</div>
    {% elif types %}<div class="tbl-wrap"><table><thead><tr><th>ID</th><th>Name</th><th>Duration</th><th>Fee</th><th>Capacity</th><th>Status</th></tr></thead><tbody>{% for t in types %}<tr><td>{{t.consultation_type_id}}</td><td>{{t.name}}</td><td>{{t.duration_minutes}} min</td><td>{{t.fee}}</td><td>{{t.capacity}}</td><td><span class="pill {{ 'ok' if t.is_active else 'off' }}">{{ 'Active' if t.is_active else 'Inactive' }}</span></td></tr>{% endfor %}</tbody></table></div>
@@ -338,6 +346,11 @@ pre{background:#12303a;color:#d6ece9;padding:20px;border-radius:12px;overflow:au
    cf.setCustomValidity(cf.value&&cf.value!==pw.value?'Passwords do not match':'')}
   pw.addEventListener('input',check);cf.addEventListener('input',check);check();
  }
+ var ct=document.getElementById('ct-type');
+ if(ct)ct.addEventListener('change',function(){var o=ct.options[ct.selectedIndex],cap=document.getElementById('ct-capacity'),h=document.getElementById('ct-cap-hint'),mn=+o.dataset.min,mx=+o.dataset.max;
+  document.getElementById('ct-duration').value=o.dataset.duration+' minutes';
+  cap.min=mn;cap.max=mx;cap.value=mn;cap.readOnly=(mn===mx);
+  h.textContent=mn===mx?'Fixed at '+mn+' patient per slot':'Choose '+mn+' to '+mx+' patients per slot'});
  var lic=document.getElementById('su-license');
  if(lic)lic.addEventListener('blur',function(){lic.value=lic.value.trim().toUpperCase()});
  var pi=document.getElementById('photo-input');
@@ -400,9 +413,29 @@ def session_expired(e):
     notify("Your session expired. Please sign in again.","error")
     return redirect("/")
 
+def photo_url_for(key):
+    # The key is unique per upload, so using it as ?v= makes the browser reload a new photo immediately.
+    return "/photo-image?v="+key.rsplit("/",1)[-1] if key else None
+_photo_bucket=None
+def photo_bucket():
+    """Name of the private doctor-photos bucket (same naming as the CloudFormation stacks)."""
+    global _photo_bucket
+    if _photo_bucket is None:
+        b=os.environ.get("DOCTOR_PHOTOS_BUCKET","")
+        if not b:
+            try:
+                account=boto3.client("sts").get_caller_identity()["Account"]
+                region=os.environ.get("AWS_DEFAULT_REGION") or os.environ.get("AWS_REGION")
+                env=os.environ.get("SESSION_SECRET_PARAMETER","/medislot/dev/web/session-secret").split("/")[2]
+                b=f"medislot-{env}-doctor-photos-{account}-{region}"
+            except Exception as e:
+                app.logger.warning("could not work out photo bucket: %s",e)
+        _photo_bucket=b
+    return _photo_bucket
 def render_dashboard(module,**extra):
     """Shared renderer for every dashboard module."""
     ctx=dict(logged_in=True,module=module,modules=MODULES,messages=session.pop("messages",[]),hospitals=HOSPITALS,specializations=SPECIALIZATIONS,weekdays=WEEKDAYS,day_names=dict(WEEKDAYS),
+             ctype_options=CONSULT_TYPES,ctypes_ref=CONSULT_TYPES,photo_url=photo_url_for(session.get("photo_key")),
              profile=None,p={},display_name=session.get("display_name"),last_name=None,greeting="Welcome",progress=None,steps=None,counts=None,types=None,active_types=None,type_names={},patterns=None,blackouts=None,sched=None)
     ctx.update(extra)
     return render_template_string(PAGE,**ctx)
@@ -425,6 +458,8 @@ def home():
         extra.update(profile=profile,p=profile or {})
         if profile:
             session["display_name"]=f"Dr. {profile.get('first_name','')} {profile.get('last_name','')}".strip()
+            if profile.get("photo_key"): session["photo_key"]=profile["photo_key"]
+            else: session.pop("photo_key",None)
             extra["last_name"]=profile.get("last_name")
     if module in ("overview","consultation","availability"):
         types=items_of(read_json("/doctors/me/consultation-types"))
@@ -432,6 +467,8 @@ def home():
         if types is not None:
             extra["active_types"]=[t for t in types if t.get("is_active")]
             extra["type_names"]={t["consultation_type_id"]:t["name"] for t in types}
+            have={t["name"] for t in types}
+            extra["ctype_options"]=[c for c in CONSULT_TYPES if c["name"] not in have]
     if module in ("overview","availability"):
         extra["patterns"]=items_of(read_json("/doctors/me/availability-patterns"))
     if module=="availability":
@@ -544,7 +581,18 @@ def blackout():
     return redirect("/?m=availability")
 @app.post("/consultation-types")
 def consultation():
-    data={"name":request.form["name"],"durationMinutes":int(request.form["durationMinutes"]),"fee":float(request.form["fee"]),"capacity":int(request.form["capacity"])}
+    ct=CONSULT_BY_NAME.get(request.form.get("name",""))
+    if not ct:
+        notify("Choose one of the standard consultation types.","error")
+        return redirect("/?m=consultation")
+    # Duration is fixed by the type; capacity is fixed at 1 except Health Camp Session (2 to 10).
+    try: capacity=int(request.form.get("capacity") or ct["cap_min"])
+    except ValueError: capacity=-1
+    if ct["cap_min"]==ct["cap_max"]: capacity=ct["cap_min"]
+    elif not ct["cap_min"]<=capacity<=ct["cap_max"]:
+        notify(f"{ct['name']} needs a capacity between {ct['cap_min']} and {ct['cap_max']}.","error")
+        return redirect("/?m=consultation")
+    data={"name":ct["name"],"durationMinutes":ct["duration"],"fee":float(request.form["fee"]),"capacity":capacity}
     r=api("POST","/doctors/me/consultation-types",json=data)
     report(r,"Consultation type created","Consultation type")
     return redirect("/?m=consultation")
@@ -570,8 +618,24 @@ def photo():
         notify(f"S3 upload failed: HTTP {put.status_code}","error")
         return redirect("/?m=photo")
     saved=api("PATCH","/doctors/me",json={"photoKey":upload["photoKey"]})
+    if saved.ok: session["photo_key"]=upload["photoKey"]
     report(saved,"Photo uploaded and profile updated","Photo uploaded but profile update")
     return redirect("/?m=photo")
+
+@app.get("/photo-image")
+def photo_image():
+    """Streams the signed-in doctor's own photo from the private S3 bucket. The key comes from the signed session, never from the URL."""
+    key=session.get("photo_key")
+    if not session.get("access_token") or not key or not key.startswith("doctors/") or not photo_bucket(): return ("",404)
+    try:
+        obj=boto3.client("s3").get_object(Bucket=photo_bucket(),Key=key)
+        data=obj["Body"].read()
+    except Exception as e:
+        app.logger.warning("photo read failed for %s: %s",key,e)
+        return ("",404)
+    resp=Response(data,mimetype=obj.get("ContentType") or "image/jpeg")
+    resp.headers["Cache-Control"]="private, max-age=3600"
+    return resp
 
 @app.get("/schedule")
 def schedule():

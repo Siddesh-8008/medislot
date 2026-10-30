@@ -74,6 +74,9 @@ Resources:
               - Effect: Allow
                 Action: s3:GetObject
                 Resource: !Sub arn:${AWS::Partition}:s3:::${DashboardArtifactBucket}/${DashboardArtifactKey}
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub arn:${AWS::Partition}:s3:::medislot-${Environment}-doctor-photos-${AWS::AccountId}-${AWS::Region}/doctors/*
       Tags:
         - Key: Project
           Value: MediSlot
@@ -127,6 +130,7 @@ Resources:
 
             cat > /etc/medislot-dashboard.env <<'ENVVARS'
             MEDISLOT_API_BASE=${ApiBaseUrl}
+            DOCTOR_PHOTOS_BUCKET=medislot-${Environment}-doctor-photos-${AWS::AccountId}-${AWS::Region}
             SESSION_SECRET_PARAMETER=/medislot/${Environment}/web/session-secret
             AWS_DEFAULT_REGION=${AWS::Region}
             ENVVARS
