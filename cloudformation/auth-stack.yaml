@@ -200,6 +200,9 @@ Resources:
                 Resource:
                   - !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/MediSlot-${Environment}-Slots'
                   - !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/MediSlot-${Environment}-Slots/index/GSI_DoctorDate'
+              - Effect: Allow
+                Action: [lambda:InvokeFunction]
+                Resource: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:medislot-${Environment}-slot-materialiser'
   DoctorDomainFunction:
     Type: AWS::Lambda::Function
     Properties:
@@ -215,6 +218,7 @@ Resources:
         Variables:
           ENVIRONMENT: !Ref Environment
           DOCTOR_PHOTOS_BUCKET: !Sub 'medislot-${Environment}-doctor-photos-${AWS::AccountId}-${AWS::Region}'
+          SLOT_MATERIALISER_FUNCTION: !Sub 'medislot-${Environment}-slot-materialiser'
       VpcConfig:
         SecurityGroupIds: [!ImportValue {Fn::Sub: 'MediSlot-${Environment}-LambdaSecurityGroupId'}]
         SubnetIds:
@@ -244,8 +248,11 @@ Resources:
                 Action: [kms:Decrypt]
                 Resource: '*'
               - Effect: Allow
-                Action: [dynamodb:PutItem]
+                Action: [dynamodb:PutItem, dynamodb:UpdateItem]
                 Resource: !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/MediSlot-${Environment}-Slots'
+              - Effect: Allow
+                Action: [dynamodb:Query]
+                Resource: !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/MediSlot-${Environment}-Slots/index/GSI_DoctorDate'
   SlotMaterialiserFunction:
     Type: AWS::Lambda::Function
     Properties:
@@ -260,7 +267,7 @@ Resources:
       Environment:
         Variables:
           ENVIRONMENT: !Ref Environment
-          MATERIALISE_DAYS: '30'
+          MATERIALISE_DAYS: '45'
       VpcConfig:
         SecurityGroupIds: [!ImportValue {Fn::Sub: 'MediSlot-${Environment}-LambdaSecurityGroupId'}]
         SubnetIds:
@@ -288,7 +295,7 @@ Resources:
     Type: AWS::Scheduler::Schedule
     Properties:
       Name: !Sub 'medislot-${Environment}-slot-materialiser-daily'
-      Description: Refresh the rolling 30-day MediSlot slot window daily.
+      Description: Extend the rolling 45-day MediSlot slot window daily.
       State: ENABLED
       ScheduleExpression: rate(1 day)
       FlexibleTimeWindow:

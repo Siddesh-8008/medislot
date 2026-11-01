@@ -113,6 +113,15 @@ Resources:
       PrivateDnsEnabled: true
       SubnetIds: [!Ref PrivateSubnet1, !Ref PrivateSubnet2]
       SecurityGroupIds: [!GetAtt EndpointSecurityGroup.GroupId]
+  LambdaInterfaceEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref MediSlotVPC
+      VpcEndpointType: Interface
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.lambda'
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PrivateSubnet1, !Ref PrivateSubnet2]
+      SecurityGroupIds: [!GetAtt EndpointSecurityGroup.GroupId]
   S3GatewayEndpoint:
     Type: AWS::EC2::VPCEndpoint
     Properties:

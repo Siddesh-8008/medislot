@@ -12,6 +12,18 @@ log=logging.getLogger()
 log.setLevel(logging.INFO)
 s3=boto3.client("s3", config=boto3.session.Config(signature_version="s3v4"))
 ddb=boto3.resource("dynamodb")
+lambda_client=boto3.client("lambda",config=boto3.session.Config(connect_timeout=2,read_timeout=3,retries={"max_attempts":1}))
+
+def refresh_slots(uid,cid):
+    """Ask the slot materialiser to rebuild this doctor's bookable slots. Fire-and-forget:
+    the doctor's save has already been committed, so a failure here must never fail the request
+    (the daily run still extends the window and a later change re-triggers the reconcile)."""
+    name=os.environ.get("SLOT_MATERIALISER_FUNCTION")
+    if not name: return
+    try:
+        lambda_client.invoke(FunctionName=name,InvocationType="Event",Payload=json.dumps({"doctorId":uid}).encode())
+    except Exception as e:
+        emit("warning","slot_refresh_trigger_failed",cid,error=type(e).__name__)
 
 def ctx_user(event):
     c=(event.get("requestContext") or {}).get("authorizer") or {}
@@ -127,6 +139,7 @@ def handler(event, context):
                     vals.append(uid)
                     cur.execute(f"UPDATE doctors SET {', '.join(sets)}, updated_at=UTC_TIMESTAMP(6) WHERE doctor_id=%s",vals)
                     conn.commit()
+                    if "timezone" in data: refresh_slots(uid,cid)
                     return out(200,{"message":"Doctor profile updated","correlationId":cid})
                 # Consultation type endpoints
                 prefix="/doctors/me/consultation-types"
@@ -149,7 +162,7 @@ def handler(event, context):
                     cur.execute("SELECT consultation_type_id FROM consultation_types WHERE consultation_type_id=%s AND doctor_id=%s",(tid,uid))
                     if not cur.fetchone(): return out(404,{"message":"Consultation type not found","correlationId":cid})
                     if method=="DELETE":
-                        cur.execute("UPDATE consultation_types SET is_active=0,updated_at=UTC_TIMESTAMP(6) WHERE consultation_type_id=%s AND doctor_id=%s",(tid,uid)); conn.commit()
+                        cur.execute("UPDATE consultation_types SET is_active=0,updated_at=UTC_TIMESTAMP(6) WHERE consultation_type_id=%s AND doctor_id=%s",(tid,uid)); conn.commit(); refresh_slots(uid,cid)
                         return out(200,{"message":"Consultation type deactivated","correlationId":cid})
                     if method in ("PATCH","PUT"):
                         if data is None: return out(400,{"message":"Invalid JSON body","correlationId":cid})
@@ -164,7 +177,7 @@ def handler(event, context):
                                 if k=="capacity" and not 1<=int(v)<=20: return out(422,{"message":"capacity must be 1..20","correlationId":cid})
                                 sets.append(f"{col}=%s"); vals.append(v)
                         if not sets: return out(400,{"message":"No fields supplied","correlationId":cid})
-                        vals.extend([tid,uid]); cur.execute(f"UPDATE consultation_types SET {', '.join(sets)},updated_at=UTC_TIMESTAMP(6) WHERE consultation_type_id=%s AND doctor_id=%s",vals); conn.commit()
+                        vals.extend([tid,uid]); cur.execute(f"UPDATE consultation_types SET {', '.join(sets)},updated_at=UTC_TIMESTAMP(6) WHERE consultation_type_id=%s AND doctor_id=%s",vals); conn.commit(); refresh_slots(uid,cid)
                         return out(200,{"message":"Consultation type updated","correlationId":cid})
                 # Weekly patterns
                 prefix="/doctors/me/availability-patterns"
@@ -181,13 +194,14 @@ def handler(event, context):
                     if not cur.fetchone(): return out(422,{"message":"Consultation type must be active and owned by doctor","correlationId":cid})
                     cur.execute("INSERT INTO availability_patterns(doctor_id,consultation_type_id,day_of_week,start_time,end_time,is_active) VALUES(%s,%s,%s,%s,%s,1)",(uid,tid,dow,start.strftime("%H:%M:%S"),end.strftime("%H:%M:%S")))
                     conn.commit()
+                    refresh_slots(uid,cid)
                     return out(201,{"patternId":cur.lastrowid,"correlationId":cid})
                 m=re.fullmatch(re.escape(prefix)+r"/(\d+)",path)
                 if m:
                     pid=int(m.group(1))
                     if method=="DELETE":
-                        cur.execute("UPDATE availability_patterns SET is_active=0,updated_at=UTC_TIMESTAMP(6) WHERE pattern_id=%s AND doctor_id=%s",(pid,uid)); conn.commit()
-                        return out(200,{"message":"Availability pattern deactivated; existing materialised slots are not automatically deleted","correlationId":cid})
+                        cur.execute("UPDATE availability_patterns SET is_active=0,updated_at=UTC_TIMESTAMP(6) WHERE pattern_id=%s AND doctor_id=%s",(pid,uid)); conn.commit(); refresh_slots(uid,cid)
+                        return out(200,{"message":"Availability pattern deactivated; unbooked future slots are closed automatically, booked slots are kept","correlationId":cid})
                     if method in ("PATCH","PUT"):
                         if data is None: return out(400,{"message":"Invalid JSON body","correlationId":cid})
                         mapping={"dayOfWeek":"day_of_week","startTime":"start_time","endTime":"end_time","isActive":"is_active"}
@@ -195,8 +209,8 @@ def handler(event, context):
                         for k,col in mapping.items():
                             if k in data: sets.append(f"{col}=%s"); vals.append(data[k])
                         if not sets: return out(400,{"message":"No fields supplied","correlationId":cid})
-                        vals.extend([pid,uid]); cur.execute(f"UPDATE availability_patterns SET {', '.join(sets)},updated_at=UTC_TIMESTAMP(6) WHERE pattern_id=%s AND doctor_id=%s",vals); conn.commit()
-                        return out(200,{"message":"Availability pattern updated; rerun materialiser for future dates","correlationId":cid})
+                        vals.extend([pid,uid]); cur.execute(f"UPDATE availability_patterns SET {', '.join(sets)},updated_at=UTC_TIMESTAMP(6) WHERE pattern_id=%s AND doctor_id=%s",vals); conn.commit(); refresh_slots(uid,cid)
+                        return out(200,{"message":"Availability pattern updated; future slots are being refreshed automatically","correlationId":cid})
                 # Blackout dates
                 prefix="/doctors/me/blackout-dates"
                 if path==prefix and method=="GET":
@@ -208,11 +222,12 @@ def handler(event, context):
                     except Exception: return out(422,{"message":"blackoutDate must be YYYY-MM-DD","correlationId":cid})
                     cur.execute("INSERT INTO blackout_dates(doctor_id,blackout_date,reason) VALUES(%s,%s,%s)",(uid,bd,data.get("reason")))
                     conn.commit()
+                    refresh_slots(uid,cid)
                     return out(201,{"blackoutDate":bd.isoformat(),"correlationId":cid})
                 m=re.fullmatch(re.escape(prefix)+r"/(\d+)",path)
                 if m and method=="DELETE":
-                    cur.execute("DELETE FROM blackout_dates WHERE blackout_id=%s AND doctor_id=%s",(int(m.group(1)),uid)); conn.commit()
-                    return out(200,{"message":"Blackout date removed; rerun materialiser if safe","correlationId":cid})
+                    cur.execute("DELETE FROM blackout_dates WHERE blackout_id=%s AND doctor_id=%s",(int(m.group(1)),uid)); conn.commit(); refresh_slots(uid,cid)
+                    return out(200,{"message":"Blackout date removed; slots for that day are reopened automatically","correlationId":cid})
                 # Schedule day view
                 if path=="/doctors/me/schedule" and method=="GET":
                     q=event.get("queryStringParameters") or {}
