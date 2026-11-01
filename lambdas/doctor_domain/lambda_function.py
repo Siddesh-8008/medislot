@@ -25,6 +25,40 @@ def refresh_slots(uid,cid):
     except Exception as e:
         emit("warning","slot_refresh_trigger_failed",cid,error=type(e).__name__)
 
+DAY_NAMES=["","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
+
+def as_time(v):
+    """MySQL TIME columns arrive from pymysql as timedelta; API input arrives as 'HH:MM' strings."""
+    if isinstance(v,time): return v
+    if isinstance(v,timedelta):
+        secs=int(v.total_seconds()); return time(secs//3600%24,secs%3600//60,secs%60)
+    h,_,rest=str(v).strip().partition(":")
+    return time.fromisoformat(f"{int(h):02d}:{rest}")
+
+def hhmm(v):
+    return as_time(v).strftime("%H:%M")
+
+def pattern_problem(cur,uid,tid,dow,start,end,exclude_pid=None):
+    """Validate a weekly pattern. Returns (http_status, message) or None when it is fine.
+    1) the window must fit at least one visit of the consultation type;
+    2) it must not overlap another active pattern of the same doctor on the same weekday
+       (overlapping patterns are what produced overlapping / duplicate-looking slots)."""
+    cur.execute("SELECT duration_minutes FROM consultation_types WHERE consultation_type_id=%s AND doctor_id=%s",(tid,uid))
+    ct=cur.fetchone()
+    if not ct: return 422,"Consultation type not found"
+    window=(end.hour*60+end.minute)-(start.hour*60+start.minute)
+    need=int(ct["duration_minutes"])
+    if window<need:
+        return 422,f"This consultation type takes {need} minutes, but the window {hhmm(start)}-{hhmm(end)} is only {window} minutes. Choose a window of at least {need} minutes."
+    sql="SELECT pattern_id,start_time,end_time FROM availability_patterns WHERE doctor_id=%s AND day_of_week=%s AND is_active=1 AND start_time<%s AND end_time>%s"
+    args=[uid,dow,end.strftime("%H:%M:%S"),start.strftime("%H:%M:%S")]
+    if exclude_pid: sql+=" AND pattern_id<>%s"; args.append(exclude_pid)
+    cur.execute(sql+" LIMIT 1",args)
+    o=cur.fetchone()
+    if o:
+        return 409,f"This overlaps your existing {DAY_NAMES[dow]} hours {hhmm(o['start_time'])}-{hhmm(o['end_time'])}. Remove or edit that pattern first, or choose different hours."
+    return None
+
 def ctx_user(event):
     c=(event.get("requestContext") or {}).get("authorizer") or {}
     return int(c.get("userId") or 0), c.get("role")
@@ -192,6 +226,8 @@ def handler(event, context):
                     if not 1<=dow<=7 or end<=start: return out(422,{"message":"dayOfWeek is 1=Monday..7=Sunday and endTime must be after startTime","correlationId":cid})
                     cur.execute("SELECT consultation_type_id FROM consultation_types WHERE consultation_type_id=%s AND doctor_id=%s AND is_active=1",(tid,uid))
                     if not cur.fetchone(): return out(422,{"message":"Consultation type must be active and owned by doctor","correlationId":cid})
+                    problem=pattern_problem(cur,uid,tid,dow,start,end)
+                    if problem: return out(problem[0],{"message":problem[1],"correlationId":cid})
                     cur.execute("INSERT INTO availability_patterns(doctor_id,consultation_type_id,day_of_week,start_time,end_time,is_active) VALUES(%s,%s,%s,%s,%s,1)",(uid,tid,dow,start.strftime("%H:%M:%S"),end.strftime("%H:%M:%S")))
                     conn.commit()
                     refresh_slots(uid,cid)
@@ -209,6 +245,15 @@ def handler(event, context):
                         for k,col in mapping.items():
                             if k in data: sets.append(f"{col}=%s"); vals.append(data[k])
                         if not sets: return out(400,{"message":"No fields supplied","correlationId":cid})
+                        cur.execute("SELECT * FROM availability_patterns WHERE pattern_id=%s AND doctor_id=%s",(pid,uid)); old=cur.fetchone()
+                        if not old: return out(404,{"message":"Availability pattern not found","correlationId":cid})
+                        try:
+                            ndow=int(data.get("dayOfWeek",old["day_of_week"])); nstart=as_time(data.get("startTime",old["start_time"])); nend=as_time(data.get("endTime",old["end_time"]))
+                        except Exception: return out(422,{"message":"dayOfWeek, startTime and endTime are invalid","correlationId":cid})
+                        if not 1<=ndow<=7 or nend<=nstart: return out(422,{"message":"dayOfWeek is 1=Monday..7=Sunday and endTime must be after startTime","correlationId":cid})
+                        if ("isActive" not in data) or data["isActive"] in (1,True,"1","true","True"):
+                            problem=pattern_problem(cur,uid,int(old["consultation_type_id"]),ndow,nstart,nend,exclude_pid=pid)
+                            if problem: return out(problem[0],{"message":problem[1],"correlationId":cid})
                         vals.extend([pid,uid]); cur.execute(f"UPDATE availability_patterns SET {', '.join(sets)},updated_at=UTC_TIMESTAMP(6) WHERE pattern_id=%s AND doctor_id=%s",vals); conn.commit(); refresh_slots(uid,cid)
                         return out(200,{"message":"Availability pattern updated; future slots are being refreshed automatically","correlationId":cid})
                 # Blackout dates
