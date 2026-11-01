@@ -69,16 +69,14 @@ def _register(event, context, role, cid):
     email = str(data.get("email", "")).strip().lower()
     password = data.get("password", "")
     phone = str(data.get("phone", "")).strip() or None
-
-    if phone and len(phone) > 25:
+    if not phone or len(phone) != 10 or not phone.isdigit():
         return response(
-            400,
-            {
-                "message": "phone must be 25 characters or fewer",
-                "correlationId": cid,
-            },
-        )
-
+        400,
+        {
+            "message": "phone must be exactly 10 digits",
+            "correlationId": cid,
+        },
+    )
     dob = str(data.get("dateOfBirth", "")).strip() or None
     gender = str(data.get("gender", "")).strip() or None
     address = str(data.get("address", "")).strip() or None
