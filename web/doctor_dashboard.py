@@ -37,12 +37,18 @@ def notify(text,kind="info"):
     """Queue one banner message for the next page view. kind: info | success | error."""
     session["messages"]=[{"kind":kind,"text":text}]
 def api_message(r):
-    try: return r.json().get("message") or r.text[:160]
-    except (ValueError,AttributeError): return r.text[:160]
+    """Human-readable message from the API. Never exposes status codes or raw response bodies to the page."""
+    try:
+        msg=r.json().get("message")
+        if msg: return str(msg)
+    except (ValueError,AttributeError): pass
+    return "Something went wrong. Please try again."
 def report(r,ok_text,label):
-    """Same API status as before, now shown as a friendly success / error banner."""
-    if r.ok: notify(f"{ok_text} (HTTP {r.status_code})","success")
-    else: notify(f"{label} failed: HTTP {r.status_code} - {api_message(r)}","error")
+    """Friendly success / error banner. Status codes go to the server log only."""
+    if r.ok: notify(ok_text,"success")
+    else:
+        app.logger.warning("%s failed: HTTP %s %s",label,r.status_code,r.text[:300])
+        notify(f"{label} failed: {api_message(r)}","error")
 
 def refresh_tokens():
     """Exchange the stored refresh token for a new access token. Returns True on success."""
@@ -186,7 +192,7 @@ def login():
     else:
         app.logger.warning("login failed: HTTP %s %s",r.status_code,r.text[:300])
         session["prefill_email"]=email
-        notify(f"Sign-in failed: HTTP {r.status_code} - {payload.get('message') or r.text[:120]}","error")
+        notify(f"Sign-in failed: {payload.get('message') or 'Please check your email and password.'}","error")
     return redirect("/")
 @app.post("/signup")
 def signup():
@@ -221,7 +227,7 @@ def signup():
         return redirect("/")
     app.logger.warning("signup failed: HTTP %s %s",r.status_code,r.text[:300])
     if r.status_code==409: return fail("An account with those details already exists. Try signing in, or check your email, phone and license number.")
-    return fail(f"Sign-up failed: HTTP {r.status_code} - {api_message(r)}")
+    return fail(f"Sign-up failed: {api_message(r)}")
 @app.get("/logout")
 def logout():
     if session.get("access_token"):
@@ -280,12 +286,14 @@ def photo():
         return redirect("/?m=photo")
     r=api("POST","/doctors/me/photo-upload-url",json={"fileName":f.filename or "photo","contentType":f.mimetype})
     if not r.ok:
-        notify(f"Could not create upload URL: HTTP {r.status_code}","error")
+        app.logger.warning("photo upload-url failed: HTTP %s",r.status_code)
+        notify("Could not prepare the photo upload. Please try again.","error")
         return redirect("/?m=photo")
     upload=r.json()
     put=requests.put(upload["uploadUrl"],data=content,headers={"Content-Type":f.mimetype,"x-amz-server-side-encryption":"AES256"},timeout=20)
     if not put.ok:
-        notify(f"S3 upload failed: HTTP {put.status_code}","error")
+        app.logger.warning("photo S3 upload failed: HTTP %s",put.status_code)
+        notify("Photo upload failed. Please try again.","error")
         return redirect("/?m=photo")
     saved=api("PATCH","/doctors/me",json={"photoKey":upload["photoKey"]})
     if saved.ok: session["photo_key"]=upload["photoKey"]
@@ -312,7 +320,8 @@ def schedule():
     day=request.args.get("date","")
     r=api("GET","/doctors/me/schedule",params={"date":day})
     # Rendered directly (not stored in the cookie session) so a long day can never overflow the 4 KB cookie.
-    sched=dict(date=day,ok=r.ok,raw=r.text[:12000],data=None,error=f"Schedule API: HTTP {r.status_code} - {api_message(r)}",slot_cols=[])
+    if not r.ok: app.logger.warning("schedule failed: HTTP %s %s",r.status_code,r.text[:300])
+    sched=dict(date=day,ok=r.ok,data=None,error=f"Could not load the schedule: {api_message(r)}",slot_cols=[])
     try:
         data=r.json()
         if isinstance(data,dict):

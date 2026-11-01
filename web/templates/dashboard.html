@@ -296,7 +296,6 @@ pre{background:#12303a;color:#d6ece9;padding:20px;border-radius:12px;overflow:au
      <h3 class="list-title">Slots</h3>
      {% if sched.data.get('slots') %}{{ table(sched.data.slots, sched.slot_cols) }}{% else %}<div class="empty"><b>No slots</b>No slots are open for this day. Check your weekly pattern and blackout dates.</div>{% endif %}
     {% else %}<div class="banner error" style="margin-top:28px"><span>{{ sched.error }}</span></div>{% endif %}
-    <details><summary>Raw API response</summary><pre>{{ sched.raw }}</pre></details>
    {% endif %}
   {% endif %}
  </main>
