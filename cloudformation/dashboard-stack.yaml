@@ -124,6 +124,7 @@ Resources:
             unzip -o /tmp/dashboard.zip -d /opt/medislot-dashboard
             test -f /opt/medislot-dashboard/doctor_dashboard.py
             test -f /opt/medislot-dashboard/requirements.txt
+            test -f /opt/medislot-dashboard/templates/dashboard.html
             python3 -m venv /opt/medislot-dashboard/venv
             /opt/medislot-dashboard/venv/bin/pip install --upgrade pip
             /opt/medislot-dashboard/venv/bin/pip install -r /opt/medislot-dashboard/requirements.txt gunicorn

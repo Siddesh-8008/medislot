@@ -205,7 +205,7 @@ jobs:
           ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
           BUCKET="medislot-${ENVIRONMENT}-artifacts-${ACCOUNT}"
           KEY="dashboard/${GITHUB_SHA}/dashboard.zip"
-          (cd web && zip -q "$GITHUB_WORKSPACE/dashboard.zip" doctor_dashboard.py requirements.txt)
+          (cd web && zip -qr "$GITHUB_WORKSPACE/dashboard.zip" doctor_dashboard.py requirements.txt templates)
           aws s3 cp "$GITHUB_WORKSPACE/dashboard.zip" "s3://${BUCKET}/${KEY}" --sse AES256 --region "$AWS_REGION"
           echo "DASHBOARD_ARTIFACT_BUCKET=$BUCKET" >> "$GITHUB_ENV"
           echo "DASHBOARD_ARTIFACT_KEY=$KEY" >> "$GITHUB_ENV"
