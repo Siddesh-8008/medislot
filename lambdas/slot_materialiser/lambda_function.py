@@ -50,7 +50,14 @@ def iso_z(dt):
 
 
 def as_time(v):
-    return v if isinstance(v, time) else time.fromisoformat(str(v))
+    """pymysql returns MySQL TIME columns as datetime.timedelta (e.g. 09:00:00 -> '9:00:00'),
+    which time.fromisoformat() rejects for hours < 10. Convert timedelta explicitly."""
+    if isinstance(v, time):
+        return v
+    if isinstance(v, timedelta):
+        secs = int(v.total_seconds())
+        return time(secs // 3600 % 24, secs % 3600 // 60, secs % 60)
+    return time.fromisoformat(str(v).zfill(8) if len(str(v)) == 7 else str(v))
 
 
 # --------------------------------------------------------------------------- pure slot generation
