@@ -250,6 +250,27 @@ def availability():
     r=api("POST","/doctors/me/availability-patterns",json=data)
     report(r,"Weekly pattern added","Availability")
     return redirect("/?m=availability")
+@app.post("/availability/<int:pid>/update")
+def availability_update(pid):
+    """Change the hours of an existing weekly pattern. The API then rebuilds this doctor's slots:
+    unbooked, unheld slots outside the new hours are closed; booked and held slots are never touched."""
+    data={"startTime":request.form["startTime"],"endTime":request.form["endTime"]}
+    r=api("PATCH",f"/doctors/me/availability-patterns/{pid}",json=data)
+    report(r,"Weekly pattern updated. Open slots outside the new hours are being closed; booked slots are kept.","Availability update")
+    return redirect("/?m=availability")
+@app.post("/availability/<int:pid>/remove")
+def availability_remove(pid):
+    r=api("DELETE",f"/doctors/me/availability-patterns/{pid}")
+    report(r,"Weekly pattern removed. Its open slots are being closed; booked slots are kept.","Remove pattern")
+    return redirect("/?m=availability")
+@app.template_filter("hhmm")
+def hhmm_filter(v):
+    """'9:00:00' / '09:00:00' -> '09:00' (for display and <input type=time>)."""
+    try:
+        h,m=str(v).split(":")[:2]
+        return f"{int(h):02d}:{m[:2]}"
+    except (ValueError,TypeError):
+        return str(v)
 @app.post("/blackout")
 def blackout():
     r=api("POST","/doctors/me/blackout-dates",json={"blackoutDate":request.form["blackoutDate"],"reason":request.form.get("reason","")})

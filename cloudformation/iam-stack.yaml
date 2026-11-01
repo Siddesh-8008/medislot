@@ -71,6 +71,21 @@ Resources:
             Resource:
               - !Sub arn:${AWS::Partition}:s3:::medislot-${Environment}-artifacts-${AWS::AccountId}/dashboard/*
 
+          - Sid: RunDashboardDeployCommand
+            Effect: Allow
+            Action: ssm:SendCommand
+            Resource:
+              - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}::document/AWS-RunShellScript
+              - !Sub arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*
+
+          - Sid: ReadDashboardDeployCommandStatus
+            Effect: Allow
+            Action:
+              - ssm:GetCommandInvocation
+              - ssm:ListCommandInvocations
+              - ssm:DescribeInstanceInformation
+            Resource: "*"
+
           - Sid: DashboardEC2Operations
             Effect: Allow
             Action:

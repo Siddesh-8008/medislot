@@ -73,7 +73,7 @@ Resources:
                 Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/medislot/${Environment}/web/session-secret
               - Effect: Allow
                 Action: s3:GetObject
-                Resource: !Sub arn:${AWS::Partition}:s3:::${DashboardArtifactBucket}/${DashboardArtifactKey}
+                Resource: !Sub arn:${AWS::Partition}:s3:::${DashboardArtifactBucket}/dashboard/*
               - Effect: Allow
                 Action: s3:GetObject
                 Resource: !Sub arn:${AWS::Partition}:s3:::medislot-${Environment}-doctor-photos-${AWS::AccountId}-${AWS::Region}/doctors/*
@@ -110,6 +110,8 @@ Resources:
           Value: !Sub medislot-${Environment}-doctor-dashboard
         - Key: Project
           Value: MediSlot
+        - Key: DashboardArtifactKey
+          Value: !Ref DashboardArtifactKey
       UserData:
         Fn::Base64:
           Fn::Sub: |
@@ -120,7 +122,9 @@ Resources:
             dnf update -y
             dnf install -y python3 python3-pip nginx unzip awscli
             mkdir -p /opt/medislot-dashboard
-            aws s3 cp "s3://${DashboardArtifactBucket}/${DashboardArtifactKey}" /tmp/dashboard.zip --region ${AWS::Region}
+            # First boot only: fetch the newest build. Later releases are pushed by the deploy workflow
+            # through SSM Run Command, so this script never changes (and the instance is never restarted) per release.
+            aws s3 cp "s3://${DashboardArtifactBucket}/dashboard/latest/dashboard.zip" /tmp/dashboard.zip --region ${AWS::Region}
             unzip -o /tmp/dashboard.zip -d /opt/medislot-dashboard
             test -f /opt/medislot-dashboard/doctor_dashboard.py
             test -f /opt/medislot-dashboard/requirements.txt

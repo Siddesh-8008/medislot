@@ -207,6 +207,8 @@ jobs:
           KEY="dashboard/${GITHUB_SHA}/dashboard.zip"
           (cd web && zip -qr "$GITHUB_WORKSPACE/dashboard.zip" doctor_dashboard.py requirements.txt templates)
           aws s3 cp "$GITHUB_WORKSPACE/dashboard.zip" "s3://${BUCKET}/${KEY}" --sse AES256 --region "$AWS_REGION"
+          # Stable copy used only when a brand-new dashboard instance boots for the first time.
+          aws s3 cp "$GITHUB_WORKSPACE/dashboard.zip" "s3://${BUCKET}/dashboard/latest/dashboard.zip" --sse AES256 --region "$AWS_REGION"
           echo "DASHBOARD_ARTIFACT_BUCKET=$BUCKET" >> "$GITHUB_ENV"
           echo "DASHBOARD_ARTIFACT_KEY=$KEY" >> "$GITHUB_ENV"
 
@@ -230,6 +232,77 @@ jobs:
             "DashboardArtifactKey=${DASHBOARD_ARTIFACT_KEY}" \
             "ApiBaseUrl=${API_URL}" \
             "AllowedClientCidr=${DASHBOARD_ALLOWED_CLIENT_CIDR}"
+
+      - name: Roll out dashboard code to EC2 (SSM Run Command)
+        shell: bash
+        run: |
+          set -euo pipefail
+          STACK="medislot-${ENVIRONMENT}-dashboard"
+          INSTANCE_ID="$(aws cloudformation describe-stacks --stack-name "$STACK" --region "$AWS_REGION" \
+            --query "Stacks[0].Outputs[?OutputKey=='DashboardInstanceId'].OutputValue | [0]" --output text)"
+          echo "Dashboard instance: $INSTANCE_ID"
+
+          # 1. Wait until the SSM agent on the instance is registered and online (up to 10 minutes).
+          PING="none"
+          for i in $(seq 1 40); do
+            PING="$(aws ssm describe-instance-information --region "$AWS_REGION" \
+              --filters "Key=InstanceIds,Values=${INSTANCE_ID}" \
+              --query 'InstanceInformationList[0].PingStatus' --output text 2>/dev/null || true)"
+            [[ "$PING" == "Online" ]] && break
+            echo "Waiting for SSM agent (status: ${PING:-none}) ..."
+            sleep 15
+          done
+          if [[ "$PING" != "Online" ]]; then
+            echo "::error::Instance $INSTANCE_ID is not reachable through SSM. Check the endpoint security group and the instance role."
+            exit 1
+          fi
+
+          # 2. Build the remote script: pull this commit's zip, swap the code, restart, health-check.
+          REMOTE_VARS="BUCKET='${DASHBOARD_ARTIFACT_BUCKET}'; KEY='${DASHBOARD_ARTIFACT_KEY}'; REGION='${AWS_REGION}'"
+          BODY="$(cat <<'EOS'
+          set -euo pipefail
+          APP=/opt/medislot-dashboard
+          WORK=$(mktemp -d)
+          aws s3 cp "s3://${BUCKET}/${KEY}" "$WORK/dashboard.zip" --region "$REGION"
+          unzip -oq "$WORK/dashboard.zip" -d "$WORK/new"
+          test -f "$WORK/new/doctor_dashboard.py"
+          test -f "$WORK/new/templates/dashboard.html"
+          test -f "$WORK/new/requirements.txt"
+          tar -czf /tmp/dashboard-previous.tgz -C "$APP" doctor_dashboard.py requirements.txt templates
+          rm -rf "$APP/templates"
+          cp -a "$WORK/new/." "$APP/"
+          "$APP/venv/bin/pip" install -q -r "$APP/requirements.txt" gunicorn
+          chown -R ec2-user:ec2-user "$APP"
+          systemctl restart medislot-dashboard
+          for i in $(seq 1 30); do
+            CODE=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/login || true)
+            if [ "$CODE" = "200" ] || [ "$CODE" = "302" ]; then echo "Dashboard healthy (HTTP $CODE) after $((i*2))s"; rm -rf "$WORK"; exit 0; fi
+            sleep 2
+          done
+          echo "Dashboard did not become healthy; recent service log:"
+          journalctl -u medislot-dashboard -n 40 --no-pager || true
+          exit 1
+          EOS
+          )"
+          SCRIPT="${REMOTE_VARS}"$'\n'"${BODY}"
+          PARAMS="$(jq -n --arg s "$SCRIPT" '{commands: [$s], executionTimeout: ["600"]}')"
+
+          # 3. Run it on the instance and wait for the result.
+          CMD_ID="$(aws ssm send-command --region "$AWS_REGION" --instance-ids "$INSTANCE_ID" \
+            --document-name AWS-RunShellScript --comment "Deploy dashboard ${GITHUB_SHA}" \
+            --parameters "$PARAMS" --query Command.CommandId --output text)"
+          echo "SSM command: $CMD_ID"
+          STATUS="Pending"
+          for i in $(seq 1 120); do
+            sleep 5
+            STATUS="$(aws ssm get-command-invocation --region "$AWS_REGION" --command-id "$CMD_ID" \
+              --instance-id "$INSTANCE_ID" --query Status --output text 2>/dev/null || echo Pending)"
+            case "$STATUS" in Pending|InProgress|Delayed) ;; *) break ;; esac
+          done
+          echo "Remote status: $STATUS"
+          aws ssm get-command-invocation --region "$AWS_REGION" --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
+            --query '[StandardOutputContent,StandardErrorContent]' --output text || true
+          [[ "$STATUS" == "Success" ]] || { echo "::error::Dashboard rollout failed (status: $STATUS)."; exit 1; }
 
       - name: Print deployed API and dashboard outputs
         shell: bash
