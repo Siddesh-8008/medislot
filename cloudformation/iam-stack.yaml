@@ -49,6 +49,27 @@ Resources:
               - cloudformation:DescribeStackResources
             Resource: "*"
 
+          - Sid: ManageMediSlotLogGroups
+            Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:DeleteLogGroup
+              - logs:PutRetentionPolicy
+              - logs:DeleteRetentionPolicy
+              - logs:TagResource
+              - logs:UntagResource
+              - logs:TagLogGroup
+              - logs:UntagLogGroup
+              - logs:ListTagsForResource
+              - logs:ListTagsLogGroup
+            Resource:
+              - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/medislot/${Environment}/*
+
+          - Sid: DescribeLogGroups
+            Effect: Allow
+            Action: logs:DescribeLogGroups
+            Resource: "*"
+
           - Sid: ReadCallerIdentity
             Effect: Allow
             Action: sts:GetCallerIdentity

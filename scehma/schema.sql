@@ -1,7 +1,8 @@
 -- MediSlot identity, doctor profile and reference-data schema.
 -- Fresh database install: creates core MediSlot tables and Milestone 3 doctor-domain tables.
--- Run this file once against an empty medislot database.
--- Never store plaintext passwords.
+-- Run this file once against an EMPTY medislot database (drop the old tables first: availability_patterns,
+-- blackout_dates, consultation_types, doctors, ... in child-to-parent order). Lambdas never create or
+-- migrate tables; this file is the only place the schema is defined.
 -- Never store plaintext passwords.
 
 CREATE TABLE IF NOT EXISTS users (
@@ -94,28 +95,54 @@ CREATE TABLE IF NOT EXISTS doctors (
 ) ENGINE=InnoDB;
 
 
+-- Master list of the standard consultation types. Not owned by any doctor: the four rows are seeded
+-- below, and a doctor *chooses* from this table (see doctor_consultation_types).
+-- Duration is fixed by the type; capacity may range between min_capacity and max_capacity.
 CREATE TABLE IF NOT EXISTS consultation_types (
-    consultation_type_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-    doctor_id BIGINT UNSIGNED NOT NULL,
+    consultation_type_id INT UNSIGNED NOT NULL,
     name VARCHAR(100) NOT NULL,
     duration_minutes SMALLINT UNSIGNED NOT NULL,
+    min_capacity SMALLINT UNSIGNED NOT NULL DEFAULT 1,
+    max_capacity SMALLINT UNSIGNED NOT NULL DEFAULT 1,
+    is_active TINYINT(1) NOT NULL DEFAULT 1,
+    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+        ON UPDATE CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (consultation_type_id),
+    UNIQUE KEY uq_consultation_types_name (name),
+    KEY ix_consultation_types_active (is_active),
+    CONSTRAINT chk_consultation_types_capacity CHECK (min_capacity >= 1 AND max_capacity >= min_capacity)
+) ENGINE=InnoDB;
+
+-- The consultation types a doctor actually offers: one row per (doctor, master type) with the
+-- doctor's own fee and capacity. Name and duration come from consultation_types.
+CREATE TABLE IF NOT EXISTS doctor_consultation_types (
+    doctor_consultation_type_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    doctor_id BIGINT UNSIGNED NOT NULL,
+    consultation_type_id INT UNSIGNED NOT NULL,
     fee DECIMAL(10,2) NOT NULL,
     capacity SMALLINT UNSIGNED NOT NULL DEFAULT 1,
     is_active TINYINT(1) NOT NULL DEFAULT 1,
     created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
         ON UPDATE CURRENT_TIMESTAMP(6),
-    PRIMARY KEY (consultation_type_id),
-    UNIQUE KEY uq_consultation_doctor_name (doctor_id, name),
-    KEY ix_consultation_doctor_active (doctor_id, is_active),
-    CONSTRAINT fk_consultation_doctor FOREIGN KEY (doctor_id)
-        REFERENCES doctors(doctor_id)
+    PRIMARY KEY (doctor_consultation_type_id),
+    UNIQUE KEY uq_doctor_consultation (doctor_id, consultation_type_id),
+    KEY ix_doctor_consultation_active (doctor_id, is_active),
+    KEY ix_doctor_consultation_type (consultation_type_id),
+    CONSTRAINT fk_doctor_consultation_doctor FOREIGN KEY (doctor_id)
+        REFERENCES doctors(doctor_id),
+    CONSTRAINT fk_doctor_consultation_type FOREIGN KEY (consultation_type_id)
+        REFERENCES consultation_types(consultation_type_id),
+    CONSTRAINT chk_doctor_consultation_fee CHECK (fee >= 0)
 ) ENGINE=InnoDB;
 
+-- A weekly pattern is always for a consultation type the doctor has chosen: the composite foreign key
+-- (doctor_id, consultation_type_id) points at doctor_consultation_types.
 CREATE TABLE IF NOT EXISTS availability_patterns (
     pattern_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
     doctor_id BIGINT UNSIGNED NOT NULL,
-    consultation_type_id BIGINT UNSIGNED NOT NULL,
+    consultation_type_id INT UNSIGNED NOT NULL,
     day_of_week TINYINT UNSIGNED NOT NULL COMMENT 'ISO weekday: 1 Monday through 7 Sunday',
     start_time TIME NOT NULL,
     end_time TIME NOT NULL,
@@ -128,8 +155,8 @@ CREATE TABLE IF NOT EXISTS availability_patterns (
     KEY ix_availability_consultation (consultation_type_id),
     CONSTRAINT fk_availability_doctor FOREIGN KEY (doctor_id)
         REFERENCES doctors(doctor_id),
-    CONSTRAINT fk_availability_consultation FOREIGN KEY (consultation_type_id)
-        REFERENCES consultation_types(consultation_type_id),
+    CONSTRAINT fk_availability_doctor_consultation FOREIGN KEY (doctor_id, consultation_type_id)
+        REFERENCES doctor_consultation_types(doctor_id, consultation_type_id),
     CONSTRAINT chk_availability_day CHECK (day_of_week BETWEEN 1 AND 7),
     CONSTRAINT chk_availability_time CHECK (end_time > start_time)
 ) ENGINE=InnoDB;
@@ -202,4 +229,19 @@ VALUES
     (30, 'Obstetrics', 1)
 ON DUPLICATE KEY UPDATE
     specialization_name = VALUES(specialization_name),
+    is_active = VALUES(is_active);
+
+-- The four standard consultation types (idempotent).
+INSERT INTO consultation_types
+    (consultation_type_id, name, duration_minutes, min_capacity, max_capacity, is_active)
+VALUES
+    (1, 'Quick Consult',       15, 1, 1,  1),
+    (2, 'Standard Consult',    30, 1, 1,  1),
+    (3, 'Detailed Consult',    60, 1, 1,  1),
+    (4, 'Health Camp Session', 60, 2, 10, 1)
+ON DUPLICATE KEY UPDATE
+    name = VALUES(name),
+    duration_minutes = VALUES(duration_minutes),
+    min_capacity = VALUES(min_capacity),
+    max_capacity = VALUES(max_capacity),
     is_active = VALUES(is_active);

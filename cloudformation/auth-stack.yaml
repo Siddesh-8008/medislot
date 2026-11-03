@@ -7,6 +7,11 @@ Parameters:
     AllowedValues: [dev, test, prod]
   ArtifactBucket: {Type: String}
   ArtifactPrefix: {Type: String}
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    Description: How many days CloudWatch keeps Lambda and API Gateway logs.
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365]
 Resources:
   LambdaExecutionBasePolicy:
     Type: AWS::IAM::ManagedPolicy
@@ -20,13 +25,51 @@ Resources:
             Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/medislot-${Environment}-*'
           - Effect: Allow
             Action: [logs:CreateLogStream, logs:PutLogEvents]
-            Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/medislot-${Environment}-*:*'
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/medislot-${Environment}-*:*'
+              - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/medislot/${Environment}/lambda/*:*'
           - Effect: Allow
             Action: [xray:PutTraceSegments, xray:PutTelemetryRecords]
             Resource: '*'
           - Effect: Allow
             Action: [ec2:CreateNetworkInterface, ec2:DescribeNetworkInterfaces, ec2:DeleteNetworkInterface, ec2:AssignPrivateIpAddresses, ec2:UnassignPrivateIpAddresses]
             Resource: '*'
+  # ---- CloudWatch log groups: one per Lambda, with retention. Lambdas write here via LoggingConfig.
+  AuthenticationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/medislot/${Environment}/lambda/authentication'
+      RetentionInDays: !Ref LogRetentionDays
+  AuthorizerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/medislot/${Environment}/lambda/authorizer'
+      RetentionInDays: !Ref LogRetentionDays
+  RdsConnectionCheckLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/medislot/${Environment}/lambda/rds-connection-check'
+      RetentionInDays: !Ref LogRetentionDays
+  ProtectedTestLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/medislot/${Environment}/lambda/protected-test'
+      RetentionInDays: !Ref LogRetentionDays
+  DoctorDomainLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/medislot/${Environment}/lambda/doctor-domain'
+      RetentionInDays: !Ref LogRetentionDays
+  SlotMaterialiserLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/medislot/${Environment}/lambda/slot-materialiser'
+      RetentionInDays: !Ref LogRetentionDays
+  ApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/medislot/${Environment}/apigateway/access'
+      RetentionInDays: !Ref LogRetentionDays
   AuthorizerRole:
     Type: AWS::IAM::Role
     Properties:
@@ -59,6 +102,9 @@ Resources:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: !Sub 'medislot-${Environment}-authentication'
+      LoggingConfig:
+        LogFormat: Text
+        LogGroup: !Ref AuthenticationLogGroup
       Runtime: python3.12
       Handler: lambda_function.handler
       Role: !GetAtt AuthenticationRole.Arn
@@ -76,6 +122,9 @@ Resources:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: !Sub 'medislot-${Environment}-authorizer'
+      LoggingConfig:
+        LogFormat: Text
+        LogGroup: !Ref AuthorizerLogGroup
       Runtime: python3.12
       Handler: lambda_function.handler
       Role: !GetAtt AuthorizerRole.Arn
@@ -106,6 +155,9 @@ Resources:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: !Sub 'medislot-${Environment}-rds-connection-check'
+      LoggingConfig:
+        LogFormat: Text
+        LogGroup: !Ref RdsConnectionCheckLogGroup
       Runtime: python3.12
       Handler: lambda_function.handler
       Role: !GetAtt RdsCheckRole.Arn
@@ -128,6 +180,9 @@ Resources:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: !Sub 'medislot-${Environment}-protected-test'
+      LoggingConfig:
+        LogFormat: Text
+        LogGroup: !Ref ProtectedTestLogGroup
       Runtime: python3.12
       Handler: index.handler
       Role: !GetAtt ProtectedFunctionRole.Arn
@@ -207,6 +262,9 @@ Resources:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: !Sub 'medislot-${Environment}-doctor-domain'
+      LoggingConfig:
+        LogFormat: Text
+        LogGroup: !Ref DoctorDomainLogGroup
       Runtime: python3.12
       Handler: lambda_function.handler
       Role: !GetAtt DoctorDomainRole.Arn
@@ -257,6 +315,9 @@ Resources:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: !Sub 'medislot-${Environment}-slot-materialiser'
+      LoggingConfig:
+        LogFormat: Text
+        LogGroup: !Ref SlotMaterialiserLogGroup
       Runtime: python3.12
       Handler: lambda_function.handler
       Role: !GetAtt SlotMaterialiserRole.Arn
@@ -310,28 +371,317 @@ Resources:
       Action: lambda:InvokeFunction
       Principal: apigateway.amazonaws.com
       SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*/*/doctors/*'
+  # ---- Doctor dashboard endpoints: every path and HTTP method is its own API Gateway method in this
+  # same REST API (same stage, same authorizer as /auth/*, /doctor and /patient). All of them
+  # invoke the doctor-domain Lambda, which checks that the caller has the DOCTOR role.
   DoctorsResource:
     Type: AWS::ApiGateway::Resource
     Properties:
       RestApiId: !Ref RestApi
       ParentId: !GetAtt RestApi.RootResourceId
       PathPart: doctors
-  DoctorsProxyResource:
+  DoctorsMeResource:
     Type: AWS::ApiGateway::Resource
     Properties:
       RestApiId: !Ref RestApi
       ParentId: !Ref DoctorsResource
-      PathPart: '{proxy+}'
-  DoctorsProxyMethod:
+      PathPart: 'me'
+  DoctorsCatalogResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref DoctorsResource
+      PathPart: 'catalog'
+  DoctorsCatalogConsultationTypesResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref DoctorsCatalogResource
+      PathPart: 'consultation-types'
+  DoctorsMePhotoUploadUrlResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref DoctorsMeResource
+      PathPart: 'photo-upload-url'
+  DoctorsMeConsultationTypesResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref DoctorsMeResource
+      PathPart: 'consultation-types'
+  DoctorsMeConsultationTypeIdResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref DoctorsMeConsultationTypesResource
+      PathPart: '{consultationTypeId}'
+  DoctorsMeAvailabilityPatternsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref DoctorsMeResource
+      PathPart: 'availability-patterns'
+  DoctorsMeAvailabilityPatternIdResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref DoctorsMeAvailabilityPatternsResource
+      PathPart: '{patternId}'
+  DoctorsMeBlackoutDatesResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref DoctorsMeResource
+      PathPart: 'blackout-dates'
+  DoctorsMeBlackoutIdResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref DoctorsMeBlackoutDatesResource
+      PathPart: '{blackoutId}'
+  DoctorsMeScheduleResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref DoctorsMeResource
+      PathPart: 'schedule'
+  DoctorsMeGetMethod:
     Type: AWS::ApiGateway::Method
     Properties:
       RestApiId: !Ref RestApi
-      ResourceId: !Ref DoctorsProxyResource
-      HttpMethod: ANY
+      ResourceId: !Ref DoctorsMeResource
+      HttpMethod: GET
       AuthorizationType: CUSTOM
       AuthorizerId: !Ref ApiAuthorizer
-      RequestParameters:
-        method.request.path.proxy: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DoctorDomainFunction.Arn}/invocations'
+  DoctorsMePostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref DoctorsMeResource
+      HttpMethod: POST
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DoctorDomainFunction.Arn}/invocations'
+  DoctorsMePutMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref DoctorsMeResource
+      HttpMethod: PUT
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DoctorDomainFunction.Arn}/invocations'
+  DoctorsMePatchMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref DoctorsMeResource
+      HttpMethod: PATCH
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DoctorDomainFunction.Arn}/invocations'
+  DoctorsCatalogConsultationTypesGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref DoctorsCatalogConsultationTypesResource
+      HttpMethod: GET
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DoctorDomainFunction.Arn}/invocations'
+  DoctorsMePhotoUploadUrlPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref DoctorsMePhotoUploadUrlResource
+      HttpMethod: POST
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DoctorDomainFunction.Arn}/invocations'
+  DoctorsMeConsultationTypesGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref DoctorsMeConsultationTypesResource
+      HttpMethod: GET
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DoctorDomainFunction.Arn}/invocations'
+  DoctorsMeConsultationTypesPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref DoctorsMeConsultationTypesResource
+      HttpMethod: POST
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DoctorDomainFunction.Arn}/invocations'
+  DoctorsMeConsultationTypeIdPutMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref DoctorsMeConsultationTypeIdResource
+      HttpMethod: PUT
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DoctorDomainFunction.Arn}/invocations'
+  DoctorsMeConsultationTypeIdPatchMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref DoctorsMeConsultationTypeIdResource
+      HttpMethod: PATCH
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DoctorDomainFunction.Arn}/invocations'
+  DoctorsMeConsultationTypeIdDeleteMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref DoctorsMeConsultationTypeIdResource
+      HttpMethod: DELETE
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DoctorDomainFunction.Arn}/invocations'
+  DoctorsMeAvailabilityPatternsGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref DoctorsMeAvailabilityPatternsResource
+      HttpMethod: GET
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DoctorDomainFunction.Arn}/invocations'
+  DoctorsMeAvailabilityPatternsPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref DoctorsMeAvailabilityPatternsResource
+      HttpMethod: POST
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DoctorDomainFunction.Arn}/invocations'
+  DoctorsMeAvailabilityPatternIdPutMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref DoctorsMeAvailabilityPatternIdResource
+      HttpMethod: PUT
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DoctorDomainFunction.Arn}/invocations'
+  DoctorsMeAvailabilityPatternIdPatchMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref DoctorsMeAvailabilityPatternIdResource
+      HttpMethod: PATCH
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DoctorDomainFunction.Arn}/invocations'
+  DoctorsMeAvailabilityPatternIdDeleteMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref DoctorsMeAvailabilityPatternIdResource
+      HttpMethod: DELETE
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DoctorDomainFunction.Arn}/invocations'
+  DoctorsMeBlackoutDatesGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref DoctorsMeBlackoutDatesResource
+      HttpMethod: GET
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DoctorDomainFunction.Arn}/invocations'
+  DoctorsMeBlackoutDatesPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref DoctorsMeBlackoutDatesResource
+      HttpMethod: POST
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DoctorDomainFunction.Arn}/invocations'
+  DoctorsMeBlackoutIdDeleteMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref DoctorsMeBlackoutIdResource
+      HttpMethod: DELETE
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DoctorDomainFunction.Arn}/invocations'
+  DoctorsMeScheduleGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref DoctorsMeScheduleResource
+      HttpMethod: GET
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
       Integration:
         Type: AWS_PROXY
         IntegrationHttpMethod: POST
@@ -428,7 +778,26 @@ Resources:
     DependsOn:
       - PatientProtectedMethod
       - DoctorProtectedMethod
-      - DoctorsProxyMethod
+      - DoctorsMeGetMethod
+      - DoctorsMePostMethod
+      - DoctorsMePutMethod
+      - DoctorsMePatchMethod
+      - DoctorsCatalogConsultationTypesGetMethod
+      - DoctorsMePhotoUploadUrlPostMethod
+      - DoctorsMeConsultationTypesGetMethod
+      - DoctorsMeConsultationTypesPostMethod
+      - DoctorsMeConsultationTypeIdPutMethod
+      - DoctorsMeConsultationTypeIdPatchMethod
+      - DoctorsMeConsultationTypeIdDeleteMethod
+      - DoctorsMeAvailabilityPatternsGetMethod
+      - DoctorsMeAvailabilityPatternsPostMethod
+      - DoctorsMeAvailabilityPatternIdPutMethod
+      - DoctorsMeAvailabilityPatternIdPatchMethod
+      - DoctorsMeAvailabilityPatternIdDeleteMethod
+      - DoctorsMeBlackoutDatesGetMethod
+      - DoctorsMeBlackoutDatesPostMethod
+      - DoctorsMeBlackoutIdDeleteMethod
+      - DoctorsMeScheduleGetMethod
       - RegisterPatientMethod
       - RegisterDoctorMethod
       - LoginMethod
@@ -444,6 +813,9 @@ Resources:
       DeploymentId: !Ref ApiDeployment
       StageName: !Ref Environment
       TracingEnabled: true
+      AccessLogSetting:
+        DestinationArn: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${ApiAccessLogGroup}'
+        Format: '{"requestId":"$context.requestId","ip":"$context.identity.sourceIp","requestTime":"$context.requestTime","httpMethod":"$context.httpMethod","resourcePath":"$context.resourcePath","path":"$context.path","status":"$context.status","responseLength":"$context.responseLength","responseLatencyMs":"$context.responseLatency","integrationLatencyMs":"$context.integrationLatency","authorizerPrincipal":"$context.authorizer.principalId","authorizerError":"$context.authorizer.error","errorMessage":"$context.error.message","userAgent":"$context.identity.userAgent"}'
       MethodSettings:
         - ResourcePath: '/*'
           HttpMethod: '*'
@@ -465,4 +837,10 @@ Outputs:
   AuthenticationFunctionName: {Value: !Ref AuthenticationFunction}
   AuthorizerFunctionName: {Value: !Ref AuthorizerFunction}
   RdsConnectionCheckFunctionName: {Value: !Ref RdsConnectionCheckFunction}
+  LambdaLogGroupPrefix:
+    Description: CloudWatch log groups for every Lambda (one group per function).
+    Value: !Sub '/medislot/${Environment}/lambda/'
+  ApiAccessLogGroupName:
+    Description: CloudWatch log group with one JSON line per API Gateway request.
+    Value: !Ref ApiAccessLogGroup
 #

@@ -1,7 +1,10 @@
 import json
 import os
+import time
 import uuid
 import logging
+import functools
+import traceback
 import boto3
 import pymysql
 import hashlib
@@ -100,3 +103,86 @@ def correlation(event):
         or (event.get("requestContext") or {}).get("requestId")
         or str(uuid.uuid4())
     )
+
+
+# --------------------------------------------------------------------------- CloudWatch event logging
+# Every Lambda handler is wrapped with @instrument("<name>"). It writes one structured JSON log line
+# when the function is invoked (what event arrived), one when it finishes (status code + duration),
+# and one with the stack trace if it crashes. Secrets are never logged: request bodies, tokens,
+# passwords and Authorization headers are dropped or masked.
+_SENSITIVE = ("password", "token", "secret", "authorization", "cookie", "jwt")
+
+
+def _redact(value, depth=0):
+    if depth > 3:
+        return "..."
+    if isinstance(value, dict):
+        return {
+            k: ("***" if any(w in str(k).lower() for w in _SENSITIVE) else _redact(v, depth + 1))
+            for k, v in list(value.items())[:30]
+        }
+    if isinstance(value, (list, tuple)):
+        return [_redact(v, depth + 1) for v in list(value)[:20]]
+    if isinstance(value, str):
+        return value[:200]
+    return value
+
+
+def describe_event(event):
+    """A log-safe summary of whatever triggered the Lambda."""
+    if not isinstance(event, dict):
+        return {"type": type(event).__name__}
+    if "methodArn" in event:  # API Gateway TOKEN authorizer: never log authorizationToken
+        return {"type": "apigateway-authorizer", "methodArn": event.get("methodArn")}
+    if "httpMethod" in event or "requestContext" in event:
+        rc = event.get("requestContext") or {}
+        auth = rc.get("authorizer") or {}
+        identity = rc.get("identity") or {}
+        return {
+            "type": "apigateway-http",
+            "method": event.get("httpMethod"),
+            "resource": event.get("resource"),
+            "path": event.get("path") or event.get("rawPath"),
+            "queryStringParameters": _redact(event.get("queryStringParameters")),
+            "requestId": rc.get("requestId"),
+            "sourceIp": identity.get("sourceIp"),
+            "userAgent": (identity.get("userAgent") or "")[:120],
+            "userId": auth.get("userId"),
+            "role": auth.get("role"),
+            "hasBody": bool(event.get("body")),
+        }
+    return {"type": "direct-invoke", "event": _redact(event)}
+
+
+def instrument(function_name):
+    """Decorator that logs every invocation, result and failure of a Lambda handler to CloudWatch."""
+
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(event, context):
+            cid = correlation(event) if isinstance(event, dict) else str(uuid.uuid4())
+            started = time.time()
+            request_id = getattr(context, "aws_request_id", None)
+            emit("info", "lambda_invoked", cid, function=function_name,
+                 awsRequestId=request_id, event=describe_event(event))
+            try:
+                result = fn(event, context)
+            except Exception as exc:
+                rejected = str(exc) == "Unauthorized"  # intentional authorizer rejection, not a crash
+                emit("warning" if rejected else "error",
+                     "lambda_rejected" if rejected else "lambda_failed", cid,
+                     function=function_name, awsRequestId=request_id,
+                     error=type(exc).__name__, durationMs=int((time.time() - started) * 1000),
+                     **({} if rejected else {"traceback": traceback.format_exc()[-1800:]}))
+                raise
+            status = result.get("statusCode") if isinstance(result, dict) else None
+            level = "info"
+            if isinstance(status, int):
+                level = "error" if status >= 500 else "warning" if status >= 400 else "info"
+            emit(level, "lambda_completed", cid, function=function_name, awsRequestId=request_id,
+                 statusCode=status, durationMs=int((time.time() - started) * 1000))
+            return result
+
+        return wrapper
+
+    return decorator

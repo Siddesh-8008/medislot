@@ -20,7 +20,7 @@ from datetime import datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 import boto3
 from boto3.dynamodb.conditions import Key
-from common import dbconn, emit, get_param
+from common import dbconn, emit, get_param, instrument
 
 log = logging.getLogger()
 log.setLevel(logging.INFO)
@@ -173,6 +173,7 @@ def reconcile_doctor(table, doctor_id, zone, desired, now, days):
 
 
 # --------------------------------------------------------------------------- Lambda entrypoint
+@instrument("slot_materialiser")
 def handler(event, context):
     env = os.environ.get("ENVIRONMENT", "dev")
     prefix = f"/medislot/{env}"
@@ -194,11 +195,14 @@ def handler(event, context):
     try:
         with dbconn(c) as conn:
             with conn.cursor() as cur:
+                # Duration comes from the master consultation_types row; fee and capacity are the doctor's own
+                # choices in doctor_consultation_types. Only types the doctor still offers produce slots.
                 sql = """SELECT d.doctor_id,d.timezone,p.pattern_id,p.consultation_type_id,p.day_of_week,
-                    p.start_time,p.end_time,ct.duration_minutes,ct.fee,ct.capacity
+                    p.start_time,p.end_time,ct.duration_minutes,dct.fee,dct.capacity
                     FROM doctors d JOIN availability_patterns p ON p.doctor_id=d.doctor_id
+                    JOIN doctor_consultation_types dct ON dct.doctor_id=p.doctor_id AND dct.consultation_type_id=p.consultation_type_id
                     JOIN consultation_types ct ON ct.consultation_type_id=p.consultation_type_id
-                    WHERE p.is_active=1 AND ct.is_active=1"""
+                    WHERE p.is_active=1 AND dct.is_active=1 AND ct.is_active=1"""
                 args = ()
                 if only_doctor:
                     sql += " AND d.doctor_id=%s"; args = (only_doctor,)
@@ -226,14 +230,17 @@ def handler(event, context):
                     skipped += sk
                     m, ex = create_missing(table, desired, errors)
                     made += m; existing += ex
+                    cl = re_ = kp = 0
                     if reconcile:
                         cl, re_, kp = reconcile_doctor(table, doctor_id, zone, desired, now, days)
                         closed += cl; reopened += re_; kept += kp
+                    emit("info", "slots_materialised_for_doctor", doctorId=doctor_id, patterns=len(patterns),
+                         desired=len(desired), created=m, alreadyExisting=ex, closed=cl, reopened=re_, keptBecauseBooked=kp)
         result = {"created": made, "alreadyExisting": existing, "dstSkipped": skipped,
                   "closed": closed, "reopened": reopened, "keptBecauseBooked": kept,
                   "errors": errors[:20], "windowDays": days, "doctorId": only_doctor, "asOf": now.isoformat()}
         emit("info", "slot_materialiser_done", **{k: v for k, v in result.items() if k != "errors"})
         return {"statusCode": 200, "body": json.dumps(result)}
     except Exception as e:
-        emit("error", "slot_materialiser_failed", error=type(e).__name__)
+        emit("error", "slot_materialiser_failed", error=type(e).__name__, detail=str(e)[:300])
         raise

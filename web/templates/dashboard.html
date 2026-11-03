@@ -125,6 +125,29 @@ tr:last-child td{border-bottom:0}
 .preview{width:132px;height:132px;border-radius:50%;background:#ebe5d6 center/cover;border:4px solid #fff;box-shadow:0 0 0 1.5px var(--line);display:grid;place-items:center;color:var(--muted);margin-bottom:6px;font-size:13px;text-align:center}
 .kv{display:grid;grid-template-columns:auto 1fr;gap:10px 20px;margin:0}.kv dt{color:var(--muted);font-size:14px}.kv dd{margin:0;font-weight:500}
 details{margin-top:24px}summary{cursor:pointer;color:var(--muted);font-weight:600}
+/* ---------- Schedule: slot & appointment cards ---------- */
+.day-title{font-family:var(--serif);font-size:clamp(22px,2.6vw,28px);margin:36px 0 4px}
+.day-sub{color:var(--muted);margin:0 0 20px}
+.legend{display:flex;flex-wrap:wrap;gap:8px 18px;margin:0 0 6px;font-size:13.5px;color:var(--muted)}
+.legend i{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px;background:var(--c)}
+.part{display:flex;align-items:center;gap:12px;font-family:var(--serif);font-size:18px;font-weight:600;margin:32px 0 14px}
+.part small{font:500 13px var(--sans);color:var(--muted)}
+.part:after{content:"";flex:1;height:1px;background:var(--line)}
+.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:16px}
+.slot{--c:var(--ok);position:relative;background:var(--paper);border:1px solid var(--line);border-left:5px solid var(--c);border-radius:14px;padding:16px 18px;display:grid;gap:10px;align-content:start}
+.slot.open{--c:var(--ok)}.slot.booked{--c:var(--coral)}.slot.partial{--c:#c98a12}.slot.hold{--c:var(--info)}.slot.closed{--c:#a9a493;background:#faf7ef}
+.slot.closed .time{color:var(--muted)}
+.slot .top{display:flex;justify-content:space-between;align-items:flex-start;gap:10px}
+.slot .time{font:600 21px var(--serif);line-height:1.15;color:var(--ink)}
+.slot .time small{display:block;font:500 13px var(--sans);color:var(--muted);margin-top:3px}
+.slot .what{font-weight:600;font-size:15px}
+.slot .facts{display:flex;flex-wrap:wrap;gap:6px 14px;font-size:13.5px;color:var(--muted)}
+.slot .facts b{color:var(--ink);font-weight:600}
+.chip{display:inline-block;padding:3px 10px;border-radius:99px;font-size:12px;font-weight:700;white-space:nowrap;background:color-mix(in srgb,var(--c) 14%,#fff);color:var(--c)}
+.slot.closed .chip{color:#6f6b5c}
+.slot details{margin:0}.slot summary{font-size:13px;font-weight:600;color:var(--teal)}
+.slot dl{margin:10px 0 0;display:grid;gap:6px;font-size:12.5px}.slot dt{color:var(--muted)}.slot dd{margin:0;word-break:break-all}
+.appt{--c:var(--teal)}
 pre{background:#12303a;color:#d6ece9;padding:20px;border-radius:12px;overflow:auto;font-size:13px;max-height:420px}
 
 @media(min-width:861px){.auth .brand{position:sticky;top:0;height:100vh;align-self:start}}
@@ -252,10 +275,11 @@ pre{background:#12303a;color:#d6ece9;padding:20px;border-radius:12px;overflow:au
    <aside class="side-note"><h3>Tips</h3><ul><li>Use a square crop with your face centred.</li><li>Good light, plain background.</li><li>Uploading a new photo replaces the old one.</li></ul></aside></div>
 
   {% elif cur=='consultation' %}
-   <div class="cols wide-left"><section class="panel"><h2>New consultation type</h2><p class="lead">Pick one of the four standard types. Its duration and capacity are fixed; you only set the fee.</p>
-   {% if not ctype_options %}<div class="empty"><b>All four standard types are created</b>Next, add your weekly hours under <a href="/?m=availability">Availability</a>.</div>
+   <div class="cols wide-left"><section class="panel"><h2>New consultation type</h2><p class="lead">Choose one of the four standard types. Its duration is fixed; you set your fee (and the capacity for Health Camp).</p>
+   {% if catalog_loaded is defined and not catalog_loaded %}<div class="empty"><b>Couldn’t load the standard types</b>Refresh to try again.</div>
+   {% elif not ctype_options %}<div class="empty"><b>You offer all four standard types</b>Next, add your weekly hours under <a href="/?m=availability">Availability</a>.</div>
    {% else %}<form method="post" action="/consultation-types"><div class="fgrid">
-    <label class="span2">Consultation type<select id="ct-type" name="name" required><option value="" disabled selected>Select a type</option>{% for t in ctype_options %}<option value="{{t.name}}" data-duration="{{t.duration}}" data-min="{{t.cap_min}}" data-max="{{t.cap_max}}">{{t.name}}</option>{% endfor %}</select></label>
+    <label class="span2">Consultation type<select id="ct-type" name="consultationTypeId" required><option value="" disabled selected>Select a type</option>{% for t in ctype_options %}<option value="{{t.id}}" data-duration="{{t.duration}}" data-min="{{t.cap_min}}" data-max="{{t.cap_max}}">{{t.name}} · {{t.duration}} min</option>{% endfor %}</select></label>
     <label>Duration<input id="ct-duration" value="Fixed by type" readonly tabindex="-1"></label>
     <label>Fee<input name="fee" type="number" min="0" step="0.01" placeholder="500" required></label>
     <label class="span2">Slot capacity<input id="ct-capacity" name="capacity" type="number" min="1" max="10" value="1" readonly><span class="hint" id="ct-cap-hint">Fixed at 1 patient per slot. Health Camp Session allows 2 to 10.</span></label>
@@ -263,14 +287,14 @@ pre{background:#12303a;color:#d6ece9;padding:20px;border-radius:12px;overflow:au
    <aside class="side-note"><h3>Standard types</h3><div class="tbl-wrap" style="background:transparent;border-color:#b9ddd6"><table class="compact" style="font-size:14px"><thead><tr><th style="background:transparent">Type</th><th style="background:transparent">Duration</th><th style="background:transparent">Capacity</th></tr></thead><tbody>{% for t in ctypes_ref %}<tr><td>{{t.name}}</td><td>{{t.duration}} min</td><td>{{ t.cap_min if t.cap_min==t.cap_max else (t.cap_min~' to '~t.cap_max) }}</td></tr>{% endfor %}</tbody></table></div><p style="margin-top:16px">Then add weekly hours for each type under Availability.</p></aside></div>
    <h3 class="list-title">Your consultation types</h3>
    {% if types is none %}<div class="empty"><b>Couldn’t load your list</b>Your changes are still saved. Refresh to try again.</div>
-   {% elif types %}<div class="tbl-wrap"><table><thead><tr><th>ID</th><th>Name</th><th>Duration</th><th>Fee</th><th>Capacity</th><th>Status</th></tr></thead><tbody>{% for t in types %}<tr><td>{{t.consultation_type_id}}</td><td>{{t.name}}</td><td>{{t.duration_minutes}} min</td><td>{{t.fee}}</td><td>{{t.capacity}}</td><td><span class="pill {{ 'ok' if t.is_active else 'off' }}">{{ 'Active' if t.is_active else 'Inactive' }}</span></td></tr>{% endfor %}</tbody></table></div>
+   {% elif types %}<div class="tbl-wrap"><table><thead><tr><th>Name</th><th>Duration</th><th>Fee</th><th>Capacity</th><th>Status</th></tr></thead><tbody>{% for t in types %}<tr><td>{{t.name}}</td><td>{{t.duration_minutes}} min</td><td>{{t.fee}}</td><td>{{t.capacity}}</td><td><span class="pill {{ 'ok' if t.is_active else 'off' }}">{{ 'Active' if t.is_active else 'Inactive' }}</span></td></tr>{% endfor %}</tbody></table></div>
    {% else %}<div class="empty"><b>Nothing here yet</b>Create your first consultation type above.</div>{% endif %}
 
   {% elif cur=='availability' %}
    <div class="cols"><section class="panel"><h2>Weekly pattern</h2><p class="lead">Repeat these hours every week for a consultation type.</p>
    {% if types is not none and not active_types %}<div class="empty"><b>Create a consultation type first</b>Availability is attached to a type. <a href="/?m=consultation">Go to Consultation types →</a></div>
    {% else %}<form method="post" action="/availability"><div class="fgrid">
-    <label class="span2">Consultation type{% if active_types %}<select name="consultationTypeId" required>{% for t in active_types %}<option value="{{t.consultation_type_id}}">{{t.name}} · {{t.duration_minutes}} min (ID {{t.consultation_type_id}})</option>{% endfor %}</select>{% else %}<input name="consultationTypeId" type="number" required>{% endif %}</label>
+    <label class="span2">Consultation type{% if active_types %}<select name="consultationTypeId" required>{% for t in active_types %}<option value="{{t.consultation_type_id}}">{{t.name}} · {{t.duration_minutes}} min</option>{% endfor %}</select>{% endif %}</label>
     <label class="span2">Weekday<select name="dayOfWeek" required>{% for n,d in weekdays %}<option value="{{n}}">{{d}}</option>{% endfor %}</select></label>
     <label>Start time<input name="startTime" type="time" required></label>
     <label>End time<input name="endTime" type="time" required></label>
@@ -279,7 +303,7 @@ pre{background:#12303a;color:#d6ece9;padding:20px;border-radius:12px;overflow:au
    <form method="post" action="/blackout"><div class="fgrid"><label class="span2">Date<input name="blackoutDate" type="date" required></label><label class="span2">Reason<span class="opt">optional</span><input name="reason" placeholder="e.g. Conference"></label></div><button>Add blackout</button></form></section></div>
    <h3 class="list-title">Current weekly patterns</h3>
    {% if patterns is none %}<div class="empty"><b>Couldn’t load your patterns</b>Refresh to try again.</div>
-   {% elif patterns %}<div class="tbl-wrap"><table><thead><tr><th>Day</th><th>Start</th><th>End</th><th>Consultation type</th><th>Status</th><th>Change hours</th></tr></thead><tbody>{% for x in patterns %}<tr><td>{{ day_names.get(x.day_of_week|int, x.day_of_week) }}</td><td>{{ x.start_time|hhmm }}</td><td>{{ x.end_time|hhmm }}</td><td>{{ type_names.get(x.consultation_type_id|int, 'ID '~x.consultation_type_id) }}</td><td><span class="pill {{ 'ok' if x.is_active else 'off' }}">{{ 'Active' if x.is_active else 'Inactive' }}</span></td><td>{% if x.is_active %}<div class="actions"><form class="rowform" method="post" action="/availability/{{ x.pattern_id }}/update"><input type="time" name="startTime" value="{{ x.start_time|hhmm }}" required><input type="time" name="endTime" value="{{ x.end_time|hhmm }}" required><button>Save</button></form><form class="rowform" method="post" action="/availability/{{ x.pattern_id }}/remove" onsubmit="return confirm('Remove this weekly pattern? Open slots will be closed; booked slots are kept.')"><button class="ghost">Remove</button></form></div>{% else %}—{% endif %}</td></tr>{% endfor %}</tbody></table></div>
+   {% elif patterns %}<div class="tbl-wrap"><table><thead><tr><th>Day</th><th>Start</th><th>End</th><th>Consultation type</th><th>Status</th><th>Change hours</th></tr></thead><tbody>{% for x in patterns %}<tr><td>{{ day_names.get(x.day_of_week|int, x.day_of_week) }}</td><td>{{ x.start_time|hhmm }}</td><td>{{ x.end_time|hhmm }}</td><td>{{ x.consultation_type_name or type_names.get(x.consultation_type_id|int, 'Consultation') }}</td><td><span class="pill {{ 'ok' if x.is_active else 'off' }}">{{ 'Active' if x.is_active else 'Inactive' }}</span></td><td>{% if x.is_active %}<div class="actions"><form class="rowform" method="post" action="/availability/{{ x.pattern_id }}/update"><input type="time" name="startTime" value="{{ x.start_time|hhmm }}" required><input type="time" name="endTime" value="{{ x.end_time|hhmm }}" required><button>Save</button></form><form class="rowform" method="post" action="/availability/{{ x.pattern_id }}/remove" onsubmit="return confirm('Remove this weekly pattern? Open slots will be closed; booked slots are kept.')"><button class="ghost">Remove</button></form></div>{% else %}—{% endif %}</td></tr>{% endfor %}</tbody></table></div>
    {% else %}<div class="empty"><b>No weekly hours yet</b>Add your first pattern above.</div>{% endif %}
    <h3 class="list-title">Blackout dates</h3>
    {% if blackouts is none %}<div class="empty"><b>Couldn’t load your blackout dates</b>Refresh to try again.</div>
@@ -291,11 +315,30 @@ pre{background:#12303a;color:#d6ece9;padding:20px;border-radius:12px;overflow:au
    <form method="get" action="/schedule" style="grid-template-columns:minmax(0,320px) auto;align-items:end;display:grid;gap:20px"><label>Date<input name="date" type="date" value="{{ sched.date if sched else '' }}" required></label><button style="margin-bottom:0">View schedule</button></form></section>
    {% if sched %}
     {% if sched.data and sched.ok %}
-     <div class="tiles"><div class="tile"><small>Date</small><strong style="font-size:24px;padding-top:8px">{{sched.data.get('date')}}</strong></div><div class="tile"><small>Timezone</small><strong style="font-size:24px;padding-top:8px">{{sched.data.get('timezone')}}</strong></div><div class="tile"><small>Slots</small><strong>{{ (sched.data.get('slots') or [])|length }}</strong></div><div class="tile"><small>Appointments</small><strong>{{ (sched.data.get('appointments') or [])|length }}</strong></div></div>
+     {% set c=sched.counts %}
+     <h2 class="day-title">{{ sched.pretty_date }}</h2><p class="day-sub">All times are in your timezone ({{ sched.data.get('timezone') }}).</p>
+     <div class="tiles" style="margin-top:0"><div class="tile"><small>Open slots</small><strong>{{ c.get('open',0) }}</strong></div><div class="tile"><small>Booked</small><strong>{{ c.get('booked',0)+c.get('partial',0) }}</strong></div><div class="tile"><small>Closed</small><strong>{{ c.get('closed',0) }}</strong></div><div class="tile"><small>Appointments</small><strong>{{ sched.appointments|length }}</strong></div></div>
+
      <h3 class="list-title">Appointments</h3>
-     {% if sched.data.get('appointments') %}{{ table(sched.data.appointments, ['start_at','end_at','status','patient_id','consultation_type_id','fee_snapshot','appointment_id']) }}{% else %}<div class="empty"><b>No appointments</b>Nothing is booked for this day.</div>{% endif %}
+     {% if sched.appointments %}<div class="cards">{% for a in sched.appointments %}
+      <article class="slot appt"><div class="top"><div class="time">{{a.start}}{% if a.end %}<small>until {{a.end}}</small>{% endif %}</div><span class="chip">{{a.status}}</span></div>
+       <div class="what">{{a.type}}</div>
+       {% if a.fee %}<div class="facts"><span>Fee <b>{{a.fee}}</b></span></div>{% endif %}
+       {% if a.details %}<details><summary>More details</summary><dl>{% for k,v in a.details %}<div><dt>{{k}}</dt><dd>{{v}}</dd></div>{% endfor %}</dl></details>{% endif %}</article>{% endfor %}</div>
+     {% else %}<div class="empty"><b>No appointments</b>Nothing is booked for this day.</div>{% endif %}
+
      <h3 class="list-title">Slots</h3>
-     {% if sched.data.get('slots') %}{{ table(sched.data.slots, sched.slot_cols) }}{% else %}<div class="empty"><b>No slots</b>No slots are open for this day. Check your weekly pattern and blackout dates.</div>{% endif %}
+     {% if sched.groups %}
+      <div class="legend"><span style="--c:var(--ok)"><i></i>Open</span><span style="--c:#c98a12"><i></i>Partly booked</span><span style="--c:var(--coral)"><i></i>Fully booked</span><span style="--c:var(--info)"><i></i>On hold</span><span style="--c:#a9a493"><i></i>Closed</span></div>
+      {% for g in sched.groups %}
+       <div class="part">{{g.label}} <small>{{ g.slots|length }} slot{{ '' if g.slots|length==1 else 's' }}</small></div>
+       <div class="cards">{% for s in g.slots %}
+        <article class="slot {{s.state}}"><div class="top"><div class="time">{{s.start}}<small>to {{s.end}} · {{s.minutes}} min</small></div><span class="chip">{{s.label}}</span></div>
+         <div class="what">{{s.type}}</div>
+         <div class="facts">{% if s.fee %}<span>Fee <b>{{s.fee}}</b></span>{% endif %}<span>{% if s.capacity>1 %}Seats <b>{{s.free}} of {{s.capacity}}</b> free{% else %}{{ 'Booked' if s.booked else 'Not booked' }}{% endif %}</span></div>
+         {% if s.details %}<details><summary>More details</summary><dl>{% for k,v in s.details %}<div><dt>{{k}}</dt><dd>{{v}}</dd></div>{% endfor %}</dl></details>{% endif %}</article>{% endfor %}</div>
+      {% endfor %}
+     {% else %}<div class="empty"><b>No slots</b>No slots are open for this day. Check your weekly pattern and blackout dates.</div>{% endif %}
     {% else %}<div class="banner error" style="margin-top:28px"><span>{{ sched.error }}</span></div>{% endif %}
    {% endif %}
   {% endif %}

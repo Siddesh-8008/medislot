@@ -1,8 +1,12 @@
-import os, json, secrets, requests, boto3
+import os, json, secrets, time, uuid, logging, requests, boto3
 from datetime import timedelta, datetime
 from zoneinfo import ZoneInfo
-from flask import Flask, request, session, redirect, url_for, render_template, flash, Response
+from flask import Flask, request, session, redirect, url_for, render_template, flash, Response, g
 app=Flask(__name__)
+# Log to the gunicorn error log (journald on the EC2 box) at INFO so every request and API call is recorded.
+_gunicorn_log=logging.getLogger("gunicorn.error")
+if _gunicorn_log.handlers: app.logger.handlers=_gunicorn_log.handlers
+app.logger.setLevel(logging.INFO)
 app.config.update(PERMANENT_SESSION_LIFETIME=timedelta(days=7),SESSION_COOKIE_HTTPONLY=True,SESSION_COOKIE_SECURE=os.environ.get("SESSION_COOKIE_SECURE","false").lower()=="true",SESSION_COOKIE_SAMESITE="Lax")
 app.secret_key=os.environ.get("FLASK_SESSION_SECRET") or boto3.client("ssm").get_parameter(Name=os.environ.get("SESSION_SECRET_PARAMETER","/medislot/dev/web/session-secret"),WithDecryption=True)["Parameter"]["Value"]
 API_BASE=os.environ["MEDISLOT_API_BASE"].rstrip("/")
@@ -15,10 +19,8 @@ REGISTER_URL=API_BASE+"/auth/register/doctor"
 HOSPITALS=[(1,"Apollo Hospitals Jubilee Hills"),(2,"Yashoda Hospitals Somajiguda"),(3,"KIMS Hospitals Secunderabad"),(4,"CARE Hospitals Banjara Hills"),(5,"AIG Hospitals Gachibowli"),(6,"Continental Hospitals"),(7,"Rainbow Children's Hospital Banjara Hills"),(8,"NIMS Hyderabad"),(9,"Osmania General Hospital"),(10,"Gandhi Hospital")]
 SPECIALIZATIONS=[(1,"Cardiology"),(2,"Dermatology"),(3,"Endocrinology"),(4,"Family Medicine"),(5,"Gastroenterology"),(6,"General Medicine"),(7,"General Surgery"),(8,"Geriatrics"),(9,"Gynecology"),(10,"Hematology"),(11,"Nephrology"),(12,"Neurology"),(13,"Neurosurgery"),(14,"Oncology"),(15,"Ophthalmology"),(16,"Orthopedics"),(17,"Otolaryngology (ENT)"),(18,"Pediatrics"),(19,"Psychiatry"),(20,"Pulmonology"),(21,"Radiology"),(22,"Rheumatology"),(23,"Urology"),(24,"Anesthesiology"),(25,"Emergency Medicine"),(26,"Infectious Disease"),(27,"Physical Medicine and Rehabilitation"),(28,"Plastic Surgery"),(29,"Vascular Surgery"),(30,"Obstetrics")]
 WEEKDAYS=[(1,"Monday"),(2,"Tuesday"),(3,"Wednesday"),(4,"Thursday"),(5,"Friday"),(6,"Saturday"),(7,"Sunday")]
-# The four standard consultation types from the project brief. Duration is fixed per type;
-# capacity is fixed at 1 except Health Camp Session (2 to 10). The doctor only sets the fee.
-CONSULT_TYPES=[dict(name="Quick Consult",duration=15,cap_min=1,cap_max=1),dict(name="Standard Consult",duration=30,cap_min=1,cap_max=1),dict(name="Detailed Consult",duration=60,cap_min=1,cap_max=1),dict(name="Health Camp Session",duration=60,cap_min=2,cap_max=10)]
-CONSULT_BY_NAME={c["name"]:c for c in CONSULT_TYPES}
+# The standard consultation types live in the master `consultation_types` table (seeded in scehma/schema.sql).
+# The dashboard reads them through the API, so there is a single source of truth.
 # key, label, icon, accent colour, one-line description
 MODULES=[
  ("overview","Overview","home","#0f6b73","Your practice at a glance and what to set up next."),
@@ -67,8 +69,13 @@ def api(method,path,**kwargs):
     headers=kwargs.pop("headers",{})
     def send():
         h=dict(headers)
+        # The same correlation id is sent to API Gateway and the Lambdas, so one click can be traced end to end.
+        h["x-correlation-id"]=getattr(g,"cid",None) or uuid.uuid4().hex
         if session.get("access_token"): h["Authorization"]="Bearer "+session["access_token"]
-        return requests.request(method,API_BASE+path,headers=h,timeout=25,**kwargs)
+        started=time.time()
+        resp=requests.request(method,API_BASE+path,headers=h,timeout=25,**kwargs)
+        app.logger.info("api_call cid=%s %s %s -> HTTP %s (%dms)",h["x-correlation-id"],method,path,resp.status_code,(time.time()-started)*1000)
+        return resp
     r=send()
     if r.status_code==401 and session.get("refresh_token"):
         # Access token expired (15 min): get a new one silently and retry once.
@@ -82,6 +89,15 @@ def read_json(path):
         return r.json() if r.ok else None
     except SessionExpired: raise
     except (requests.RequestException,ValueError): return None
+
+@app.before_request
+def _start_request():
+    g.cid=uuid.uuid4().hex; g.started=time.time()
+@app.after_request
+def _log_request(resp):
+    if request.endpoint!="static":
+        app.logger.info("request cid=%s %s %s -> %s (%dms)",getattr(g,"cid","-"),request.method,request.path,resp.status_code,(time.time()-getattr(g,"started",time.time()))*1000)
+    return resp
 
 @app.errorhandler(SessionExpired)
 def session_expired(e):
@@ -111,13 +127,18 @@ def photo_bucket():
 def render_dashboard(module,**extra):
     """Shared renderer for every dashboard module."""
     ctx=dict(logged_in=True,module=module,modules=MODULES,messages=session.pop("messages",[]),hospitals=HOSPITALS,specializations=SPECIALIZATIONS,weekdays=WEEKDAYS,day_names=dict(WEEKDAYS),
-             ctype_options=CONSULT_TYPES,ctypes_ref=CONSULT_TYPES,photo_url=photo_url_for(session.get("photo_key")),
+             ctype_options=[],ctypes_ref=[],photo_url=photo_url_for(session.get("photo_key")),
              profile=None,p={},display_name=session.get("display_name"),last_name=None,greeting="Welcome",progress=None,steps=None,counts=None,types=None,active_types=None,type_names={},patterns=None,blackouts=None,sched=None)
     ctx.update(extra)
     return render_template("dashboard.html",**ctx)
 def load_profile():
     data=read_json("/doctors/me")
     return (data or {}).get("profile") if isinstance(data,dict) else None
+def load_catalog():
+    """Master consultation types from the API, shaped for the template. None if it can't be loaded."""
+    items=items_of(read_json("/doctors/catalog/consultation-types"))
+    if items is None: return None
+    return [dict(id=c["consultation_type_id"],name=c["name"],duration=c["duration_minutes"],cap_min=c["min_capacity"],cap_max=c["max_capacity"]) for c in items]
 def items_of(data):
     return data.get("items",[]) if isinstance(data,dict) else None
 
@@ -143,8 +164,11 @@ def home():
         if types is not None:
             extra["active_types"]=[t for t in types if t.get("is_active")]
             extra["type_names"]={t["consultation_type_id"]:t["name"] for t in types}
-            have={t["name"] for t in types}
-            extra["ctype_options"]=[c for c in CONSULT_TYPES if c["name"] not in have]
+
+    if module=="consultation":
+        catalog=load_catalog()
+        have={t["consultation_type_id"] for t in (extra.get("types") or []) if t.get("is_active")}
+        extra.update(ctypes_ref=catalog or [],ctype_options=[c for c in (catalog or []) if c["id"] not in have],catalog_loaded=catalog is not None)
     if module in ("overview","availability"):
         extra["patterns"]=items_of(read_json("/doctors/me/availability-patterns"))
     if module=="availability":
@@ -189,8 +213,9 @@ def login():
             notify("Doctor account required.","error")
         else:
             session["access_token"]=payload["accessToken"]; session["refresh_token"]=payload.get("refreshToken"); session["role"]=role
+            app.logger.info("login_succeeded cid=%s userId=%s",g.cid,payload.get("userId"))
     else:
-        app.logger.warning("login failed: HTTP %s %s",r.status_code,r.text[:300])
+        app.logger.warning("login_failed cid=%s HTTP %s %s",g.cid,r.status_code,r.text[:300])
         session["prefill_email"]=email
         notify(f"Sign-in failed: {payload.get('message') or 'Please check your email and password.'}","error")
     return redirect("/")
@@ -221,6 +246,7 @@ def signup():
         app.logger.error("signup upstream error: %s",e)
         return fail(f"Could not reach the MediSlot API ({type(e).__name__}). Check API URL and Lambda logs.")
     if r.status_code==201:
+        app.logger.info("signup_succeeded cid=%s",g.cid)
         session.pop("signup_form",None)
         session["prefill_email"]=data["email"]
         notify("Account created. Sign in to open your dashboard.","success")
@@ -230,6 +256,7 @@ def signup():
     return fail(f"Sign-up failed: {api_message(r)}")
 @app.get("/logout")
 def logout():
+    app.logger.info("logout cid=%s",g.cid)
     if session.get("access_token"):
         try: api("POST","/auth/logout",json={"refreshToken":session.get("refresh_token")})
         except Exception: pass
@@ -278,20 +305,16 @@ def blackout():
     return redirect("/?m=availability")
 @app.post("/consultation-types")
 def consultation():
-    ct=CONSULT_BY_NAME.get(request.form.get("name",""))
-    if not ct:
-        notify("Choose one of the standard consultation types.","error")
+    """The doctor picks one of the standard types (by id) and sets only the fee, plus capacity for Health Camp.
+    The API checks the capacity range against the master table and stores the choice in doctor_consultation_types."""
+    try:
+        data={"consultationTypeId":int(request.form["consultationTypeId"]),"fee":float(request.form["fee"])}
+        if request.form.get("capacity","").strip(): data["capacity"]=int(request.form["capacity"])
+    except (KeyError,ValueError):
+        notify("Choose a consultation type and enter a valid fee.","error")
         return redirect("/?m=consultation")
-    # Duration is fixed by the type; capacity is fixed at 1 except Health Camp Session (2 to 10).
-    try: capacity=int(request.form.get("capacity") or ct["cap_min"])
-    except ValueError: capacity=-1
-    if ct["cap_min"]==ct["cap_max"]: capacity=ct["cap_min"]
-    elif not ct["cap_min"]<=capacity<=ct["cap_max"]:
-        notify(f"{ct['name']} needs a capacity between {ct['cap_min']} and {ct['cap_max']}.","error")
-        return redirect("/?m=consultation")
-    data={"name":ct["name"],"durationMinutes":ct["duration"],"fee":float(request.form["fee"]),"capacity":capacity}
     r=api("POST","/doctors/me/consultation-types",json=data)
-    report(r,"Consultation type created","Consultation type")
+    report(r,"Consultation type added","Consultation type")
     return redirect("/?m=consultation")
 
 @app.post("/photo")
@@ -336,21 +359,65 @@ def photo_image():
     resp.headers["Cache-Control"]="private, max-age=3600"
     return resp
 
+def _utc(iso):
+    """'2026-11-09T04:00:00Z' -> aware UTC datetime (works on Python 3.9, where fromisoformat rejects 'Z')."""
+    return datetime.fromisoformat(str(iso).replace("Z","+00:00"))
+def _clock(dt):
+    return dt.strftime("%I:%M %p").lstrip("0")
+def _money(v):
+    try: return "\u20b9{:,.0f}".format(float(v)) if float(v)==int(float(v)) else "\u20b9{:,.2f}".format(float(v))
+    except (TypeError,ValueError): return None
+def _num(v,default=0):
+    try: return int(v)
+    except (TypeError,ValueError): return default
+def slot_card(s,zone):
+    """Turn a raw slot record into something a person can read at a glance (times in the doctor's own timezone)."""
+    start=_utc(s["start_at"]).astimezone(zone); end=_utc(s["end_at"]).astimezone(zone)
+    cap=max(_num(s.get("capacity"),1),1); booked=_num(s.get("booked_count")); held=_num(s.get("held_count"))
+    raw=str(s.get("status") or "").upper()
+    if raw=="CLOSED": state,label="closed","Closed"
+    elif booked>=cap: state,label="booked","Fully booked"
+    elif booked>0: state,label="partial","Partly booked"
+    elif held>0: state,label="hold","On hold"
+    elif raw in ("","OPEN"): state,label="open","Open"
+    else: state,label="closed",raw.title()
+    mins=s.get("duration_minutes") or int((end-start).total_seconds()//60)
+    details=[("Slot ID",s.get("slot_id")),("Starts (UTC)",s.get("start_at")),("Ends (UTC)",s.get("end_at")),("Seats held",held),("Closed because","Schedule changed" if s.get("closed_reason")=="SCHEDULE_CHANGE" else s.get("closed_reason")),("Version",s.get("version"))]
+    return dict(start=_clock(start),end=_clock(end),hour=start.hour,sort=start,state=state,label=label,minutes=mins,type=s.get("consultation_type_name") or "Consultation",
+                fee=_money(s.get("fee")),capacity=cap,booked=booked,free=max(cap-booked-held,0),details=[(k,v) for k,v in details if v not in (None,"")])
+def appointment_card(a,zone):
+    start=_utc(a["start_at"]).astimezone(zone); end=_utc(a["end_at"]).astimezone(zone) if a.get("end_at") else None
+    status=str(a.get("status") or "").replace("_"," ").title() or "Scheduled"
+    details=[("Appointment ref",a.get("appointment_id")),("Patient ref",a.get("patient_id")),("Slot ID",a.get("slot_id"))]
+    return dict(start=_clock(start),end=_clock(end) if end else None,type=a.get("consultation_type_name") or "Consultation",status=status,fee=_money(a.get("fee_snapshot") if a.get("fee_snapshot") is not None else a.get("fee")),details=[(k,v) for k,v in details if v not in (None,"")])
+PARTS=[("Morning",0,12),("Afternoon",12,17),("Evening",17,24)]
 @app.get("/schedule")
 def schedule():
     day=request.args.get("date","")
     r=api("GET","/doctors/me/schedule",params={"date":day})
     # Rendered directly (not stored in the cookie session) so a long day can never overflow the 4 KB cookie.
     if not r.ok: app.logger.warning("schedule failed: HTTP %s %s",r.status_code,r.text[:300])
-    sched=dict(date=day,ok=r.ok,data=None,error=f"Could not load the schedule: {api_message(r)}",slot_cols=[])
+    sched=dict(date=day,ok=r.ok,data=None,error=f"Could not load the schedule: {api_message(r)}",groups=[],appointments=[],counts={},pretty_date=day)
     try:
         data=r.json()
-        if isinstance(data,dict):
+        if r.ok and isinstance(data,dict):
             sched["data"]=data
-            slots=data.get("slots") or []
-            preferred=["start_at","end_at","status","slot_id","consultation_type_id","capacity","booked_count"]
-            keys=[k for s in slots if isinstance(s,dict) for k in s]
-            sched["slot_cols"]=[k for k in preferred if k in keys]+[k for k in dict.fromkeys(keys) if k not in preferred]
+            try: zone=ZoneInfo(data.get("timezone") or "Asia/Kolkata")
+            except Exception: zone=ZoneInfo("Asia/Kolkata")
+            try: d=datetime.strptime(data.get("date") or day,"%Y-%m-%d"); sched["pretty_date"]=f"{d:%A}, {d.day} {d:%B %Y}"
+            except ValueError: pass
+            cards=[]
+            for raw in data.get("slots") or []:
+                try: cards.append(slot_card(raw,zone))
+                except (KeyError,ValueError,TypeError): app.logger.warning("skipped unreadable slot record: %s",str(raw)[:200])
+            cards.sort(key=lambda c:c["sort"])
+            sched["groups"]=[dict(label=lbl,slots=[c for c in cards if lo<=c["hour"]<hi]) for lbl,lo,hi in PARTS if any(lo<=c["hour"]<hi for c in cards)]
+            sched["counts"]=dict(total=len(cards),**{k:sum(1 for c in cards if c["state"]==k) for k in ("open","booked","partial","hold","closed")})
+            appts=[]
+            for raw in data.get("appointments") or []:
+                try: appts.append(appointment_card(raw,zone))
+                except (KeyError,ValueError,TypeError): app.logger.warning("skipped unreadable appointment record: %s",str(raw)[:200])
+            sched["appointments"]=appts
     except ValueError: pass
     return render_dashboard("schedule",sched=sched)
 if __name__=="__main__":
