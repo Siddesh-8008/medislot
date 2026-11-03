@@ -1057,7 +1057,9 @@ Resources:
   ProtectedInvokePermission:
     Type: AWS::Lambda::Permission
     Properties: {FunctionName: !Ref ProtectedFunction, Action: lambda:InvokeFunction, Principal: apigateway.amazonaws.com, SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*/GET/*'}
-  ApiDeployment:
+  # NOTE: API Gateway only publishes a NEW snapshot when this resource is REPLACED. Changing its Description does not.
+  # So the logical ID carries the milestone: rename it (ApiDeploymentM5, ...) whenever routes are added or changed.
+  ApiDeploymentM4:
     Type: AWS::ApiGateway::Deployment
     DependsOn:
       - PatientProtectedMethod
@@ -1104,7 +1106,7 @@ Resources:
     Type: AWS::ApiGateway::Stage
     Properties:
       RestApiId: !Ref RestApi
-      DeploymentId: !Ref ApiDeployment
+      DeploymentId: !Ref ApiDeploymentM4
       StageName: !Ref Environment
       TracingEnabled: true
       AccessLogSetting:
