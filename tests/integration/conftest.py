@@ -18,7 +18,11 @@ import uuid
 from datetime import date, timedelta
 
 import pytest
-import requests
+
+try:  # only needed when the deployed API is tested; never break offline collection
+    import requests
+except ImportError:  # pragma: no cover
+    requests = None
 
 API = os.environ.get("MEDISLOT_API_BASE", "").rstrip("/")
 PASSWORD = "Integr@tion-Test-9x"
@@ -43,6 +47,7 @@ class Api:
     """Tiny client: JSON in/out, retries a GET once or twice when API Gateway or a cold Lambda hiccups."""
 
     def call(self, method, path, token=None, json=None, params=None, retries=2):
+        assert requests is not None, "pip install requests to run the integration tests"
         headers = {"x-correlation-id": "it-" + uuid.uuid4().hex[:12]}
         if token:
             headers["Authorization"] = "Bearer " + token
