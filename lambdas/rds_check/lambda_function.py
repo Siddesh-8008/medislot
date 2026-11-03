@@ -33,6 +33,27 @@ REQUIRED_TABLES = {
 
 
 # ---------------------------------------------------------
+# 0. INDEXES THE PATIENT SEARCH RELIES ON (Milestone 4)
+# ---------------------------------------------------------
+# Used only to REPORT whether the deployed database has them (the CI pipeline fails with a clear message if
+# not). Nothing here creates or alters an index: existing databases get them from scehma/milestone4_indexes.sql.
+REQUIRED_INDEXES = {
+    "doctors": {
+        "ix_doctors_spec_hospital": ("specialization_id", "hospital_id"),
+        "ix_doctors_hospital_id": ("hospital_id",),
+        "ix_doctors_name": ("last_name", "first_name"),
+        "ix_doctors_first_name": ("first_name",),
+    },
+    "hospitals": {
+        "ix_hospitals_city": ("city", "is_active"),
+    },
+    "doctor_consultation_types": {
+        "ix_doctor_consultation_active": ("doctor_id", "is_active", "fee"),
+    },
+}
+
+
+# ---------------------------------------------------------
 # 1. TABLE CREATION
 # ---------------------------------------------------------
 
@@ -74,7 +95,8 @@ CREATE_TABLES = [
             ON UPDATE CURRENT_TIMESTAMP(6),
         PRIMARY KEY (hospital_id),
         UNIQUE KEY uq_hospitals_name (hospital_name),
-        KEY ix_hospitals_active (is_active)
+        KEY ix_hospitals_active (is_active),
+        KEY ix_hospitals_city (city, is_active)
     ) ENGINE=InnoDB
     """,
 
@@ -131,9 +153,10 @@ CREATE_TABLES = [
             ON UPDATE CURRENT_TIMESTAMP(6),
         PRIMARY KEY (doctor_id),
         UNIQUE KEY uq_doctors_license_number (license_number),
-        KEY ix_doctors_specialization_id (specialization_id),
+        KEY ix_doctors_spec_hospital (specialization_id, hospital_id),
         KEY ix_doctors_hospital_id (hospital_id),
         KEY ix_doctors_name (last_name, first_name),
+        KEY ix_doctors_first_name (first_name),
         CONSTRAINT fk_doctors_user FOREIGN KEY (doctor_id)
             REFERENCES users(user_id) ON DELETE CASCADE,
         CONSTRAINT fk_doctors_hospital FOREIGN KEY (hospital_id)
@@ -180,7 +203,7 @@ CREATE_TABLES = [
         PRIMARY KEY (doctor_consultation_type_id),
         UNIQUE KEY uq_doctor_consultation
             (doctor_id, consultation_type_id),
-        KEY ix_doctor_consultation_active (doctor_id, is_active),
+        KEY ix_doctor_consultation_active (doctor_id, is_active, fee),
         KEY ix_doctor_consultation_type (consultation_type_id),
         CONSTRAINT fk_doctor_consultation_doctor
             FOREIGN KEY (doctor_id)
@@ -501,6 +524,26 @@ def _list_tables(conn):
         )
 
 
+def _index_report(conn):
+    """Read-only: {table: {index_name: (columns...)}} for the tables the search uses, plus what is missing."""
+
+    found = {}
+    missing = []
+
+    with conn.cursor() as cur:
+        for table_name, wanted in REQUIRED_INDEXES.items():
+            cur.execute(f"SHOW INDEX FROM {table_name}")
+            by_name = {}
+            for row in sorted(cur.fetchall(), key=lambda r: (r["Key_name"], r["Seq_in_index"])):
+                by_name.setdefault(row["Key_name"], []).append(row["Column_name"])
+            found[table_name] = {name: list(cols) for name, cols in by_name.items()}
+            for name, columns in wanted.items():
+                if tuple(by_name.get(name, ())) != columns:
+                    missing.append(f"{table_name}.{name}({', '.join(columns)})")
+
+    return found, sorted(missing)
+
+
 # ---------------------------------------------------------
 # 8. LAMBDA HANDLER
 # ---------------------------------------------------------
@@ -539,11 +582,14 @@ def handler(event, context):
                 f"Missing tables after setup: {missing}"
             )
 
+        indexes, missing_indexes = _index_report(conn)
+
         emit(
             "info",
             "rds_connection_and_schema_setup_succeeded",
             cid,
-            tables=tables
+            tables=tables,
+            missingIndexes=missing_indexes
         )
 
         return {
@@ -552,7 +598,9 @@ def handler(event, context):
                 "connected": True,
                 "schema_created": True,
                 "tables": tables,
-                "missing_tables": []
+                "missing_tables": [],
+                "indexes": indexes,
+                "missing_indexes": missing_indexes
             }
         }
 

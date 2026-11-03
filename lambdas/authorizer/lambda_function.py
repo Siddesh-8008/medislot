@@ -1,5 +1,6 @@
 import os, time, jwt
-from common import get_param, auth_table, emit
+from common import get_param, auth_table, emit, instrument
+@instrument("authorizer")
 def handler(event, context):
     method_arn=event.get("methodArn","*")
     token=(event.get("authorizationToken") or "").strip()

@@ -1,5 +1,8 @@
 -- MediSlot identity, doctor profile and reference-data schema.
 -- Fresh database install: creates core MediSlot tables and Milestone 3 doctor-domain tables.
+-- Milestone 4 adds search indexes (doctors, hospitals, doctor_consultation_types). They are marked
+-- "M4 search index" below; the reasoning for each one is in MILESTONE4.md. A database that was created
+-- before Milestone 4 can get them without dropping anything by running scehma/milestone4_indexes.sql.
 -- Run this file once against an EMPTY medislot database (drop the old tables first: availability_patterns,
 -- blackout_dates, consultation_types, doctors, ... in child-to-parent order). Lambdas never create or
 -- migrate tables; this file is the only place the schema is defined.
@@ -50,7 +53,9 @@ CREATE TABLE IF NOT EXISTS hospitals (
         ON UPDATE CURRENT_TIMESTAMP(6),
     PRIMARY KEY (hospital_id),
     UNIQUE KEY uq_hospitals_name (hospital_name),
-    KEY ix_hospitals_active (is_active)
+    KEY ix_hospitals_active (is_active),
+    -- M4 search index: city filter, and the distinct-city list for the search form (covering).
+    KEY ix_hospitals_city (city, is_active)
 ) ENGINE=InnoDB;
 
 CREATE TABLE IF NOT EXISTS specializations (
@@ -83,9 +88,15 @@ CREATE TABLE IF NOT EXISTS doctors (
         ON UPDATE CURRENT_TIMESTAMP(6),
     PRIMARY KEY (doctor_id),
     UNIQUE KEY uq_doctors_license_number (license_number),
-    KEY ix_doctors_specialization_id (specialization_id),
+    -- M4 search index: specialization filter, and specialization + hospital together.
+    -- Its leading column also serves fk_doctors_specialization, so a separate (specialization_id) index is not needed.
+    KEY ix_doctors_spec_hospital (specialization_id, hospital_id),
+    -- Hospital filter, and city filter (city -> hospital ids in hospitals -> doctors here).
     KEY ix_doctors_hospital_id (hospital_id),
+    -- Last-name prefix search, and the default ORDER BY last_name, first_name, doctor_id (no filesort).
     KEY ix_doctors_name (last_name, first_name),
+    -- M4 search index: first-name prefix search.
+    KEY ix_doctors_first_name (first_name),
     CONSTRAINT fk_doctors_user FOREIGN KEY (doctor_id)
         REFERENCES users(user_id) ON DELETE CASCADE,
     CONSTRAINT fk_doctors_hospital FOREIGN KEY (hospital_id)
@@ -128,7 +139,9 @@ CREATE TABLE IF NOT EXISTS doctor_consultation_types (
         ON UPDATE CURRENT_TIMESTAMP(6),
     PRIMARY KEY (doctor_consultation_type_id),
     UNIQUE KEY uq_doctor_consultation (doctor_id, consultation_type_id),
-    KEY ix_doctor_consultation_active (doctor_id, is_active),
+    -- M4 search index: covering index for "starting fee" and "number of types" per doctor (MIN(fee), COUNT(*))
+    -- and for the "only doctors taking bookings" filter, without reading table rows.
+    KEY ix_doctor_consultation_active (doctor_id, is_active, fee),
     KEY ix_doctor_consultation_type (consultation_type_id),
     CONSTRAINT fk_doctor_consultation_doctor FOREIGN KEY (doctor_id)
         REFERENCES doctors(doctor_id),

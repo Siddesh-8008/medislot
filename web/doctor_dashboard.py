@@ -2,6 +2,7 @@ import os, json, secrets, time, uuid, logging, requests, boto3
 from datetime import timedelta, datetime
 from zoneinfo import ZoneInfo
 from flask import Flask, request, session, redirect, url_for, render_template, flash, Response, g
+import patient_portal
 app=Flask(__name__)
 # Log to the gunicorn error log (journald on the EC2 box) at INFO so every request and API call is recorded.
 _gunicorn_log=logging.getLogger("gunicorn.error")
@@ -13,6 +14,7 @@ API_BASE=os.environ["MEDISLOT_API_BASE"].rstrip("/")
 LOGIN_URL=API_BASE+"/auth/login"
 REFRESH_URL=API_BASE+"/auth/refresh"
 REGISTER_URL=API_BASE+"/auth/register/doctor"
+REGISTER_PATIENT_URL=API_BASE+"/auth/register/patient"
 
 # Reference data. Mirrors the seed rows in scehma/schema.sql so doctors pick a name
 # instead of typing a numeric ID. The API still validates every ID on its side.
@@ -101,9 +103,10 @@ def _log_request(resp):
 
 @app.errorhandler(SessionExpired)
 def session_expired(e):
+    was_patient=session.get("role")=="PATIENT"
     session.clear()
     notify("Your session expired. Please sign in again.","error")
-    return redirect("/")
+    return redirect("/?mode=signin&role=patient" if was_patient else "/")
 
 def photo_url_for(key):
     # The key is unique per upload, so using it as ?v= makes the browser reload a new photo immediately.
@@ -144,9 +147,11 @@ def items_of(data):
 
 @app.get("/")
 def home():
+    if session.get("access_token") and session.get("role")=="PATIENT": return redirect("/patient")
     if not session.get("access_token"):
         mode="signup" if request.args.get("mode")=="signup" else "signin"
-        return render_template("dashboard.html",logged_in=False,mode=mode,messages=session.pop("messages",[]),form=session.pop("signup_form",{}) if mode=="signup" else {},prefill_email=session.pop("prefill_email","") if mode=="signin" else "",hospitals=HOSPITALS,specializations=SPECIALIZATIONS)
+        who="patient" if request.args.get("role")=="patient" else "doctor"
+        return render_template("dashboard.html",logged_in=False,mode=mode,who=who,messages=session.pop("messages",[]),form=session.pop("signup_form",{}) if mode=="signup" else {},prefill_email=session.pop("prefill_email","") if mode=="signin" else "",hospitals=HOSPITALS,specializations=SPECIALIZATIONS,genders=patient_portal.GENDERS,today=datetime.now(ZoneInfo("Asia/Kolkata")).date().isoformat())
     module=request.args.get("m","overview")
     if module not in MODULE_KEYS: module="overview"
     extra={}
@@ -197,20 +202,24 @@ def signup_page():
 @app.post("/login")
 def login():
     email=request.form["email"]
+    expect="PATIENT" if request.form.get("as")=="patient" else "DOCTOR"
+    back="/?mode=signin&role=patient" if expect=="PATIENT" else "/"
     try:
         r=requests.post(LOGIN_URL,json={"email":email,"password":request.form["password"]},timeout=25)
     except requests.RequestException as e:
         app.logger.error("login upstream error: %s",e)
         session["prefill_email"]=email
         notify(f"Could not reach the MediSlot API ({type(e).__name__}). Check API URL and Lambda logs.","error")
-        return redirect("/")
+        return redirect(back)
     try: payload=r.json()
     except ValueError: payload={}
     if r.ok and payload.get("accessToken"):
         role=payload.get("role","DOCTOR")
         session.clear(); session.permanent=True
-        if role!="DOCTOR":
-            notify("Doctor account required.","error")
+        if role!=expect:
+            session["prefill_email"]=email
+            notify("This is a patient account. Use the patient sign in." if role=="PATIENT" else "This is a doctor account. Use the doctor sign in.","error")
+            return redirect("/?mode=signin&role=patient" if role=="PATIENT" else "/")
         else:
             session["access_token"]=payload["accessToken"]; session["refresh_token"]=payload.get("refreshToken"); session["role"]=role
             app.logger.info("login_succeeded cid=%s userId=%s",g.cid,payload.get("userId"))
@@ -218,6 +227,7 @@ def login():
         app.logger.warning("login_failed cid=%s HTTP %s %s",g.cid,r.status_code,r.text[:300])
         session["prefill_email"]=email
         notify(f"Sign-in failed: {payload.get('message') or 'Please check your email and password.'}","error")
+        return redirect(back)
     return redirect("/")
 @app.post("/signup")
 def signup():
@@ -254,6 +264,53 @@ def signup():
     app.logger.warning("signup failed: HTTP %s %s",r.status_code,r.text[:300])
     if r.status_code==409: return fail("An account with those details already exists. Try signing in, or check your email, phone and license number.")
     return fail(f"Sign-up failed: {api_message(r)}")
+@app.post("/signup/patient")
+def signup_patient():
+    """Patient registration. The API validates everything again (shared rules in lambdas/common.py)."""
+    f=request.form
+    keep=("firstName","lastName","email","phone","dateOfBirth","gender","address")
+    session["signup_form"]={k:f.get(k,"").strip() for k in keep}   # never includes the password
+    def fail(text):
+        notify(text,"error")
+        return redirect("/?mode=signup&role=patient")
+    required={"firstName":"first name","lastName":"last name","email":"email","phone":"phone","dateOfBirth":"date of birth","gender":"gender","password":"password"}
+    missing=[label for k,label in required.items() if not f.get(k,"").strip()]
+    if missing: return fail("Please fill in: "+", ".join(missing)+".")
+    if f.get("password")!=f.get("confirmPassword"): return fail("Passwords do not match.")
+    data={k:f[k].strip() for k in ("firstName","lastName","email","phone","dateOfBirth","gender")}
+    data["password"]=f["password"]
+    if f.get("address","").strip(): data["address"]=f["address"].strip()
+    try:
+        r=requests.post(REGISTER_PATIENT_URL,json=data,timeout=25)
+    except requests.RequestException as e:
+        app.logger.error("patient signup upstream error: %s",e)
+        return fail(f"Could not reach the MediSlot API ({type(e).__name__}). Please try again.")
+    if r.status_code==201:
+        app.logger.info("patient_signup_succeeded cid=%s",g.cid)
+        session.pop("signup_form",None)
+        session["prefill_email"]=data["email"]
+        notify("Account created. Sign in to find a doctor.","success")
+        return redirect("/?mode=signin&role=patient")
+    app.logger.warning("patient signup failed: HTTP %s %s",r.status_code,r.text[:300])
+    if r.status_code==409: return fail("An account with that email or phone number already exists. Try signing in instead.")
+    return fail(f"Sign-up failed: {api_message(r)}")
+
+# Role separation in the shared dashboard: doctors never see patient pages and patients never see doctor pages.
+OPEN_ENDPOINTS={"static","home","login_page","signup_page","login","signup","signup_patient","logout","patient.login_page","patient.register_page"}
+@app.before_request
+def _role_guard():
+    ep=request.endpoint
+    if ep is None or ep in OPEN_ENDPOINTS: return None
+    role=session.get("role") if session.get("access_token") else None
+    if ep.startswith("patient."):
+        if role=="PATIENT": return None
+        if role is None:
+            notify("Please sign in to continue.","info")
+            return redirect("/?mode=signin&role=patient")
+        return redirect("/")
+    if role=="PATIENT": return redirect("/patient")
+    return None
+
 @app.get("/logout")
 def logout():
     app.logger.info("logout cid=%s",g.cid)
@@ -420,6 +477,7 @@ def schedule():
             sched["appointments"]=appts
     except ValueError: pass
     return render_dashboard("schedule",sched=sched)
+patient_portal.init(app,api=api,notify=notify,api_message=api_message,read_json=read_json,photo_bucket=photo_bucket,HOSPITALS=HOSPITALS,SPECIALIZATIONS=SPECIALIZATIONS)
 if __name__=="__main__":
     # Production runs under gunicorn behind an approved HTTPS reverse proxy.
     app.run(host="127.0.0.1",port=8000,debug=False)

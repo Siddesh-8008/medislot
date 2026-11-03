@@ -1,0 +1,119 @@
+{# Signed-in patient area. Context comes from patient_portal.render(). #}
+<div class="shell">
+ <aside class="side">
+  <a class="logo" href="/patient"><i><svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.4" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg></i>MediSlot</a>
+  <nav class="nav" aria-label="Patient pages">
+   {% for key,label,ic,acc,href,desc in nav %}<a href="{{href}}" class="{{ 'on' if key==active }}" style="--acc:{{acc}}"><span class="ico">{{ icon(ic) }}</span>{{label}}</a>{% endfor %}
+  </nav>
+  <div class="me"><div><small>Signed in as patient</small><strong>{{ display_name or 'Patient' }}</strong></div><a href="/logout">Log out</a></div>
+ </aside>
+ <main class="content">
+  {% if page!='doctor' %}{% for key,label,ic,acc,href,desc in nav if key==active %}
+  <header class="mod-head" style="--acc:{{acc}}"><span class="chip-ic">{{ icon(ic) }}</span><div><h1>{{label}}</h1><p>{{desc}}</p></div></header>
+  {% endfor %}{% endif %}
+  {{ banners() }}
+
+{% if page=='home' %}
+  <section class="hello"><div><h2>{{ greeting }}{{ ', '+profile.firstName if profile }}</h2><p>Find a doctor by name, hospital, specialization or city, and see which time slots are free.</p></div></section>
+  <ul class="todo">
+   <li><a href="/patient/doctors"><span class="tick" style="background:#2563b8;border-color:#2563b8">{{ icon('search') }}</span><span class="t"><b>Find a doctor</b><span>Search with any mix of filters and browse their free slots.</span></span><span class="go">Start →</span></a></li>
+   <li><a href="/patient/profile"><span class="tick" style="background:#7a4fd6;border-color:#7a4fd6">{{ icon('user') }}</span><span class="t"><b>Check your profile</b><span>Keep your phone number and details up to date.</span></span><span class="go">Open →</span></a></li>
+  </ul>
+  {% if profile %}<div class="tiles"><div class="tile"><small>Name</small><strong style="font-size:22px;padding-top:10px">{{ profile.firstName }} {{ profile.lastName }}</strong></div><div class="tile"><small>Phone</small><strong style="font-size:22px;padding-top:10px">{{ profile.phone or '—' }}</strong></div></div>
+  {% else %}<div class="banner error" style="margin-top:28px"><span>Your profile could not be loaded right now. Please refresh in a moment.</span></div>{% endif %}
+  <p class="soon">Booking an appointment opens in the next release. For now you can search doctors and see their free slots.</p>
+
+{% elif page=='profile' %}
+  {% if not profile and not form %}
+   <div class="empty"><b>Your profile could not be loaded</b>Please refresh in a moment.</div>
+  {% else %}
+  {% set pv = form if form else {'firstName':profile.firstName,'lastName':profile.lastName,'phone':profile.phone or '','dateOfBirth':profile.dateOfBirth or '','gender':profile.gender or '','address':profile.address or ''} %}
+  <div class="cols wide-left"><section class="panel"><h2>Profile editor</h2><p class="lead">Only you can see and change these details.</p>
+   <form method="post" action="/patient/profile"><div class="fgrid">
+    <label>First name<span class="req">*</span><input name="firstName" maxlength="75" value="{{ pv.firstName }}" required></label>
+    <label>Last name<span class="req">*</span><input name="lastName" maxlength="75" value="{{ pv.lastName }}" required></label>
+    <label class="span2">Email<input value="{{ profile.email if profile else '' }}" readonly tabindex="-1"><span class="hint">Your email is your sign-in and cannot be changed here.</span></label>
+    <label>Phone<span class="req">*</span><input name="phone" type="tel" inputmode="numeric" pattern="[0-9]{10}" maxlength="10" value="{{ pv.phone }}" required><span class="hint">10 digits</span></label>
+    <label>Date of birth<span class="req">*</span><input name="dateOfBirth" type="date" max="{{ today }}" value="{{ pv.dateOfBirth }}" required></label>
+    <label class="span2">Gender<span class="req">*</span><select name="gender" required>{% for g in genders %}<option value="{{g}}" {{ 'selected' if pv.gender==g }}>{{g}}</option>{% endfor %}</select></label>
+    <label class="span2">Address<span class="opt">optional</span><textarea name="address" maxlength="500" style="min-height:84px">{{ pv.address }}</textarea></label>
+   </div><button>Save profile</button></form></section>
+   <aside class="side-note"><h3>Your privacy</h3><ul><li>Doctors cannot browse patient profiles.</li><li>Nobody else can read your profile, even by guessing your ID.</li></ul></aside></div>
+
+   <details class="panel danger"><summary>Close my account</summary>
+    <p class="lead" style="margin-top:14px">This signs you out everywhere and permanently erases your name, phone number, date of birth, gender and address. It cannot be undone.</p>
+    <form method="post" action="/patient/profile/delete" onsubmit="return confirm('Close your account for good?')">
+     <label>Confirm with your password<input name="password" type="password" autocomplete="current-password" required></label>
+     <label class="check"><input type="checkbox" name="confirm" value="yes" required> I understand this cannot be undone</label>
+     <button class="danger-btn">Close my account</button></form></details>
+  {% endif %}
+
+{% elif page=='doctors' %}
+  <section class="panel"><form method="get" action="/patient/doctors" class="searchbar">
+   <label class="span2">Doctor name<input name="name" maxlength="100" value="{{ form.get('name','') }}" placeholder="e.g. Sharma"></label>
+   <label class="span2">Specialization<select name="specializationId"><option value="">Any specialization</option>{% for s in filters.specializations %}<option value="{{s.specializationId}}" {{ 'selected' if form.get('specializationId')==(s.specializationId|string) }}>{{s.name}}</option>{% endfor %}</select></label>
+   <label class="span2">Hospital<select name="hospitalId"><option value="">Any hospital</option>{% for h in filters.hospitals %}<option value="{{h.hospitalId}}" {{ 'selected' if form.get('hospitalId')==(h.hospitalId|string) }}>{{h.name}} · {{h.city}}</option>{% endfor %}</select></label>
+   <label class="span2">City<select name="city"><option value="">Any city</option>{% for c in filters.cities %}<option value="{{c}}" {{ 'selected' if form.get('city')|lower==c|lower }}>{{c}}</option>{% endfor %}</select></label>
+   <div class="row"><label class="check"><input type="checkbox" name="acceptingOnly" value="1" {{ 'checked' if form.get('acceptingOnly') }}> Only doctors accepting bookings</label>
+    <button>Search doctors</button>{% if reset_needed %}<a class="btn ghost" href="/patient/doctors">Clear filters</a>{% endif %}</div>
+  </form></section>
+
+  {% if error %}<div class="banner error" style="margin-top:28px"><span>{{ error }}</span></div>
+  {% elif result %}
+   <div class="found"><b>{{ result.total }} doctor{{ '' if result.total==1 else 's' }} found</b>{% if result.totalPages>1 %}<span>Page {{ page_no }} of {{ result.totalPages }}</span>{% endif %}</div>
+   {% if cards %}<div class="docs">{% for c in cards %}
+    <a class="doc" href="/patient/doctors/{{c.id}}"><div class="head"><span class="pic">{% if c.photo %}<img src="{{c.photo}}" alt="" onerror="this.remove()">{% endif %}{{c.initials}}</span><div><h3>{{c.name}}</h3><div class="spec">{{c.specialization}}</div></div></div>
+     <div class="meta"><span>{{c.hospital}}{% if c.city %} · {{c.city}}{% endif %}</span>{% if c.experience %}<span>{{c.experience}}</span>{% endif %}{% if c.languages %}<span>Speaks {{c.languages}}</span>{% endif %}</div>
+     <div class="foot">{% if c.accepting %}<span>From <b>{{c.fee}}</b></span><span class="pill ok">Accepting bookings</span>{% else %}<span class="quiet">No consultation types yet</span><span class="pill warn">Not available</span>{% endif %}</div></a>{% endfor %}</div>
+    {% if pager %}<nav class="pager" aria-label="Pages">{% if prev_url %}<a href="{{prev_url}}">← Previous</a>{% endif %}{% for l in pager %}{% if l.gap %}<span class="gap">…</span>{% elif l.current %}<span class="cur" aria-current="page">{{l.n}}</span>{% else %}<a href="{{l.url}}">{{l.n}}</a>{% endif %}{% endfor %}{% if next_url %}<a href="{{next_url}}">Next →</a>{% endif %}</nav>{% endif %}
+   {% else %}<div class="empty" style="margin-top:8px"><b>No doctors match these filters</b>{% if result.total>0 %}That page is past the last result. <a href="{{ first_url }}">Go back to the first page</a>.{% else %}Try removing a filter or searching a shorter name.{% endif %}</div>{% endif %}
+  {% endif %}
+
+{% elif page=='doctor' %}
+  <a class="crumb" href="{{ back_url }}">← Back to search results</a>
+  <section class="dochero"><span class="pic big">{% if photo %}<img src="{{photo}}" alt="" onerror="this.remove()">{% endif %}{{initials}}</span>
+   <div><h1>{{ doc.displayName }}</h1><div class="spec">{{ doc.specialization.name }}</div>
+    <dl class="kv"><dt>Hospital</dt><dd>{{ doc.hospital.name }}{% if doc.hospital.address %}, {{ doc.hospital.address }}{% endif %}{% if doc.hospital.city %}, {{ doc.hospital.city }}{% endif %}</dd>
+     {% if experience %}<dt>Experience</dt><dd>{{ experience }}</dd>{% endif %}
+     {% if doc.qualifications %}<dt>Qualifications</dt><dd>{{ doc.qualifications }}</dd>{% endif %}
+     {% if languages %}<dt>Languages</dt><dd>{{ languages }}</dd>{% endif %}
+     {% if doc.clinicAddress %}<dt>Clinic</dt><dd>{{ doc.clinicAddress }}</dd>{% endif %}</dl></div></section>
+
+  <h2 class="sub-h" style="margin-top:0">Consultation types and fees</h2>
+  {% if types %}<div class="types">{% for t in types %}<div class="type"><b>{{t.name}}</b><span class="fee">{{ t.fee_label or '—' }}</span><small>{{t.durationMinutes}} min{% if t.capacity>1 %} · up to {{t.capacity}} patients{% endif %}</small></div>{% endfor %}</div>
+  {% else %}<div class="empty"><b>Not taking bookings yet</b>This doctor has not set up any consultation types.</div>{% endif %}
+
+  {% if types %}
+  <h2 class="sub-h">Available slots</h2>
+  <section class="panel"><form method="get" class="slotbar">
+   <label>From<input type="date" name="from" value="{{ window[0] if window else '' }}"></label>
+   <label>To<input type="date" name="to" value="{{ window[1] if window else '' }}"></label>
+   <label>Type<select name="type"><option value="">All types</option>{% for t in types %}<option value="{{t.consultationTypeId}}" {{ 'selected' if selected_type==(t.consultationTypeId|string) }}>{{t.name}}</option>{% endfor %}</select></label>
+   <div class="row"><label class="check"><input type="checkbox" name="free" value="1" {{ 'checked' if only_free }}> Free only</label><button>Show slots</button></div>
+  </form></section>
+
+  {% if slot_error %}<div class="banner error" style="margin-top:24px"><span>{{ slot_error }}</span></div>
+  {% elif slots %}
+   {% if slots.fromWasInThePast %}<p class="quiet" style="margin-top:16px">Dates in the past were skipped; showing slots from today.</p>{% endif %}
+   <p class="day-sub" style="margin-top:20px">Showing {{ window[0] }} to {{ window[1] }} · times in {{ slots.timezone }} · {{ slots.totalFreeSeats }} free seat{{ '' if slots.totalFreeSeats==1 else 's' }}</p>
+   {% if days %}
+    <div class="legend"><span style="--c:var(--ok)"><i></i>Free</span><span style="--c:#c98a12"><i></i>Few seats left</span><span style="--c:var(--coral)"><i></i>Full</span></div>
+    {% for day in days %}
+     <h3 class="day-title">{{ day.title }}</h3><p class="day-sub">{{ day.free }} of {{ day.total }} slot{{ '' if day.total==1 else 's' }} free</p>
+     {% for grp in day.groups %}
+      <div class="part">{{grp.label}} <small>{{ grp.cards|length }} slot{{ '' if grp.cards|length==1 else 's' }}</small></div>
+      <div class="cards">{% for s in grp.cards %}
+       <article class="slot {{s.state}}"><div class="top"><div class="time">{{s.start}}<small>to {{s.end}} · {{s.minutes}} min</small></div><span class="chip">{{s.label}}</span></div>
+        <div class="what">{{s.type}}</div>
+        <div class="facts">{% if s.fee %}<span>Fee <b>{{s.fee}}</b></span>{% endif %}<span>{{s.seats}}</span></div></article>{% endfor %}</div>
+     {% endfor %}
+    {% endfor %}
+    {% if empty_days %}<p class="quiet" style="margin-top:26px">No slots on: {{ empty_days|join(', ') }}.</p>{% endif %}
+   {% else %}<div class="empty" style="margin-top:20px"><b>No slots in this date range</b>Try another week or choose “All types”{% if only_free %} and untick “Free only”{% endif %}.</div>{% endif %}
+   <div class="winnav"><span>{% if prev_url %}<a class="btn ghost" href="{{prev_url}}">← Earlier</a>{% endif %}</span><span>{% if next_url %}<a class="btn ghost" href="{{next_url}}">Later →</a>{% endif %}</span></div>
+   <p class="soon">Booking opens in the next release. Free seats shown here are live.</p>
+  {% endif %}
+  {% endif %}
+{% endif %}
+ </main>
+</div>

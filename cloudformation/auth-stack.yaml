@@ -65,6 +65,16 @@ Resources:
     Properties:
       LogGroupName: !Sub '/medislot/${Environment}/lambda/slot-materialiser'
       RetentionInDays: !Ref LogRetentionDays
+  PatientDomainLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/medislot/${Environment}/lambda/patient-domain'
+      RetentionInDays: !Ref LogRetentionDays
+  DoctorDiscoveryLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/medislot/${Environment}/lambda/doctor-discovery'
+      RetentionInDays: !Ref LogRetentionDays
   ApiAccessLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
@@ -364,6 +374,114 @@ Resources:
       Target:
         Arn: !GetAtt SlotMaterialiserFunction.Arn
         RoleArn: !GetAtt SlotMaterialiserScheduleRole.Arn
+  # ---- Milestone 4: patient profile API (RDS + AuthTokens for closing an account).
+  PatientDomainRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'MediSlot-${Environment}-PatientDomainRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns: [!Ref LambdaExecutionBasePolicy]
+      Policies:
+        - PolicyName: PatientDomainRuntimeAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [ssm:GetParameter]
+                Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/medislot/${Environment}/db/*'
+              - Effect: Allow
+                Action: [kms:Decrypt]
+                Resource: '*'
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem]
+                Resource: !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/MediSlot-${Environment}-AuthTokens'
+  PatientDomainFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'medislot-${Environment}-patient-domain'
+      LoggingConfig:
+        LogFormat: Text
+        LogGroup: !Ref PatientDomainLogGroup
+      Runtime: python3.12
+      Handler: lambda_function.handler
+      Role: !GetAtt PatientDomainRole.Arn
+      Timeout: 15
+      MemorySize: 256
+      TracingConfig: {Mode: Active}
+      Code: {S3Bucket: !Ref ArtifactBucket, S3Key: !Sub '${ArtifactPrefix}/patient_domain.zip'}
+      Environment: {Variables: {ENVIRONMENT: !Ref Environment}}
+      VpcConfig:
+        SecurityGroupIds: [!ImportValue {Fn::Sub: 'MediSlot-${Environment}-LambdaSecurityGroupId'}]
+        SubnetIds:
+          - !ImportValue {Fn::Sub: 'MediSlot-${Environment}-PrivateSubnet1Id'}
+          - !ImportValue {Fn::Sub: 'MediSlot-${Environment}-PrivateSubnet2Id'}
+  PatientDomainInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref PatientDomainFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*/*/patients/*'
+  # ---- Milestone 4: doctor search, public doctor profile and slot availability (RDS + read-only DynamoDB).
+  DoctorDiscoveryRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'MediSlot-${Environment}-DoctorDiscoveryRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns: [!Ref LambdaExecutionBasePolicy]
+      Policies:
+        - PolicyName: DoctorDiscoveryRuntimeAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [ssm:GetParameter]
+                Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/medislot/${Environment}/db/*'
+              - Effect: Allow
+                Action: [kms:Decrypt]
+                Resource: '*'
+              - Effect: Allow
+                Action: [dynamodb:Query]
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/MediSlot-${Environment}-Slots'
+                  - !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/MediSlot-${Environment}-Slots/index/GSI_DoctorDate'
+  DoctorDiscoveryFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'medislot-${Environment}-doctor-discovery'
+      LoggingConfig:
+        LogFormat: Text
+        LogGroup: !Ref DoctorDiscoveryLogGroup
+      Runtime: python3.12
+      Handler: lambda_function.handler
+      Role: !GetAtt DoctorDiscoveryRole.Arn
+      Timeout: 20
+      MemorySize: 256
+      TracingConfig: {Mode: Active}
+      Code: {S3Bucket: !Ref ArtifactBucket, S3Key: !Sub '${ArtifactPrefix}/doctor_discovery.zip'}
+      Environment: {Variables: {ENVIRONMENT: !Ref Environment}}
+      VpcConfig:
+        SecurityGroupIds: [!ImportValue {Fn::Sub: 'MediSlot-${Environment}-LambdaSecurityGroupId'}]
+        SubnetIds:
+          - !ImportValue {Fn::Sub: 'MediSlot-${Environment}-PrivateSubnet1Id'}
+          - !ImportValue {Fn::Sub: 'MediSlot-${Environment}-PrivateSubnet2Id'}
+  DoctorDiscoveryInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DoctorDiscoveryFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*/GET/doctors/*'
   DoctorDomainInvokePermission:
     Type: AWS::Lambda::Permission
     Properties:
@@ -687,6 +805,172 @@ Resources:
         IntegrationHttpMethod: POST
         Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DoctorDomainFunction.Arn}/invocations'
 
+  # ---- Milestone 4 endpoints. Same REST API, stage and JWT authorizer as everything above; the dashboard calls
+  # exactly these methods. /patients/* -> patient-domain Lambda (PATIENT role only, checked in the Lambda).
+  # /doctors/search|filters|{doctorId}[/slots] -> doctor-discovery Lambda (any signed-in user).
+  PatientsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !GetAtt RestApi.RootResourceId
+      PathPart: 'patients'
+  PatientsMeResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref PatientsResource
+      PathPart: 'me'
+  PatientsIdResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref PatientsResource
+      PathPart: '{patientId}'
+  DoctorsSearchResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref DoctorsResource
+      PathPart: 'search'
+  DoctorsFiltersResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref DoctorsResource
+      PathPart: 'filters'
+  DoctorsIdResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref DoctorsResource
+      PathPart: '{doctorId}'
+  DoctorsIdSlotsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref DoctorsIdResource
+      PathPart: 'slots'
+  PatientsMeGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref PatientsMeResource
+      HttpMethod: GET
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${PatientDomainFunction.Arn}/invocations'
+  PatientsMePostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref PatientsMeResource
+      HttpMethod: POST
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${PatientDomainFunction.Arn}/invocations'
+  PatientsMePutMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref PatientsMeResource
+      HttpMethod: PUT
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${PatientDomainFunction.Arn}/invocations'
+  PatientsMePatchMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref PatientsMeResource
+      HttpMethod: PATCH
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${PatientDomainFunction.Arn}/invocations'
+  PatientsMeDeleteMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref PatientsMeResource
+      HttpMethod: DELETE
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${PatientDomainFunction.Arn}/invocations'
+  PatientsIdGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref PatientsIdResource
+      HttpMethod: GET
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${PatientDomainFunction.Arn}/invocations'
+  DoctorsSearchGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref DoctorsSearchResource
+      HttpMethod: GET
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DoctorDiscoveryFunction.Arn}/invocations'
+  DoctorsFiltersGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref DoctorsFiltersResource
+      HttpMethod: GET
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DoctorDiscoveryFunction.Arn}/invocations'
+  DoctorsIdGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref DoctorsIdResource
+      HttpMethod: GET
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DoctorDiscoveryFunction.Arn}/invocations'
+  DoctorsIdSlotsGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref DoctorsIdSlotsResource
+      HttpMethod: GET
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DoctorDiscoveryFunction.Arn}/invocations'
+
   PatientProtectedMethod:
     Type: AWS::ApiGateway::Method
     Properties:
@@ -798,6 +1082,16 @@ Resources:
       - DoctorsMeBlackoutDatesPostMethod
       - DoctorsMeBlackoutIdDeleteMethod
       - DoctorsMeScheduleGetMethod
+      - PatientsMeGetMethod
+      - PatientsMePostMethod
+      - PatientsMePutMethod
+      - PatientsMePatchMethod
+      - PatientsMeDeleteMethod
+      - PatientsIdGetMethod
+      - DoctorsSearchGetMethod
+      - DoctorsFiltersGetMethod
+      - DoctorsIdGetMethod
+      - DoctorsIdSlotsGetMethod
       - RegisterPatientMethod
       - RegisterDoctorMethod
       - LoginMethod
@@ -834,6 +1128,8 @@ Outputs:
     Value: !Sub 'https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/auth/login'
   DoctorDomainFunctionName: {Value: !Ref DoctorDomainFunction}
   SlotMaterialiserFunctionName: {Value: !Ref SlotMaterialiserFunction}
+  PatientDomainFunctionName: {Value: !Ref PatientDomainFunction}
+  DoctorDiscoveryFunctionName: {Value: !Ref DoctorDiscoveryFunction}
   AuthenticationFunctionName: {Value: !Ref AuthenticationFunction}
   AuthorizerFunctionName: {Value: !Ref AuthorizerFunction}
   RdsConnectionCheckFunctionName: {Value: !Ref RdsConnectionCheckFunction}

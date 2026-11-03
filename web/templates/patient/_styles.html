@@ -1,0 +1,44 @@
+<style>
+/* ---------- Patient area (shares the variables, buttons, cards and slot styles above) ---------- */
+.switch{display:inline-grid;grid-template-columns:1fr 1fr;gap:4px;margin-bottom:18px;width:100%;max-width:340px;border:1.5px solid var(--line);border-radius:14px;padding:4px}
+.switch a{text-align:center;padding:9px 12px;border-radius:10px;text-decoration:none;color:var(--muted);font-weight:600;font-size:14px}
+.switch a.on{background:var(--ink);color:#fff}
+.brand-patient{background:radial-gradient(900px 500px at 0% 0%,#2563b855,transparent 60%),linear-gradient(165deg,#0b3a41,#0a2a31 70%)}
+.searchbar{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:18px 18px;align-items:end}
+.searchbar .span2{grid-column:span 2}.searchbar .row{grid-column:1/-1;display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+.check{display:flex;align-items:center;gap:10px;font-weight:500}.check input{width:auto;margin:0}
+.found{display:flex;justify-content:space-between;align-items:baseline;gap:12px;flex-wrap:wrap;margin:30px 0 16px;color:var(--muted)}
+.found b{color:var(--ink);font-family:var(--serif);font-size:20px}
+.docs{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:18px}
+.doc{background:var(--paper);border:1px solid var(--line);border-radius:var(--r);padding:20px;display:grid;gap:14px;align-content:start;text-decoration:none;color:var(--ink);transition:border-color .15s,transform .15s,box-shadow .15s}
+.doc:hover{border-color:var(--teal);transform:translateY(-2px);box-shadow:0 8px 24px #12303a14}
+.doc .head{display:flex;gap:14px;align-items:center}
+.pic{width:64px;height:64px;border-radius:50%;flex:none;display:grid;place-items:center;background:var(--mint);color:var(--teal-d);font:700 22px var(--serif);overflow:hidden}
+.pic img{width:100%;height:100%;object-fit:cover}
+.pic.big{width:112px;height:112px;font-size:38px}
+.doc h3{font-size:19px;line-height:1.2}.doc .spec{color:var(--teal);font-weight:600;font-size:14.5px}
+.doc .meta{display:grid;gap:4px;font-size:14px;color:var(--muted)}
+.doc .foot{display:flex;justify-content:space-between;align-items:center;gap:10px;border-top:1px solid var(--line);padding-top:12px;font-size:14px}
+.doc .foot b{font-family:var(--serif);font-size:18px}
+.pill.warn{background:#fff1d6;color:#8a5a00}
+.pager{display:flex;gap:6px;flex-wrap:wrap;justify-content:center;align-items:center;margin:34px 0 0}
+.pager a,.pager span{min-width:40px;padding:9px 12px;border-radius:10px;text-align:center;text-decoration:none;font-weight:600;font-size:14px;border:1.5px solid var(--line);color:var(--ink);background:var(--paper)}
+.pager a:hover{border-color:var(--teal)}.pager .cur{background:var(--ink);color:#fff;border-color:var(--ink)}.pager .gap{border:0;background:none;color:var(--muted)}
+.crumb{display:inline-flex;gap:6px;align-items:center;margin-bottom:22px;font-weight:600;text-decoration:none}
+.dochero{display:flex;gap:28px;align-items:center;flex-wrap:wrap;background:var(--paper);border:1px solid var(--line);border-radius:22px;padding:clamp(22px,3vw,36px);margin-bottom:28px}
+.dochero h1{font-size:clamp(26px,3vw,36px);line-height:1.1}.dochero .spec{color:var(--teal);font-weight:600;margin:6px 0 10px}
+.dochero .kv{margin-top:6px}
+.types{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:14px;margin:0 0 8px}
+.type{border:1px solid var(--line);border-radius:14px;background:#fff;padding:16px;display:grid;gap:4px}
+.type b{font-size:15px}.type .fee{font:600 24px var(--serif)}.type small{color:var(--muted)}
+.slotbar{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px;align-items:end}
+.slotbar .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.winnav{display:flex;justify-content:space-between;gap:12px;margin:26px 0 0}
+.soon{margin-top:24px;background:var(--infobg);color:var(--info);border:1px solid #c5dcee;border-radius:12px;padding:12px 16px;font-size:14.5px}
+.sub-h{font-family:var(--serif);font-size:20px;margin:30px 0 14px}
+.danger{border-color:#f2c4bf;background:#fffaf9}.danger summary{color:var(--err)}
+button.danger-btn{background:var(--err)}button.danger-btn:hover{background:#8c1d17}
+.quiet{color:var(--muted);font-size:14px}
+@media(max-width:1020px){.searchbar,.slotbar{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:560px){.searchbar,.slotbar{grid-template-columns:minmax(0,1fr)}.searchbar .span2{grid-column:auto}.dochero{flex-direction:column;align-items:flex-start}}
+</style>

@@ -1,5 +1,5 @@
 <!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>MediSlot Doctor Dashboard</title>
+<title>MediSlot</title>
 <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&display=swap" rel="stylesheet">
 <style>
@@ -160,7 +160,9 @@ pre{background:#12303a;color:#d6ece9;padding:20px;border-radius:12px;overflow:au
  .mod-head .chip-ic{width:48px;height:48px;border-radius:14px}
 }
 @media(max-width:560px){.fgrid,.rules{grid-template-columns:1fr}.span2{grid-column:auto}}
-</style></head><body>
+</style>
+{% include "patient/_styles.html" %}
+</head><body>
 
 {%- macro icon(n) -%}<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
 {%- if n=='home' %}<path d="M3 11l9-8 9 8"/><path d="M5 10v10h14V10"/>
@@ -168,6 +170,7 @@ pre{background:#12303a;color:#d6ece9;padding:20px;border-radius:12px;overflow:au
 {%- elif n=='camera' %}<path d="M4 8h3l2-3h6l2 3h3v12H4z"/><circle cx="12" cy="13" r="4"/>
 {%- elif n=='list' %}<path d="M8 6h13M8 12h13M8 18h13"/><path d="M3 6h.01M3 12h.01M3 18h.01"/>
 {%- elif n=='clock' %}<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>
+{%- elif n=='search' %}<circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/>
 {%- elif n=='calendar' %}<rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 10h18M8 3v4M16 3v4"/>
 {%- endif -%}</svg>{%- endmacro -%}
 
@@ -179,8 +182,19 @@ pre{background:#12303a;color:#d6ece9;padding:20px;border-radius:12px;overflow:au
 
 {% if not logged_in %}
 <div class="auth">
- <aside class="brand">
+ <aside class="brand {{ 'brand-patient' if who=='patient' }}">
   <a class="logo" href="/"><i><svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.4" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg></i>MediSlot</a>
+  {% if who=='patient' %}<div>
+   <h2>Find the right doctor, <em>and a time that fits.</em></h2>
+   <p>Search by name, hospital, specialization or city, check each doctor’s fees and see which slots are free.</p>
+   <svg class="ecg" viewBox="0 0 520 70" preserveAspectRatio="none" aria-hidden="true"><path d="M0 40 H150 L172 40 L190 10 L212 62 L232 26 L248 40 H340 L360 40 L376 22 L392 46 L408 40 H520"/></svg>
+  </div>
+  <ol class="steps">
+   <li><span class="n">1</span><div><b>Register as a patient</b>A few details about you.</div></li>
+   <li><span class="n">2</span><div><b>Search for doctors</b>Combine any filters.</div></li>
+   <li><span class="n">3</span><div><b>Browse free slots</b>See what is open this week.</div></li>
+  </ol>
+  {% else %}
   <div>
    <h2>Run your clinic hours <em>without the back-and-forth.</em></h2>
    <p>Set your consultation types, publish your weekly availability and see each day’s schedule in one calm workspace.</p>
@@ -191,11 +205,15 @@ pre{background:#12303a;color:#d6ece9;padding:20px;border-radius:12px;overflow:au
    <li><span class="n">2</span><div><b>Add consultation types</b>Duration, fee and capacity.</div></li>
    <li><span class="n">3</span><div><b>Publish weekly availability</b>Patients can start booking.</div></li>
   </ol>
+  {% endif %}
  </aside>
  <main class="auth-main"><div class="auth-card">
-  <nav class="seg" aria-label="Sign in or sign up"><a href="/?mode=signin" class="{{ 'on' if mode=='signin' }}">Sign in</a><a href="/?mode=signup" class="{{ 'on' if mode=='signup' }}">Create account</a></nav>
+  {% set rq = '&role=patient' if who=='patient' else '' %}
+  <nav class="switch" aria-label="Account type"><a href="/?mode={{mode}}" class="{{ 'on' if who!='patient' }}">I’m a doctor</a><a href="/?mode={{mode}}&role=patient" class="{{ 'on' if who=='patient' }}">I’m a patient</a></nav><br>
+  <nav class="seg" aria-label="Sign in or sign up"><a href="/?mode=signin{{rq}}" class="{{ 'on' if mode=='signin' }}">Sign in</a><a href="/?mode=signup{{rq}}" class="{{ 'on' if mode=='signup' }}">{{ 'Register' if who=='patient' else 'Create account' }}</a></nav>
   {{ banners() }}
-  {% if mode=='signin' %}
+  {% if who=='patient' %}{% include "patient/_auth.html" %}
+  {% elif mode=='signin' %}
   <h1>Doctor sign in</h1><p class="sub">Welcome back. Use your MediSlot doctor account.</p>
   <div class="card" style="max-width:520px"><form method="post" action="/login" class="fgrid" style="grid-template-columns:1fr">
    <label>Email<input name="email" type="email" value="{{ prefill_email }}" autocomplete="username" required {{ 'autofocus' if not prefill_email }}></label>
@@ -231,6 +249,9 @@ pre{background:#12303a;color:#d6ece9;padding:20px;border-radius:12px;overflow:au
   {% endif %}
  </div></main>
 </div>
+
+{% elif role=='PATIENT' %}
+{% include "patient/_shell.html" %}
 
 {% else %}
 {% set cur = module %}

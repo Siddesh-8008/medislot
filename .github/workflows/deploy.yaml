@@ -1,10 +1,10 @@
-name: MediSlot Milestone 2 CI and Deployment
+name: MediSlot CI and Deployment
 
 on:
   pull_request:
     branches: [main]
   push:
-    branches: [main]
+    branches: [main,Patient]
     paths:
       - "cloudformation/**"
       - "lambdas/**"
@@ -16,6 +16,7 @@ on:
       - "scehma/**"
       - "web/**"
       - "MILESTONE3.md"
+      - "MILESTONE4.md"
   workflow_dispatch:
 
 permissions:
@@ -176,7 +177,7 @@ jobs:
           set -euo pipefail
           AWS_ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
           BUCKET="medislot-${ENVIRONMENT}-artifacts-${AWS_ACCOUNT_ID}"
-          for fn in authentication authorizer rds_check doctor_domain slot_materialiser; do
+          for fn in authentication authorizer rds_check doctor_domain slot_materialiser patient_domain doctor_discovery; do
             tmp="$(mktemp -d)"
             cp -R "lambdas/${fn}/." "$tmp/"
             cp "lambdas/common.py" "$tmp/common.py"
@@ -205,7 +206,7 @@ jobs:
           ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
           BUCKET="medislot-${ENVIRONMENT}-artifacts-${ACCOUNT}"
           KEY="dashboard/${GITHUB_SHA}/dashboard.zip"
-          (cd web && zip -qr "$GITHUB_WORKSPACE/dashboard.zip" doctor_dashboard.py requirements.txt templates)
+          (cd web && zip -qr "$GITHUB_WORKSPACE/dashboard.zip" doctor_dashboard.py patient_portal.py requirements.txt templates)
           aws s3 cp "$GITHUB_WORKSPACE/dashboard.zip" "s3://${BUCKET}/${KEY}" --sse AES256 --region "$AWS_REGION"
           # Stable copy used only when a brand-new dashboard instance boots for the first time.
           aws s3 cp "$GITHUB_WORKSPACE/dashboard.zip" "s3://${BUCKET}/dashboard/latest/dashboard.zip" --sse AES256 --region "$AWS_REGION"
@@ -333,3 +334,31 @@ jobs:
               body = json.loads(body)
           assert body.get("connected") is True, result
           '
+
+      - name: Check the search indexes exist (Milestone 4)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -c '
+          import json
+          with open("/tmp/rds-check.json") as f:
+              result = json.load(f)
+          body = result.get("body", {})
+          if isinstance(body, str):
+              body = json.loads(body)
+          missing = body.get("missing_indexes")
+          assert missing is not None, "rds-connection-check did not report indexes: " + json.dumps(result)[:500]
+          if missing:
+              raise SystemExit("Missing indexes: " + ", ".join(missing) + ". Run scehma/milestone4_indexes.sql on the database (or recreate the tables from scehma/schema.sql) and re-run.")
+          print("All required indexes are present.")
+          '
+
+      - name: Integration tests against the deployed API
+        shell: bash
+        run: |
+          set -euo pipefail
+          API_URL="$(aws cloudformation describe-stacks --stack-name "medislot-${ENVIRONMENT}-auth" --region "$AWS_REGION" \
+            --query "Stacks[0].Outputs[?OutputKey=='ApiUrl'].OutputValue | [0]" --output text)"
+          [[ -n "$API_URL" && "$API_URL" != "None" ]] || { echo "::error::Could not find ApiUrl output on the auth stack."; exit 1; }
+          python -m pip install --quiet pytest==8.3.5 requests==2.32.4
+          MEDISLOT_API_BASE="${API_URL%/}" python -m pytest tests/integration -v

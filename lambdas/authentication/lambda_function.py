@@ -18,6 +18,11 @@ from common import (
     auth_table,
     token_hash,
     get_param,
+    instrument,
+    clean_patient_fields,
+    FieldErrors,
+    PATIENT_MANDATORY,
+    valid_email,
 )
 
 LICENSE_RE = re.compile(r"^[A-Z][A-Z ]{1,29}-\d{4}$")
@@ -69,7 +74,7 @@ def _register(event, context, role, cid):
     email = str(data.get("email", "")).strip().lower()
     password = data.get("password", "")
     phone = str(data.get("phone", "")).strip() or None
-    if not phone or len(phone) != 10 or not phone.isdigit():
+    if role == "DOCTOR" and (not phone or len(phone) != 10 or not phone.isdigit()):
         return response(
         400,
         {
@@ -80,6 +85,43 @@ def _register(event, context, role, cid):
     dob = str(data.get("dateOfBirth", "")).strip() or None
     gender = str(data.get("gender", "")).strip() or None
     address = str(data.get("address", "")).strip() or None
+
+    if role == "PATIENT":
+        # Milestone 4: a patient must supply name, phone, date of birth and gender (address is optional).
+        # Every problem is reported at once so the form can be fixed in a single pass.
+        errors = {}
+        cleaned = {}
+        try:
+            cleaned = clean_patient_fields(
+                {
+                    "firstName": first,
+                    "lastName": last,
+                    "phone": phone,
+                    "dateOfBirth": data.get("dateOfBirth"),
+                    "gender": data.get("gender"),
+                    "address": data.get("address"),
+                },
+                required=PATIENT_MANDATORY,
+            )
+        except FieldErrors as exc:
+            errors = dict(exc.errors)
+        if not valid_email(email):
+            errors["email"] = "A valid email address is required"
+        if errors:
+            return response(
+                400,
+                {
+                    "message": "; ".join(errors.values()),
+                    "errors": errors,
+                    "correlationId": cid,
+                },
+            )
+        first = cleaned["firstName"]
+        last = cleaned["lastName"]
+        phone = cleaned["phone"]
+        dob = cleaned["dateOfBirth"]
+        gender = cleaned["gender"]
+        address = cleaned.get("address")
 
     if (
         not first
@@ -599,6 +641,28 @@ def _refresh(event, cid):
             },
         )
 
+    # A closed (deleted or deactivated) account must not be able to mint new access tokens.
+    conn = dbconn(c)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT is_active FROM users WHERE user_id = %s",
+                (int(item["user_id"]),),
+            )
+            account = cur.fetchone()
+    finally:
+        conn.close()
+
+    if not account or not account.get("is_active"):
+        emit("warning", "refresh_rejected_closed_account", cid)
+        return response(
+            401,
+            {
+                "message": "Invalid or revoked refresh token",
+                "correlationId": cid,
+            },
+        )
+
     minutes = int(
         get_param(f"{c['prefix']}/auth/access-token-minutes")
     )
@@ -705,6 +769,7 @@ def _logout(event, cid):
     )
 
 
+@instrument("authentication")
 def handler(event, context):
     cid = correlation(event)
 

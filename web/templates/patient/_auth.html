@@ -1,0 +1,30 @@
+{# Patient sign in / create account. Rendered inside the shared auth card; `mode`, `form`, `prefill_email`, `genders`, `today` come from home(). #}
+{% if mode=='signin' %}
+<h1>Patient sign in</h1><p class="sub">Welcome back. Use your MediSlot patient account.</p>
+<div class="card" style="max-width:520px"><form method="post" action="/login" class="fgrid" style="grid-template-columns:1fr">
+ <input type="hidden" name="as" value="patient">
+ <label>Email<input name="email" type="email" value="{{ prefill_email }}" autocomplete="username" required {{ 'autofocus' if not prefill_email }}></label>
+ <label>Password<input name="password" type="password" autocomplete="current-password" required {{ 'autofocus' if prefill_email }}></label>
+ <button class="block">Sign in</button></form>
+ <p class="foot-note">New to MediSlot? <a href="/?mode=signup&role=patient">Register as a patient</a></p></div>
+{% else %}
+<h1>Register as a patient</h1><p class="sub">Fields marked <span style="color:var(--coral)">*</span> are required. You will be taken to the patient sign in afterwards.</p>
+<form method="post" action="/signup/patient" class="card" autocomplete="on">
+ <fieldset class="fset"><legend><span>1</span>Account</legend><div class="fgrid">
+  <label class="span2">Email<span class="req">*</span><input name="email" type="email" value="{{ form.get('email','') }}" autocomplete="username" required></label>
+  <label>Password<span class="req">*</span><div class="pwwrap"><input id="su-password" name="password" type="password" autocomplete="new-password" required><button type="button" data-toggle="su-password">Show</button></div>
+   <ul class="rules" id="rules"><li data-r="len">12+ characters</li><li data-r="low">Lowercase letter</li><li data-r="up">Uppercase letter</li><li data-r="num">A number</li><li data-r="sym">A symbol</li></ul></label>
+  <label>Confirm password<span class="req">*</span><div class="pwwrap"><input id="su-confirm" name="confirmPassword" type="password" autocomplete="new-password" required><button type="button" data-toggle="su-confirm">Show</button></div></label>
+ </div></fieldset>
+ <fieldset class="fset" style="margin-bottom:28px"><legend><span>2</span>About you</legend><div class="fgrid">
+  <label>First name<span class="req">*</span><input name="firstName" maxlength="75" value="{{ form.get('firstName','') }}" autocomplete="given-name" required></label>
+  <label>Last name<span class="req">*</span><input name="lastName" maxlength="75" value="{{ form.get('lastName','') }}" autocomplete="family-name" required></label>
+  <label>Phone<span class="req">*</span><input name="phone" type="tel" inputmode="numeric" pattern="[0-9]{10}" maxlength="10" value="{{ form.get('phone','') }}" autocomplete="tel-national" required><span class="hint">10 digits, no spaces or country code</span></label>
+  <label>Date of birth<span class="req">*</span><input name="dateOfBirth" type="date" max="{{ today }}" value="{{ form.get('dateOfBirth','') }}" autocomplete="bday" required></label>
+  <label class="span2">Gender<span class="req">*</span><select name="gender" required><option value="" disabled {{ 'selected' if not form.get('gender') }}>Select</option>{% for g in genders %}<option value="{{g}}" {{ 'selected' if form.get('gender')==g }}>{{g}}</option>{% endfor %}</select></label>
+  <label class="span2">Address<span class="opt">optional</span><input name="address" maxlength="500" value="{{ form.get('address','') }}" autocomplete="street-address"></label>
+ </div></fieldset>
+ <button class="block">Create patient account</button>
+ <p class="foot-note">Already registered? <a href="/?mode=signin&role=patient">Patient sign in</a></p>
+</form>
+{% endif %}
