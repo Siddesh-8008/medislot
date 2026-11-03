@@ -197,8 +197,8 @@ def test_slot_filters(api, patient_a, doctor):
     base = {"from": date.today().isoformat(), "to": (date.today() + timedelta(days=3)).isoformat()}
     quick = api.get(f"/doctors/{doctor.id}/slots", patient_a.token, params={**base, "consultationTypeId": 1}).json()
     assert all(s["consultationTypeId"] == 1 for d in quick["days"] for s in d["slots"])
-    none = api.get(f"/doctors/{doctor.id}/slots", patient_a.token, params={**base, "consultationTypeId": 4}).json()
-    assert none["totalSlots"] == 0
+    not_offered = api.get(f"/doctors/{doctor.id}/slots", patient_a.token, params={**base, "consultationTypeId": 4})
+    assert not_offered.status_code == 422, "a type this doctor does not offer is a validation error, not an empty list"
     free = api.get(f"/doctors/{doctor.id}/slots", patient_a.token, params={**base, "availableOnly": "true"}).json()
     assert all(s["available"] for d in free["days"] for s in d["slots"])
 
