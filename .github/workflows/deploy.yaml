@@ -194,17 +194,27 @@ jobs:
             rm -rf "$tmp" "$GITHUB_WORKSPACE/${fn}.zip"
           done
 
+      # The auth template is larger than the 51,200-byte limit for inline template bodies,
+      # so it is deployed with --s3-bucket: the CLI uploads the template to S3 first
+      # (S3-hosted templates can be up to 1 MB).
       - name: Deploy authentication API stack
         shell: bash
         run: |
           set -euo pipefail
           ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
-          python scripts/deploy_stack.py \
-            cloudformation/auth-stack.yaml \
-            "medislot-${ENVIRONMENT}-auth" \
-            "Environment=${ENVIRONMENT}" \
-            "ArtifactBucket=medislot-${ENVIRONMENT}-artifacts-${ACCOUNT}" \
-            "ArtifactPrefix=lambda/${GITHUB_SHA}"
+          BUCKET="medislot-${ENVIRONMENT}-artifacts-${ACCOUNT}"
+          aws cloudformation deploy \
+            --template-file cloudformation/auth-stack.yaml \
+            --stack-name "medislot-${ENVIRONMENT}-auth" \
+            --s3-bucket "$BUCKET" \
+            --s3-prefix "templates/${GITHUB_SHA}" \
+            --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND \
+            --no-fail-on-empty-changeset \
+            --region "$AWS_REGION" \
+            --parameter-overrides \
+              "Environment=${ENVIRONMENT}" \
+              "ArtifactBucket=${BUCKET}" \
+              "ArtifactPrefix=lambda/${GITHUB_SHA}"
 
       - name: Package and upload doctor dashboard
         shell: bash
