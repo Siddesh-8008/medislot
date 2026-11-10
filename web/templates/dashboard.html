@@ -146,6 +146,7 @@ details{margin-top:24px}summary{cursor:pointer;color:var(--muted);font-weight:60
 .chip{display:inline-block;padding:3px 10px;border-radius:99px;font-size:12px;font-weight:700;white-space:nowrap;background:color-mix(in srgb,var(--c) 14%,#fff);color:var(--c)}
 .slot.closed .chip{color:#6f6b5c}
 .slot details{margin:0}.slot summary{font-size:13px;font-weight:600;color:var(--teal)}
+.slot-cancel summary{color:var(--err)!important}.slot-cancel form{display:grid;gap:8px;margin-top:8px}.slot-cancel input{padding:8px 10px;font-size:13.5px}.slot-cancel .check input{width:auto}.slot-cancel button{padding:8px 14px;font-size:13.5px;justify-self:start}
 .slot dl{margin:10px 0 0;display:grid;gap:6px;font-size:12.5px}.slot dt{color:var(--muted)}.slot dd{margin:0;word-break:break-all}
 .appt{--c:var(--teal)}
 pre{background:#12303a;color:#d6ece9;padding:20px;border-radius:12px;overflow:auto;font-size:13px;max-height:420px}
@@ -357,7 +358,12 @@ pre{background:#12303a;color:#d6ece9;padding:20px;border-radius:12px;overflow:au
         <article class="slot {{s.state}}"><div class="top"><div class="time">{{s.start}}<small>to {{s.end}} · {{s.minutes}} min</small></div><span class="chip">{{s.label}}</span></div>
          <div class="what">{{s.type}}</div>
          <div class="facts">{% if s.fee %}<span>Fee <b>{{s.fee}}</b></span>{% endif %}<span>{% if s.capacity>1 %}Seats <b>{{s.free}} of {{s.capacity}}</b> free{% else %}{{ 'Booked' if s.booked else 'Not booked' }}{% endif %}</span></div>
-         {% if s.details %}<details><summary>More details</summary><dl>{% for k,v in s.details %}<div><dt>{{k}}</dt><dd>{{v}}</dd></div>{% endfor %}</dl></details>{% endif %}</article>{% endfor %}</div>
+         {% if s.details %}<details><summary>More details</summary><dl>{% for k,v in s.details %}<div><dt>{{k}}</dt><dd>{{v}}</dd></div>{% endfor %}</dl></details>{% endif %}
+         {% if s.cancellable %}<details class="slot-cancel"><summary>Cancel this slot</summary><form method="post" action="/schedule/slots/cancel" onsubmit="return confirm('Cancel this slot? Booked patients get a full refund.')">
+          <input type="hidden" name="slot" value="{{s.slot_hex}}"><input type="hidden" name="date" value="{{ sched.date }}">
+          <label>Reason (optional)<input name="reason" maxlength="255" placeholder="e.g. Called into surgery"></label>
+          <label class="check"><input type="checkbox" name="confirm" value="yes" required> {% if s.booked %}Cancel and refund {{s.booked}} patient{{ '' if s.booked==1 else 's' }} in full{% else %}Close this slot{% endif %}</label>
+          <button class="danger-btn">Cancel slot</button></form></details>{% endif %}</article>{% endfor %}</div>
       {% endfor %}
      {% else %}<div class="empty"><b>No slots</b>No slots are open for this day. Check your weekly pattern and blackout dates.</div>{% endif %}
     {% else %}<div class="banner error" style="margin-top:28px"><span>{{ sched.error }}</span></div>{% endif %}

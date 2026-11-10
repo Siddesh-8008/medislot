@@ -23,6 +23,8 @@ jobs:
           cache-dependency-path: requirements-dev.txt
       - name: Install dependencies
         run: python -m pip install -r requirements-dev.txt
+      - name: "Milestone 5 mandatory tests: concurrency and idempotency"
+        run: python -m pytest -v tests/test_booking_concurrency.py tests/test_booking_idempotency.py
       - name: Run unit tests (a failing test fails the build)
         run: python -m pytest -v
 

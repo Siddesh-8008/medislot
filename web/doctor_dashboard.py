@@ -1,5 +1,5 @@
-import os, json, secrets, time, uuid, logging, requests, boto3
-from datetime import timedelta, datetime
+import os, re, json, secrets, time, uuid, logging, requests, boto3
+from datetime import timedelta, datetime, timezone
 from zoneinfo import ZoneInfo
 from flask import Flask, request, session, redirect, url_for, render_template, flash, Response, g
 import patient_portal
@@ -440,8 +440,13 @@ def slot_card(s,zone):
     else: state,label="closed",raw.title()
     mins=s.get("duration_minutes") or int((end-start).total_seconds()//60)
     details=[("Slot ID",s.get("slot_id")),("Starts (UTC)",s.get("start_at")),("Ends (UTC)",s.get("end_at")),("Seats held",held),("Closed because","Schedule changed" if s.get("closed_reason")=="SCHEDULE_CHANGE" else s.get("closed_reason")),("Version",s.get("version"))]
+    sid=str(s.get("slot_id") or "")
+    # Milestone 5: a future slot that is not already cancelled can be cancelled by the doctor (patients refunded in full).
+    cancellable=raw!="CANCELLED" and _utc(s["start_at"])>datetime.now(timezone.utc) and bool(re.fullmatch(r"SLOT#[0-9a-f]{40}",sid))
+    if raw=="CANCELLED": state,label="closed","Cancelled"
     return dict(start=_clock(start),end=_clock(end),hour=start.hour,sort=start,state=state,label=label,minutes=mins,type=s.get("consultation_type_name") or "Consultation",
-                fee=_money(s.get("fee")),capacity=cap,booked=booked,free=max(cap-booked-held,0),details=[(k,v) for k,v in details if v not in (None,"")])
+                fee=_money(s.get("fee")),capacity=cap,booked=booked,free=max(cap-booked-held,0),details=[(k,v) for k,v in details if v not in (None,"")],
+                slot_hex=sid[5:] if cancellable else None,cancellable=cancellable)
 def appointment_card(a,zone):
     start=_utc(a["start_at"]).astimezone(zone); end=_utc(a["end_at"]).astimezone(zone) if a.get("end_at") else None
     status=str(a.get("status") or "").replace("_"," ").title() or "Scheduled"
@@ -477,6 +482,24 @@ def schedule():
             sched["appointments"]=appts
     except ValueError: pass
     return render_dashboard("schedule",sched=sched)
+@app.post("/schedule/slots/cancel")
+def schedule_cancel_slot():
+    """Milestone 5: the doctor cancels one slot. Every patient booked in it is cancelled with a 100% refund (booking API)."""
+    slot_hex=request.form.get("slot","")
+    day=request.form.get("date","")
+    back="/schedule?date="+day if re.fullmatch(r"\d{4}-\d{2}-\d{2}",day) else "/?m=schedule"
+    if not re.fullmatch(r"[0-9a-f]{40}",slot_hex) or request.form.get("confirm")!="yes":
+        notify("Tick the confirmation box to cancel the slot.","error")
+        return redirect(back)
+    reason=" ".join(request.form.get("reason","").split())[:255]
+    r=api("POST",f"/doctors/me/slots/{slot_hex}/cancel",json={"reason":reason} if reason else {})
+    if r.ok:
+        n=r.json().get("cancelledAppointments",0)
+        notify("Slot cancelled."+(f" {n} patient{'s' if n!=1 else ''} refunded in full." if n else " Nobody was booked in it."),"success")
+    else:
+        app.logger.warning("slot cancel failed: HTTP %s %s",r.status_code,r.text[:300])
+        notify(f"Slot not cancelled: {api_message(r)}","error")
+    return redirect(back)
 patient_portal.init(app,api=api,notify=notify,api_message=api_message,read_json=read_json,photo_bucket=photo_bucket,HOSPITALS=HOSPITALS,SPECIALIZATIONS=SPECIALIZATIONS)
 if __name__=="__main__":
     # Production runs under gunicorn behind an approved HTTPS reverse proxy.

@@ -278,6 +278,41 @@ Resources:
       Type: String
       Value: '7'
 
+  # ---- Milestone 5: booking rules. Change a value here (or in the console) and the booking Lambda picks it up
+  # within 60 seconds - no redeploy. Refund tiers: a tier applies when the cancellation is made at least
+  # minHoursBefore hours before the appointment start (inclusive). The last tier must have minHoursBefore 0.
+  BookingRefundPolicyParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/medislot/${Environment}/booking/refund-policy'
+      Type: String
+      Description: Refund tiers for patient cancellations (JSON). Doctor cancellations always refund 100 percent.
+      Value: '{"tiers":[{"name":"FULL","minHoursBefore":24,"refundPercent":100},{"name":"PARTIAL","minHoursBefore":2,"refundPercent":50},{"name":"NONE","minHoursBefore":0,"refundPercent":0}]}'
+
+  BookingMaxActiveParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/medislot/${Environment}/booking/max-active-appointments'
+      Type: String
+      Description: Most upcoming CONFIRMED appointments one patient may hold at once.
+      Value: '3'
+
+  BookingMaxPerDoctorPerDayParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/medislot/${Environment}/booking/max-per-doctor-per-day'
+      Type: String
+      Description: Most CONFIRMED appointments one patient may hold with the same doctor on one local day.
+      Value: '1'
+
+  BookingMaxConflictRetriesParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/medislot/${Environment}/booking/max-conflict-retries'
+      Type: String
+      Description: Bounded retries when the optimistic-concurrency write on a slot loses a race (then 409 SLOT_BUSY).
+      Value: '10'
+
 Outputs:
   DBEndpoint:
     Value: !GetAtt MediSlotDatabase.Endpoint.Address

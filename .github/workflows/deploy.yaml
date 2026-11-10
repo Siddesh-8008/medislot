@@ -17,6 +17,7 @@ on:
       - "web/**"
       - "MILESTONE3.md"
       - "MILESTONE4.md"
+      - "MILESTONE5.md"
   workflow_dispatch:
 
 permissions:
@@ -51,6 +52,12 @@ jobs:
 
       - name: Install test dependencies
         run: pip install -r requirements-dev.txt
+
+      - name: "Milestone 5 mandatory tests: concurrency (20+ bookings, capacity 3) and idempotency"
+        env:
+          AWS_REGION: ap-south-1
+          AWS_DEFAULT_REGION: ap-south-1
+        run: pytest -v tests/test_milestone5.py -k "mandatory1 or mandatory2"
 
       - name: Unit tests
         env:
@@ -177,7 +184,7 @@ jobs:
           set -euo pipefail
           AWS_ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
           BUCKET="medislot-${ENVIRONMENT}-artifacts-${AWS_ACCOUNT_ID}"
-          for fn in authentication authorizer rds_check doctor_domain slot_materialiser patient_domain doctor_discovery; do
+          for fn in authentication authorizer rds_check doctor_domain slot_materialiser patient_domain doctor_discovery booking; do
             tmp="$(mktemp -d)"
             cp -R "lambdas/${fn}/." "$tmp/"
             cp "lambdas/common.py" "$tmp/common.py"
@@ -349,7 +356,7 @@ jobs:
           missing = body.get("missing_indexes")
           assert missing is not None, "rds-connection-check did not report indexes: " + json.dumps(result)[:500]
           if missing:
-              raise SystemExit("Missing indexes: " + ", ".join(missing) + ". Run scehma/milestone4_indexes.sql on the database (or recreate the tables from scehma/schema.sql) and re-run.")
+              raise SystemExit("Missing indexes: " + ", ".join(missing) + ". Recreate the tables from scehma/schema.sql (the single schema file) and re-run.")
           print("All required indexes are present.")
           '
 
@@ -361,4 +368,6 @@ jobs:
             --query "Stacks[0].Outputs[?OutputKey=='ApiUrl'].OutputValue | [0]" --output text)"
           [[ -n "$API_URL" && "$API_URL" != "None" ]] || { echo "::error::Could not find ApiUrl output on the auth stack."; exit 1; }
           python -m pip install --quiet pytest==8.3.5 requests==2.32.4
+          # Includes the Milestone 5 mandatory tests against the live stack (tests/integration/test_booking_live_api.py):
+          # 20+ parallel bookings on a capacity-3 slot and an idempotency-key replay.
           MEDISLOT_API_BASE="${API_URL%/}" python -m pytest tests/integration -v

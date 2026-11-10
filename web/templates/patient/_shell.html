@@ -8,7 +8,7 @@
   <div class="me"><div><small>Signed in as patient</small><strong>{{ display_name or 'Patient' }}</strong></div><a href="/logout">Log out</a></div>
  </aside>
  <main class="content">
-  {% if page!='doctor' %}{% for key,label,ic,acc,href,desc in nav if key==active %}
+  {% if page not in ('doctor','appointment') %}{% for key,label,ic,acc,href,desc in nav if key==active %}
   <header class="mod-head" style="--acc:{{acc}}"><span class="chip-ic">{{ icon(ic) }}</span><div><h1>{{label}}</h1><p>{{desc}}</p></div></header>
   {% endfor %}{% endif %}
   {{ banners() }}
@@ -17,11 +17,12 @@
   <section class="hello"><div><h2>{{ greeting }}{{ ', '+profile.firstName if profile }}</h2><p>Find a doctor by name, hospital, specialization or city, and see which time slots are free.</p></div></section>
   <ul class="todo">
    <li><a href="/patient/doctors"><span class="tick" style="background:#2563b8;border-color:#2563b8">{{ icon('search') }}</span><span class="t"><b>Find a doctor</b><span>Search with any mix of filters and browse their free slots.</span></span><span class="go">Start →</span></a></li>
+   <li><a href="/patient/appointments"><span class="tick" style="background:#1f7a4d;border-color:#1f7a4d">{{ icon('calendar') }}</span><span class="t"><b>My appointments</b><span>See what you have booked, or cancel with a refund.</span></span><span class="go">Open →</span></a></li>
    <li><a href="/patient/profile"><span class="tick" style="background:#7a4fd6;border-color:#7a4fd6">{{ icon('user') }}</span><span class="t"><b>Check your profile</b><span>Keep your phone number and details up to date.</span></span><span class="go">Open →</span></a></li>
   </ul>
   {% if profile %}<div class="tiles"><div class="tile"><small>Name</small><strong style="font-size:22px;padding-top:10px">{{ profile.firstName }} {{ profile.lastName }}</strong></div><div class="tile"><small>Phone</small><strong style="font-size:22px;padding-top:10px">{{ profile.phone or '—' }}</strong></div></div>
   {% else %}<div class="banner error" style="margin-top:28px"><span>Your profile could not be loaded right now. Please refresh in a moment.</span></div>{% endif %}
-  <p class="soon">Booking an appointment opens in the next release. For now you can search doctors and see their free slots.</p>
+  <p class="soon">Pick a doctor, choose a free slot and press <b>Book</b>. Cancelling well ahead of time gets you a bigger refund.</p>
 
 {% elif page=='profile' %}
   {% if not profile and not form %}
@@ -105,14 +106,71 @@
       <div class="cards">{% for s in grp.cards %}
        <article class="slot {{s.state}}"><div class="top"><div class="time">{{s.start}}<small>to {{s.end}} · {{s.minutes}} min</small></div><span class="chip">{{s.label}}</span></div>
         <div class="what">{{s.type}}</div>
-        <div class="facts">{% if s.fee %}<span>Fee <b>{{s.fee}}</b></span>{% endif %}<span>{{s.seats}}</span></div></article>{% endfor %}</div>
+        <div class="facts">{% if s.fee %}<span>Fee <b>{{s.fee}}</b></span>{% endif %}<span>{{s.seats}}</span></div>
+        {% if s.bookable %}<form method="post" action="/patient/book" class="bookform" onsubmit="var b=this.querySelector('button');b.disabled=true;b.textContent='Booking…'"><input type="hidden" name="slotId" value="{{s.id}}"><input type="hidden" name="key" value="{{s.key}}"><input type="hidden" name="back" value="{{ here }}">{% if family %}<label class="for">Booking for<select name="dependentId"><option value="">Me</option>{% for f in family %}<option value="{{f.id}}">{{f.name}} ({{f.relation}})</option>{% endfor %}</select></label>{% endif %}<button>Book this slot</button></form>{% endif %}</article>{% endfor %}</div>
      {% endfor %}
     {% endfor %}
     {% if empty_days %}<p class="quiet" style="margin-top:26px">No slots on: {{ empty_days|join(', ') }}.</p>{% endif %}
    {% else %}<div class="empty" style="margin-top:20px"><b>No slots in this date range</b>Try another week or choose “All types”{% if only_free %} and untick “Free only”{% endif %}.</div>{% endif %}
    <div class="winnav"><span>{% if prev_url %}<a class="btn ghost" href="{{prev_url}}">← Earlier</a>{% endif %}</span><span>{% if next_url %}<a class="btn ghost" href="{{next_url}}">Later →</a>{% endif %}</span></div>
-   <p class="soon">Booking opens in the next release. Free seats shown here are live.</p>
+   <p class="soon">Free seats shown here are live. Pressing <b>Book</b> twice never books twice. Booking for a parent or child? <a href="/patient/family">Add them as a family member</a> and pick them under “Booking for”.</p>
   {% endif %}
+  {% endif %}
+{% elif page=='appointments' %}
+  <nav class="tabs" aria-label="Appointment lists">{% for k,lbl in (('upcoming','Upcoming'),('past','Past'),('cancelled','Cancelled')) %}<a href="/patient/appointments?tab={{k}}" class="{{ 'on' if tab==k }}">{{lbl}}</a>{% endfor %}</nav>
+  {% if error %}<div class="banner error" style="margin-top:20px"><span>{{ error }}</span></div>
+  {% elif items %}
+   <div class="appts">{% for a in items %}
+    <a class="appt-card" href="/patient/appointments/{{a.id}}"><div class="top"><div><b>{{a.when}}</b><small>{{a.type}}{% if a.minutes %} · {{a.minutes}} min{% endif %}</small></div><span class="pill {{a.tone}}">{{a.status}}</span></div>
+     <div class="who">For <b>{{ a.for or 'you' }}</b></div>
+     <div class="meta"><span>{{a.doctor}}</span><span>{{a.hospital}}{% if a.city %} · {{a.city}}{% endif %}</span></div>
+     <div class="foot"><span>Fee <b>{{a.fee}}</b></span>{% if a.refund %}<span>Refunded <b>{{a.refund.amount}}</b></span>{% elif a.preview %}<span class="quiet">Cancel now: {{a.preview.amount}} back</span>{% endif %}</div></a>{% endfor %}</div>
+   {% if prev_url or next_url %}<div class="winnav"><span>{% if prev_url %}<a class="btn ghost" href="{{prev_url}}">← Previous</a>{% endif %}</span><span>{% if next_url %}<a class="btn ghost" href="{{next_url}}">Next →</a>{% endif %}</span></div>{% endif %}
+  {% else %}<div class="empty" style="margin-top:20px"><b>{{ 'No upcoming appointments' if tab=='upcoming' else 'Nothing here yet' }}</b>{% if tab=='upcoming' %}<a href="/patient/doctors">Find a doctor</a> and book a free slot.{% else %}Appointments will show up here.{% endif %}</div>{% endif %}
+
+{% elif page=='appointment' %}
+  <a class="crumb" href="/patient/appointments">← My appointments</a>
+  <section class="dochero"><div><span class="pill {{a.tone}}">{{a.status}}</span><h1 style="margin-top:10px">{{a.when}}</h1><div class="spec">{{a.type}}{% if a.minutes %} · {{a.minutes}} min{% endif %}</div>
+   <dl class="kv"><dt>Patient</dt><dd>{{ a.for or 'You' }}</dd><dt>Doctor</dt><dd><a href="/patient/doctors/{{a.doctor_id}}">{{a.doctor}}</a></dd><dt>Hospital</dt><dd>{{a.hospital}}{% if a.city %}, {{a.city}}{% endif %}</dd>
+    <dt>Fee paid</dt><dd>{{a.fee}}</dd><dt>Times</dt><dd>{{a.tz}}</dd><dt>Reference</dt><dd>#{{a.id}}</dd></dl></div></section>
+  {% if a.refund %}
+   <section class="panel"><h2>Refund</h2><dl class="kv"><dt>Refunded</dt><dd><b>{{a.refund.amount}}</b> ({{a.refund.refundPercent}}%)</dd><dt>Not refunded</dt><dd>{{a.refund.deducted}}</dd>
+    <dt>Why</dt><dd>{{ 'The doctor cancelled this slot - always a full refund.' if a.refund.reason=='DOCTOR_CANCEL' else 'Refund tier: ' ~ a.refund.tier|replace('_',' ')|title }}</dd></dl></section>
+  {% elif a.cancellable %}
+   <details class="panel danger"><summary>Cancel this appointment</summary>
+    {% if a.preview %}<p class="lead" style="margin-top:14px">Cancel now and get <b>{{a.preview.amount}}</b> back ({{a.preview.refundPercent}}%){% if a.preview.until and a.preview.refundPercent>0 %} - this applies until {{a.preview.until}}{% endif %}.</p>{% endif %}
+    <form method="post" action="/patient/appointments/{{a.id}}/cancel" onsubmit="return confirm('Cancel this appointment?')">
+     <label class="check"><input type="checkbox" name="confirm" value="yes" required> I want to cancel this appointment</label>
+     <button class="danger-btn">Cancel appointment</button></form></details>
+  {% endif %}
+
+{% elif page=='refunds' %}
+  {% if error %}<div class="banner error"><span>{{ error }}</span></div>
+  {% else %}
+   <div class="tiles" style="margin-top:0"><div class="tile"><small>Total refunded</small><strong>{{ total_refunded or '₹0' }}</strong></div><div class="tile"><small>Not refunded</small><strong>{{ total_deducted or '₹0' }}</strong></div><div class="tile"><small>Refunds</small><strong>{{ result.total if result else 0 }}</strong></div></div>
+   {% if items %}<div class="tbl-wrap" style="margin-top:28px"><table><thead><tr><th>Appointment</th><th>For</th><th>Doctor</th><th>Fee</th><th>Refund</th><th>Tier</th><th>Calculated</th></tr></thead><tbody>
+    {% for i in items %}<tr><td><a href="/patient/appointments/{{i.appointment_id}}">{{i.when}}</a><br><small class="quiet">{{i.type}}</small></td><td>{{i.for}}</td><td>{{i.doctor}}</td><td>{{i.fee}}</td><td><b>{{i.amount}}</b> ({{i.percent}}%)</td><td>{{ 'Doctor cancelled' if i.by_doctor else i.tier }}</td><td>{{i.on or ''}}</td></tr>{% endfor %}
+   </tbody></table></div>
+   {% if prev_url or next_url %}<div class="winnav"><span>{% if prev_url %}<a class="btn ghost" href="{{prev_url}}">← Previous</a>{% endif %}</span><span>{% if next_url %}<a class="btn ghost" href="{{next_url}}">Next →</a>{% endif %}</span></div>{% endif %}
+   {% else %}<div class="empty" style="margin-top:28px"><b>No refunds yet</b>When you cancel an appointment, the refund is shown here.</div>{% endif %}
+  {% endif %}
+{% elif page=='family' %}
+  {% if error %}<div class="banner error"><span>{{ error }}</span></div>{% endif %}
+  <div class="cols wide-left"><section class="panel"><h2>Your family members</h2><p class="lead">Book appointments for them from your own account. Each person can have their own appointment at the same time as you.</p>
+   {% if members %}<div class="fam">{% for m in members %}<div class="fam-row"><span class="pic">{{ m.firstName[:1] }}{{ m.lastName[:1] }}</span><div><b>{{m.displayName}}</b><small>{{m.relation}} · born {{m.dateOfBirth}}{% if m.upcomingAppointments %} · {{m.upcomingAppointments}} upcoming appointment{{ '' if m.upcomingAppointments==1 else 's' }}{% endif %}</small></div>
+    {% if m.upcomingAppointments %}<span class="quiet">Cancel their appointments to remove</span>{% else %}<form method="post" action="/patient/family/{{m.dependentId}}/remove" onsubmit='return confirm({{ ("Remove " ~ m.firstName ~ " from your family members?")|tojson }})'><button class="ghost">Remove</button></form>{% endif %}</div>{% endfor %}</div>
+   {% elif not error %}<div class="empty"><b>No family members yet</b>Add someone below to book appointments for them.</div>{% endif %}
+  </section>
+  <aside class="side-note"><h3>Good to know</h3><ul><li>Up to {{ max_members }} family members per account.</li><li>Your upcoming-appointment limit covers everyone you book for.</li><li>Doctors see the family member's name, not your contact details.</li></ul></aside></div>
+  {% if members|length < max_members %}
+  <section class="panel" style="margin-top:28px"><h2>Add a family member</h2>
+   <form method="post" action="/patient/family"><div class="fgrid">
+    <label>First name<span class="req">*</span><input name="firstName" maxlength="75" value="{{ form.get('firstName','') }}" required></label>
+    <label>Last name<span class="req">*</span><input name="lastName" maxlength="75" value="{{ form.get('lastName','') }}" required></label>
+    <label>Relation<span class="req">*</span><select name="relation" required><option value="">Choose…</option>{% for r in relations %}<option value="{{r}}" {{ 'selected' if form.get('relation')==r }}>{{r}}</option>{% endfor %}</select></label>
+    <label>Date of birth<span class="req">*</span><input name="dateOfBirth" type="date" max="{{ today }}" value="{{ form.get('dateOfBirth','') }}" required></label>
+    <label class="span2">Gender<span class="opt">optional</span><select name="gender"><option value="">Prefer not to say here</option>{% for g in genders %}<option value="{{g}}" {{ 'selected' if form.get('gender')==g }}>{{g}}</option>{% endfor %}</select></label>
+   </div><button>Add family member</button></form></section>
   {% endif %}
 {% endif %}
  </main>

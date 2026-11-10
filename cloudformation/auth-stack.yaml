@@ -75,6 +75,17 @@ Resources:
     Properties:
       LogGroupName: !Sub '/medislot/${Environment}/lambda/doctor-discovery'
       RetentionInDays: !Ref LogRetentionDays
+  BookingLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/medislot/${Environment}/lambda/booking'
+      RetentionInDays: !Ref LogRetentionDays
+  # Every booking-domain event on the bus is also written here, so published events can be inspected.
+  BookingEventsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/events/medislot-${Environment}-booking'
+      RetentionInDays: !Ref LogRetentionDays
   ApiAccessLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
@@ -489,6 +500,134 @@ Resources:
       Action: lambda:InvokeFunction
       Principal: apigateway.amazonaws.com
       SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*/*/doctors/*'
+  # ---- Milestone 5: booking engine (one Lambda for booking, listing, cancellation and refunds).
+  # EventBridge bus for domain events (AppointmentBooked, AppointmentCancelled, SlotSeatFreed, SlotCancelled).
+  BookingEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Sub 'medislot-${Environment}-events'
+  BookingEventsLogPolicy:
+    Type: AWS::Logs::ResourcePolicy
+    Properties:
+      PolicyName: !Sub 'medislot-${Environment}-booking-events-to-logs'
+      PolicyDocument: !Sub '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":["events.amazonaws.com","delivery.logs.amazonaws.com"]},"Action":["logs:CreateLogStream","logs:PutLogEvents"],"Resource":"arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/events/medislot-${Environment}-booking:*"}]}'
+  BookingEventsToLogsRule:
+    Type: AWS::Events::Rule
+    DependsOn: BookingEventsLogPolicy
+    Properties:
+      Name: !Sub 'medislot-${Environment}-booking-events-to-logs'
+      Description: Copy every MediSlot booking event to CloudWatch Logs for verification and audit.
+      EventBusName: !Ref BookingEventBus
+      State: ENABLED
+      EventPattern:
+        source: [medislot.booking]
+      Targets:
+        - Id: booking-events-log
+          Arn: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/events/medislot-${Environment}-booking'
+  BookingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'MediSlot-${Environment}-BookingRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns: [!Ref LambdaExecutionBasePolicy]
+      Policies:
+        - PolicyName: BookingRuntimeAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [ssm:GetParameter, ssm:GetParameters]
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/medislot/${Environment}/db/*'
+                  - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/medislot/${Environment}/booking/*'
+              - Effect: Allow
+                Action: [kms:Decrypt]
+                Resource: '*'
+              # Slot seat counters: read (consistent) and conditional updates only. No Put/Delete on slots.
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:UpdateItem]
+                Resource: !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/MediSlot-${Environment}-Slots'
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem]
+                Resource: !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/MediSlot-${Environment}-Idempotency'
+              - Effect: Allow
+                Action: [events:PutEvents]
+                Resource: !GetAtt BookingEventBus.Arn
+  BookingFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'medislot-${Environment}-booking'
+      Description: Booking engine - optimistic concurrency on slots, idempotency, cancellations and refunds.
+      LoggingConfig:
+        LogFormat: Text
+        LogGroup: !Ref BookingLogGroup
+      Runtime: python3.12
+      Handler: lambda_function.handler
+      Role: !GetAtt BookingRole.Arn
+      Timeout: 25
+      MemorySize: 512
+      TracingConfig: {Mode: Active}
+      Code: {S3Bucket: !Ref ArtifactBucket, S3Key: !Sub '${ArtifactPrefix}/booking.zip'}
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          EVENT_BUS_NAME: !Ref BookingEventBus
+          SLOTS_TABLE: !Sub 'MediSlot-${Environment}-Slots'
+          IDEMPOTENCY_TABLE: !Sub 'MediSlot-${Environment}-Idempotency'
+      VpcConfig:
+        SecurityGroupIds: [!ImportValue {Fn::Sub: 'MediSlot-${Environment}-LambdaSecurityGroupId'}]
+        SubnetIds:
+          - !ImportValue {Fn::Sub: 'MediSlot-${Environment}-PrivateSubnet1Id'}
+          - !ImportValue {Fn::Sub: 'MediSlot-${Environment}-PrivateSubnet2Id'}
+  BookingAppointmentsInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref BookingFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*/*/appointments*'
+  BookingSlotCancelInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref BookingFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*/POST/doctors/me/slots/*'
+  BookingDependentsInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref BookingFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*/*/patients/me/dependents*'
+  BookingRefundsInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref BookingFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*/GET/patients/me/refunds'
+  # The checkpoint review: is contention really happening, and how are cancellations distributed across tiers?
+  BookingMetricsDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub 'medislot-${Environment}-booking'
+      DashboardBody: !Sub |
+        {"widgets":[
+         {"type":"metric","x":0,"y":0,"width":12,"height":6,"properties":{"title":"BookingConflictRetries (sum = retries, samples = booking attempts)","region":"${AWS::Region}","stat":"Sum","period":60,"view":"timeSeries",
+          "metrics":[["MediSlot","BookingConflictRetries","Environment","${Environment}",{"label":"retries (Sum)"}],["...",{"stat":"SampleCount","label":"attempts that raced (SampleCount)"}],["...",{"stat":"Maximum","label":"max retries in one booking"}]]}},
+         {"type":"metric","x":12,"y":0,"width":12,"height":6,"properties":{"title":"Bookings confirmed vs rejected (by reason)","region":"${AWS::Region}","stat":"Sum","period":60,"view":"timeSeries",
+          "metrics":[["MediSlot","BookingsConfirmed","Environment","${Environment}"],[{"expression":"SEARCH('{MediSlot,Environment,Reason} MetricName=\"BookingsRejected\" Environment=\"${Environment}\"', 'Sum', 60)","id":"rej","label":""}]]}},
+         {"type":"metric","x":0,"y":6,"width":12,"height":6,"properties":{"title":"CancellationsByTier","region":"${AWS::Region}","stat":"Sum","period":300,"view":"bar",
+          "metrics":[[{"expression":"SEARCH('{MediSlot,Environment,Tier} MetricName=\"CancellationsByTier\" Environment=\"${Environment}\"', 'Sum', 300)","id":"tiers","label":""}]]}},
+         {"type":"metric","x":12,"y":6,"width":12,"height":6,"properties":{"title":"Things that must stay at zero","region":"${AWS::Region}","stat":"Sum","period":300,"view":"timeSeries",
+          "metrics":[["MediSlot","EventPublishFailures","Environment","${Environment}"],["MediSlot","SeatReleaseFailures","Environment","${Environment}"],["MediSlot","IdempotentReplays","Environment","${Environment}"]]}}
+        ]}
   # ---- Doctor dashboard endpoints: every path and HTTP method is its own API Gateway method in this
   # same REST API (same stage, same authorizer as /auth/*, /doctor and /patient). All of them
   # invoke the doctor-domain Lambda, which checks that the caller has the DOCTOR role.
@@ -971,6 +1110,183 @@ Resources:
         IntegrationHttpMethod: POST
         Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DoctorDiscoveryFunction.Arn}/invocations'
 
+  # ---- Milestone 5 endpoints -> booking Lambda (role checks inside the Lambda; ids always from the token).
+  AppointmentsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !GetAtt RestApi.RootResourceId
+      PathPart: 'appointments'
+  AppointmentIdResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref AppointmentsResource
+      PathPart: '{appointmentId}'
+  AppointmentCancelResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref AppointmentIdResource
+      PathPart: 'cancel'
+  DoctorsMeSlotsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref DoctorsMeResource
+      PathPart: 'slots'
+  DoctorsMeSlotIdResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref DoctorsMeSlotsResource
+      PathPart: '{slotId}'
+  DoctorsMeSlotCancelResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref DoctorsMeSlotIdResource
+      PathPart: 'cancel'
+  PatientsMeRefundsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref PatientsMeResource
+      PathPart: 'refunds'
+  AppointmentsPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref AppointmentsResource
+      HttpMethod: POST
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BookingFunction.Arn}/invocations'
+  AppointmentsGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref AppointmentsResource
+      HttpMethod: GET
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BookingFunction.Arn}/invocations'
+  AppointmentIdGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref AppointmentIdResource
+      HttpMethod: GET
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BookingFunction.Arn}/invocations'
+  AppointmentCancelPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref AppointmentCancelResource
+      HttpMethod: POST
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BookingFunction.Arn}/invocations'
+  DoctorsMeSlotCancelPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref DoctorsMeSlotCancelResource
+      HttpMethod: POST
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BookingFunction.Arn}/invocations'
+  PatientsMeRefundsGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref PatientsMeRefundsResource
+      HttpMethod: GET
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BookingFunction.Arn}/invocations'
+
+  # Family members (people a patient books for) -> booking Lambda.
+  PatientsMeDependentsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref PatientsMeResource
+      PathPart: 'dependents'
+  PatientsMeDependentIdResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref PatientsMeDependentsResource
+      PathPart: '{dependentId}'
+  PatientsMeDependentsGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref PatientsMeDependentsResource
+      HttpMethod: GET
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BookingFunction.Arn}/invocations'
+  PatientsMeDependentsPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref PatientsMeDependentsResource
+      HttpMethod: POST
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BookingFunction.Arn}/invocations'
+  PatientsMeDependentIdPatchMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref PatientsMeDependentIdResource
+      HttpMethod: PATCH
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BookingFunction.Arn}/invocations'
+  PatientsMeDependentIdDeleteMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref PatientsMeDependentIdResource
+      HttpMethod: DELETE
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BookingFunction.Arn}/invocations'
   PatientProtectedMethod:
     Type: AWS::ApiGateway::Method
     Properties:
@@ -1059,9 +1375,19 @@ Resources:
     Properties: {FunctionName: !Ref ProtectedFunction, Action: lambda:InvokeFunction, Principal: apigateway.amazonaws.com, SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*/GET/*'}
   # NOTE: API Gateway only publishes a NEW snapshot when this resource is REPLACED. Changing its Description does not.
   # So the logical ID carries the milestone: rename it (ApiDeploymentM5, ...) whenever routes are added or changed.
-  ApiDeploymentM4:
+  ApiDeploymentM5Family:
     Type: AWS::ApiGateway::Deployment
     DependsOn:
+      - PatientsMeDependentsGetMethod
+      - PatientsMeDependentsPostMethod
+      - PatientsMeDependentIdPatchMethod
+      - PatientsMeDependentIdDeleteMethod
+      - AppointmentsPostMethod
+      - AppointmentsGetMethod
+      - AppointmentIdGetMethod
+      - AppointmentCancelPostMethod
+      - DoctorsMeSlotCancelPostMethod
+      - PatientsMeRefundsGetMethod
       - PatientProtectedMethod
       - DoctorProtectedMethod
       - DoctorsMeGetMethod
@@ -1106,7 +1432,7 @@ Resources:
     Type: AWS::ApiGateway::Stage
     Properties:
       RestApiId: !Ref RestApi
-      DeploymentId: !Ref ApiDeploymentM4
+      DeploymentId: !Ref ApiDeploymentM5Family
       StageName: !Ref Environment
       TracingEnabled: true
       AccessLogSetting:
@@ -1132,6 +1458,19 @@ Outputs:
   SlotMaterialiserFunctionName: {Value: !Ref SlotMaterialiserFunction}
   PatientDomainFunctionName: {Value: !Ref PatientDomainFunction}
   DoctorDiscoveryFunctionName: {Value: !Ref DoctorDiscoveryFunction}
+  BookingFunctionName: {Value: !Ref BookingFunction}
+  BookingEventBusName:
+    Description: EventBridge bus that receives AppointmentBooked / AppointmentCancelled / SlotSeatFreed / SlotCancelled.
+    Value: !Ref BookingEventBus
+  BookingEventBusArn:
+    Value: !GetAtt BookingEventBus.Arn
+    Export: {Name: !Sub 'MediSlot-${Environment}-BookingEventBusArn'}
+  BookingEventsLogGroupName:
+    Description: Every booking event published to the bus is copied here.
+    Value: !Ref BookingEventsLogGroup
+  BookingMetricsDashboardName:
+    Description: CloudWatch dashboard with BookingConflictRetries and CancellationsByTier.
+    Value: !Ref BookingMetricsDashboard
   AuthenticationFunctionName: {Value: !Ref AuthenticationFunction}
   AuthorizerFunctionName: {Value: !Ref AuthorizerFunction}
   RdsConnectionCheckFunctionName: {Value: !Ref RdsConnectionCheckFunction}

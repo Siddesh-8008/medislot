@@ -39,6 +39,20 @@
 .danger{border-color:#f2c4bf;background:#fffaf9}.danger summary{color:var(--err)}
 button.danger-btn{background:var(--err)}button.danger-btn:hover{background:#8c1d17}
 .quiet{color:var(--muted);font-size:14px}
+/* Milestone 5: booking, appointments, refunds */
+.bookform{margin:2px 0 0}.bookform button{width:100%;padding:10px 14px;font-size:14px}.bookform button:disabled{opacity:.6;cursor:wait}
+.tabs{display:inline-flex;gap:4px;border:1.5px solid var(--line);border-radius:14px;padding:4px;background:var(--paper)}
+.tabs a{padding:9px 18px;border-radius:10px;text-decoration:none;color:var(--muted);font-weight:600;font-size:14px}.tabs a.on{background:var(--ink);color:#fff}
+.appts{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:16px;margin-top:22px}
+.appt-card{background:var(--paper);border:1px solid var(--line);border-radius:var(--r);padding:18px;display:grid;gap:12px;text-decoration:none;color:var(--ink)}
+.appt-card:hover{border-color:var(--teal)}.appt-card .top{display:flex;justify-content:space-between;gap:10px;align-items:flex-start}
+.appt-card .top b{display:block;font:600 18px var(--serif)}.appt-card small{color:var(--muted)}
+.appt-card .meta{display:grid;gap:2px;font-size:14px;color:var(--muted)}
+.bookform .for{display:grid;gap:4px;font-size:12.5px;font-weight:600;color:var(--muted);margin-bottom:8px}.bookform select{padding:7px 10px;font-size:13.5px}
+.appt-card .who{font-size:14px;color:var(--muted)}.appt-card .who b{color:var(--ink)}
+.fam{display:grid;gap:10px}.fam-row{display:flex;align-items:center;gap:14px;border:1px solid var(--line);border-radius:14px;padding:12px 14px;background:#fff}
+.fam-row>div{flex:1;display:grid}.fam-row small{color:var(--muted)}.fam-row .pic{width:44px;height:44px;font-size:16px}.fam-row form{margin:0}.fam-row button{padding:8px 14px;font-size:13.5px}
+.appt-card .foot{display:flex;justify-content:space-between;gap:10px;border-top:1px solid var(--line);padding-top:10px;font-size:14px}
 @media(max-width:1020px){.searchbar,.slotbar{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media(max-width:560px){.searchbar,.slotbar{grid-template-columns:minmax(0,1fr)}.searchbar .span2{grid-column:auto}.dochero{flex-direction:column;align-items:flex-start}}
 </style>

@@ -8,6 +8,8 @@ Creates all MediSlot tables and inserts reference data during deployment.
 - Inserts hospitals.
 - Inserts specializations.
 - Inserts four standard consultation types.
+- Creates the Milestone 5 patient_dependents, appointments and refund_ledger tables if missing, and upgrades an
+  appointments table created by the first Milestone 5 build (before family members) in place.
 - Verifies all required tables.
 - Never deletes existing application records.
 """
@@ -29,6 +31,9 @@ REQUIRED_TABLES = {
     "doctor_consultation_types",
     "availability_patterns",
     "blackout_dates",
+    "patient_dependents",
+    "appointments",
+    "refund_ledger",
 }
 
 
@@ -36,7 +41,7 @@ REQUIRED_TABLES = {
 # 0. INDEXES THE PATIENT SEARCH RELIES ON (Milestone 4)
 # ---------------------------------------------------------
 # Used only to REPORT whether the deployed database has them (the CI pipeline fails with a clear message if
-# not). Nothing here creates or alters an index: existing databases get them from scehma/milestone4_indexes.sql.
+# not). Nothing here creates or alters a Milestone 4 index: recreate the tables from scehma/schema.sql.
 REQUIRED_INDEXES = {
     "doctors": {
         "ix_doctors_spec_hospital": ("specialization_id", "hospital_id"),
@@ -49,6 +54,22 @@ REQUIRED_INDEXES = {
     },
     "doctor_consultation_types": {
         "ix_doctor_consultation_active": ("doctor_id", "is_active", "fee"),
+    },
+    # Milestone 5: booking, limits, schedule and slot-cancellation queries, plus the duplicate backstops.
+    "appointments": {
+        "uq_appointments_idempotency_key": ("idempotency_key",),
+        "uq_appointments_active_patient_slot": ("active_patient_slot",),
+        "ix_appointments_patient_start": ("patient_id", "start_at"),
+        "ix_appointments_doctor_start": ("doctor_id", "start_at"),
+        "ix_appointments_slot_status": ("slot_id", "status"),
+        "ix_appointments_patient_doctor_status_start": ("patient_id", "doctor_id", "status", "start_at"),
+        "ix_appointments_dependent": ("dependent_id",),
+    },
+    "patient_dependents": {
+        "ix_dependents_patient_active": ("patient_id", "is_active"),
+    },
+    "refund_ledger": {
+        "uq_refund_ledger_appointment": ("appointment_id",),
     },
 }
 
@@ -266,6 +287,124 @@ CREATE_TABLES = [
             REFERENCES doctors(doctor_id)
     ) ENGINE=InnoDB
     """,
+
+    # PATIENT DEPENDENTS / family members (Milestone 5) - identical to scehma/schema.sql.
+    """
+    CREATE TABLE IF NOT EXISTS patient_dependents (
+        dependent_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        patient_id BIGINT UNSIGNED NOT NULL COMMENT 'The account holder who manages and books for this person',
+        first_name VARCHAR(75) NOT NULL,
+        last_name VARCHAR(75) NOT NULL,
+        relation VARCHAR(20) NOT NULL,
+        date_of_birth DATE NOT NULL,
+        gender VARCHAR(30) NULL,
+        is_active TINYINT(1) NOT NULL DEFAULT 1,
+        created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+        updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+            ON UPDATE CURRENT_TIMESTAMP(6),
+        PRIMARY KEY (dependent_id),
+        -- "My family members" list and the per-account limit. Also serves fk_dependents_patient.
+        KEY ix_dependents_patient_active (patient_id, is_active),
+        CONSTRAINT fk_dependents_patient FOREIGN KEY (patient_id)
+            REFERENCES patients(patient_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
+        CONSTRAINT chk_dependents_relation CHECK (relation IN ('Mother', 'Father', 'Spouse', 'Child', 'Sibling', 'Grandparent', 'Grandchild', 'Other'))
+    ) ENGINE=InnoDB
+    """,
+
+    # APPOINTMENTS (Milestone 5) - identical to scehma/schema.sql.
+    """
+    CREATE TABLE IF NOT EXISTS appointments (
+        appointment_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        patient_id BIGINT UNSIGNED NOT NULL,
+        doctor_id BIGINT UNSIGNED NOT NULL,
+        consultation_type_id INT UNSIGNED NOT NULL,
+        slot_id VARCHAR(100) NOT NULL COMMENT 'DynamoDB Slots.slot_id; not a SQL foreign key',
+        start_at DATETIME(6) NOT NULL COMMENT 'UTC instant',
+        end_at DATETIME(6) NOT NULL COMMENT 'UTC instant',
+        fee_snapshot DECIMAL(10,2) NOT NULL COMMENT 'Fee at booking time; later price changes never alter it',
+        status ENUM('CONFIRMED','COMPLETED','CANCELLED_BY_PATIENT','CANCELLED_BY_DOCTOR','NO_SHOW') NOT NULL DEFAULT 'CONFIRMED',
+        reschedule_count TINYINT UNSIGNED NOT NULL DEFAULT 0,
+        dependent_id BIGINT UNSIGNED NULL COMMENT 'NULL = for the account holder; otherwise the family member it is for',
+        idempotency_key VARCHAR(200) NULL COMMENT 'Scoped client key BOOK#<patientId>#<key>; DB-level duplicate backstop',
+        -- One CONFIRMED booking per PERSON per slot (account holder = dependent 0), enforced by the database
+        -- (NULL for every other status, and a UNIQUE index allows any number of NULLs).
+        active_patient_slot VARCHAR(170) GENERATED ALWAYS AS
+            (CASE WHEN status = 'CONFIRMED' THEN CONCAT(patient_id, '#', COALESCE(dependent_id, 0), '#', slot_id) ELSE NULL END) STORED,
+        cancelled_at DATETIME(6) NULL,
+        cancellation_note VARCHAR(255) NULL,
+        created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+        updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+            ON UPDATE CURRENT_TIMESTAMP(6),
+        PRIMARY KEY (appointment_id),
+        UNIQUE KEY uq_appointments_idempotency_key (idempotency_key),
+        UNIQUE KEY uq_appointments_active_patient_slot (active_patient_slot),
+        -- Patient's list (upcoming / past) and the "max active appointments" + overlap checks. Also serves fk_appointments_patient.
+        KEY ix_appointments_patient_start (patient_id, start_at),
+        -- Doctor's list and the doctor schedule day view (doctor_id = ? AND start_at in a range).
+        KEY ix_appointments_doctor_start (doctor_id, start_at),
+        -- Doctor slot cancellation: every CONFIRMED appointment in one slot.
+        KEY ix_appointments_slot_status (slot_id, status),
+        -- "At most N bookings with the same doctor on one day" check.
+        KEY ix_appointments_patient_doctor_status_start (patient_id, doctor_id, status, start_at),
+        -- Serves the composite foreign key below (InnoDB needs an index whose leading columns match it).
+        KEY ix_appointments_doctor_type (doctor_id, consultation_type_id),
+        -- Serves fk_appointments_dependent ("does this family member still have upcoming appointments?").
+        KEY ix_appointments_dependent (dependent_id),
+        CONSTRAINT fk_appointments_patient FOREIGN KEY (patient_id)
+            REFERENCES patients(patient_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
+        CONSTRAINT fk_appointments_doctor FOREIGN KEY (doctor_id)
+            REFERENCES doctors(doctor_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
+        CONSTRAINT fk_appointments_doctor_consultation FOREIGN KEY (doctor_id, consultation_type_id)
+            REFERENCES doctor_consultation_types(doctor_id, consultation_type_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
+        CONSTRAINT fk_appointments_dependent FOREIGN KEY (dependent_id)
+            REFERENCES patient_dependents(dependent_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
+        CONSTRAINT chk_appointments_time CHECK (end_at > start_at),
+        CONSTRAINT chk_appointments_fee CHECK (fee_snapshot >= 0),
+        CONSTRAINT chk_appointments_reschedules CHECK (reschedule_count <= 2)
+    ) ENGINE=InnoDB
+    """,
+
+    # REFUND LEDGER (Milestone 5) - identical to scehma/schema.sql.
+    """
+    CREATE TABLE IF NOT EXISTS refund_ledger (
+        refund_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        appointment_id BIGINT UNSIGNED NOT NULL,
+        fee_amount DECIMAL(10,2) NOT NULL COMMENT 'appointments.fee_snapshot the refund was calculated from',
+        refund_amount DECIMAL(10,2) NOT NULL,
+        deduction_amount DECIMAL(10,2) NOT NULL,
+        refund_percentage DECIMAL(5,2) NOT NULL,
+        refund_tier VARCHAR(30) NOT NULL COMMENT 'Tier name from the SSM policy, or DOCTOR_CANCELLED',
+        cancellation_reason VARCHAR(30) NOT NULL,
+        refund_policy JSON NULL COMMENT 'Snapshot of the tier policy used, for audit',
+        calculated_at DATETIME(6) NOT NULL COMMENT 'UTC instant the tier was decided',
+        created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+        PRIMARY KEY (refund_id),
+        UNIQUE KEY uq_refund_ledger_appointment (appointment_id),
+        CONSTRAINT fk_refund_ledger_appointment FOREIGN KEY (appointment_id)
+            REFERENCES appointments(appointment_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
+        CONSTRAINT chk_refund_amounts CHECK (refund_amount >= 0 AND deduction_amount >= 0 AND refund_amount + deduction_amount = fee_amount),
+        CONSTRAINT chk_refund_percentage CHECK (refund_percentage BETWEEN 0 AND 100),
+        CONSTRAINT chk_refund_reason CHECK (cancellation_reason IN ('PATIENT_CANCEL', 'DOCTOR_CANCEL', 'NO_SHOW'))
+    ) ENGINE=InnoDB
+    """,
+]
+
+
+# Run in order, only when appointments.dependent_id is missing. No row is deleted.
+APPOINTMENTS_FAMILY_UPGRADE = [
+    "ALTER TABLE appointments DROP INDEX uq_appointments_active_patient_slot",
+    "ALTER TABLE appointments DROP COLUMN active_patient_slot",
+    """ALTER TABLE appointments
+        ADD COLUMN dependent_id BIGINT UNSIGNED NULL
+            COMMENT 'NULL = for the account holder; otherwise the family member it is for' AFTER reschedule_count""",
+    """ALTER TABLE appointments
+        ADD COLUMN active_patient_slot VARCHAR(170) GENERATED ALWAYS AS
+            (CASE WHEN status = 'CONFIRMED' THEN CONCAT(patient_id, '#', COALESCE(dependent_id, 0), '#', slot_id) ELSE NULL END)
+            STORED AFTER idempotency_key,
+        ADD UNIQUE KEY uq_appointments_active_patient_slot (active_patient_slot),
+        ADD KEY ix_appointments_dependent (dependent_id),
+        ADD CONSTRAINT fk_appointments_dependent FOREIGN KEY (dependent_id)
+            REFERENCES patient_dependents(dependent_id) ON DELETE RESTRICT ON UPDATE RESTRICT""",
 ]
 
 
@@ -428,6 +567,13 @@ def _create_tables(conn):
                 ADD COLUMN photo_key VARCHAR(1024) NULL
                 """
             )
+
+        # Milestone 5 upgrade: appointments created before family members existed has no dependent_id, and its
+        # "one booking per slot" key was per account instead of per person. Rebuild just those parts in place.
+        cur.execute("SHOW COLUMNS FROM appointments LIKE 'dependent_id'")
+        if not cur.fetchone():
+            for statement in APPOINTMENTS_FAMILY_UPGRADE:
+                cur.execute(statement)
 
         # Insert hospitals.
         cur.executemany(

@@ -47,11 +47,12 @@ def test_rds_check_lambda_creates_and_reports_the_same_indexes():
         assert f'"{name}"' in required, name
 
 
-def test_manual_migration_adds_each_new_index_and_drops_the_replaced_one():
-    text = (ROOT / "scehma" / "milestone4_indexes.sql").read_text()
+def test_schema_sql_is_the_only_sql_file():
+    """All tables and indexes live in scehma/schema.sql (the separate Milestone 4 index migration was folded in)."""
+    assert sorted(p.name for p in (ROOT / "scehma").glob("*.sql")) == ["schema.sql"]
+    text = (ROOT / "scehma" / "schema.sql").read_text()
     for name in ("ix_hospitals_city", "ix_doctors_spec_hospital", "ix_doctors_first_name", "ix_doctor_consultation_active"):
         assert name in text, name
-    assert re.search(r"DROP INDEX\s+ix_doctors_specialization_id", text, re.I)
 
 
 def test_every_new_lambda_is_wired_into_ci_and_cloudformation():

@@ -7,7 +7,7 @@ cd "$(dirname "$0")/.."
 OUT="$(mktemp -d)"
 trap 'rm -rf "$OUT"' EXIT
 
-FUNCTIONS="authentication authorizer rds_check doctor_domain slot_materialiser patient_domain doctor_discovery"
+FUNCTIONS="authentication authorizer rds_check doctor_domain slot_materialiser patient_domain doctor_discovery booking"
 MAX_BYTES=$((50 * 1024 * 1024))
 
 for fn in $FUNCTIONS; do

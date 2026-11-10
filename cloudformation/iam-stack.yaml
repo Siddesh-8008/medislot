@@ -64,11 +64,67 @@ Resources:
               - logs:ListTagsLogGroup
             Resource:
               - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/medislot/${Environment}/*
+              - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/events/medislot-${Environment}-*
 
           - Sid: DescribeLogGroups
             Effect: Allow
             Action: logs:DescribeLogGroups
             Resource: "*"
+
+          # Milestone 5: booking event bus, the rule that copies booking events to CloudWatch Logs,
+          # the log-group resource policy that rule needs, and the booking metrics dashboard.
+          - Sid: ManageBookingEventBus
+            Effect: Allow
+            Action:
+              - events:CreateEventBus
+              - events:DeleteEventBus
+              - events:DescribeEventBus
+              - events:UpdateEventBus
+              - events:PutRule
+              - events:DeleteRule
+              - events:DescribeRule
+              - events:EnableRule
+              - events:DisableRule
+              - events:PutTargets
+              - events:RemoveTargets
+              - events:ListTargetsByRule
+              - events:TagResource
+              - events:UntagResource
+              - events:ListTagsForResource
+            Resource:
+              - !Sub arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:event-bus/medislot-${Environment}-*
+              - !Sub arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:rule/medislot-${Environment}-*
+              - !Sub arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:rule/medislot-${Environment}-*/*
+
+          - Sid: ManageLogResourcePolicies
+            Effect: Allow
+            Action:
+              - logs:PutResourcePolicy
+              - logs:DeleteResourcePolicy
+              - logs:DescribeResourcePolicies
+            Resource: "*"
+
+          - Sid: ManageBookingDashboard
+            Effect: Allow
+            Action:
+              - cloudwatch:PutDashboard
+              - cloudwatch:GetDashboard
+              - cloudwatch:DeleteDashboards
+            Resource:
+              - !Sub arn:${AWS::Partition}:cloudwatch::${AWS::AccountId}:dashboard/medislot-${Environment}-*
+
+          - Sid: ManageBookingParameters
+            Effect: Allow
+            Action:
+              - ssm:PutParameter
+              - ssm:GetParameter
+              - ssm:GetParameters
+              - ssm:DeleteParameter
+              - ssm:AddTagsToResource
+              - ssm:RemoveTagsFromResource
+              - ssm:ListTagsForResource
+            Resource:
+              - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/medislot/${Environment}/booking/*
 
           - Sid: ReadCallerIdentity
             Effect: Allow
