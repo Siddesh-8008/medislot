@@ -30,8 +30,12 @@ MODULES=[
  ("photo","Profile photo","camera","#e0572f","The picture patients see when they find you."),
  ("consultation","Consultation types","list","#b9801c","What you offer, how long it takes and what it costs."),
  ("availability","Availability","clock","#1f7a4d","Weekly working hours and the days you are away."),
+ ("appointments","Appointments","clipboard","#c2417a","Patients who have booked with you."),
  ("schedule","Schedule","calendar","#2563b8","Look up slots and appointments for any day."),
 ]
+# Tabs of the Appointments module -> query for GET /appointments (the booking API filters by the signed-in doctor).
+APPT_TABS={"upcoming":{"when":"upcoming","status":"CONFIRMED"},"past":{"when":"past"},"cancelled":{"status":"CANCELLED"}}
+APPT_PAGE_SIZE=20
 MODULE_KEYS={m[0] for m in MODULES}
 
 class SessionExpired(Exception):
@@ -131,7 +135,8 @@ def render_dashboard(module,**extra):
     """Shared renderer for every dashboard module."""
     ctx=dict(logged_in=True,module=module,modules=MODULES,messages=session.pop("messages",[]),hospitals=HOSPITALS,specializations=SPECIALIZATIONS,weekdays=WEEKDAYS,day_names=dict(WEEKDAYS),
              ctype_options=[],ctypes_ref=[],photo_url=photo_url_for(session.get("photo_key")),
-             profile=None,p={},display_name=session.get("display_name"),last_name=None,greeting="Welcome",progress=None,steps=None,counts=None,types=None,active_types=None,type_names={},patterns=None,blackouts=None,sched=None)
+             profile=None,p={},display_name=session.get("display_name"),last_name=None,greeting="Welcome",progress=None,steps=None,counts=None,types=None,active_types=None,type_names={},patterns=None,blackouts=None,sched=None,
+             upcoming=None,appts=None)
     ctx.update(extra)
     return render_template("dashboard.html",**ctx)
 def load_profile():
@@ -154,7 +159,18 @@ def home():
         return render_template("dashboard.html",logged_in=False,mode=mode,who=who,messages=session.pop("messages",[]),form=session.pop("signup_form",{}) if mode=="signup" else {},prefill_email=session.pop("prefill_email","") if mode=="signin" else "",hospitals=HOSPITALS,specializations=SPECIALIZATIONS,genders=patient_portal.GENDERS,today=datetime.now(ZoneInfo("Asia/Kolkata")).date().isoformat())
     module=request.args.get("m","overview")
     if module not in MODULE_KEYS: module="overview"
+    if module=="schedule":
+        # Open the schedule on today's date instead of an empty picker.
+        return redirect("/schedule?date="+datetime.now(ZoneInfo("Asia/Kolkata")).date().isoformat())
     extra={}
+    if module=="appointments":
+        tab=request.args.get("tab","upcoming")
+        if tab not in APPT_TABS: tab="upcoming"
+        try: page=max(int(request.args.get("page","1")),1)
+        except ValueError: page=1
+        extra["appts"]=load_bookings(tab,page,APPT_PAGE_SIZE)
+    if module=="overview":
+        extra["upcoming"]=load_bookings("upcoming",1,5)
     if module in ("overview","profile","photo"):
         profile=load_profile()
         extra.update(profile=profile,p=profile or {})
@@ -417,8 +433,55 @@ def photo_image():
     return resp
 
 def _utc(iso):
-    """'2026-11-09T04:00:00Z' -> aware UTC datetime (works on Python 3.9, where fromisoformat rejects 'Z')."""
-    return datetime.fromisoformat(str(iso).replace("Z","+00:00"))
+    """'2026-11-09T04:00:00Z' -> aware UTC datetime (works on Python 3.9, where fromisoformat rejects 'Z').
+    RDS DATETIME values arrive without an offset ('2026-11-09T04:00:00'); they are stored in UTC, so treat them as UTC
+    (otherwise .astimezone() would read them in the server's own local time and shift every appointment)."""
+    dt=datetime.fromisoformat(str(iso).replace("Z","+00:00"))
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+STATUS_LABELS={"CONFIRMED":("Confirmed","open"),"COMPLETED":("Completed","done"),"NO_SHOW":("No-show","closed"),
+               "CANCELLED_BY_PATIENT":("Cancelled by patient","closed"),"CANCELLED_BY_DOCTOR":("Cancelled by you","closed")}
+def booking_card(a):
+    """One appointment from GET /appointments (doctor view), shaped for the template. Times are already in the doctor's timezone."""
+    label,state=STATUS_LABELS.get(str(a.get("status")),(str(a.get("status") or "").replace("_"," ").title(),"closed"))
+    pat=a.get("patient") or {}
+    name=pat.get("name") or (f"Patient #{pat['id']}" if pat.get("id") else "Patient")
+    booked_by=None
+    if pat.get("bookedBy"):
+        booked_by=f"Booked by {pat['bookedBy']}"+(f" ({pat['relation']})" if pat.get("relation") else "")
+    try:
+        d=datetime.strptime(a.get("localDate") or "","%Y-%m-%d").date(); pretty=f"{d:%A}, {d.day} {d:%B %Y}"
+    except ValueError:
+        d=None; pretty=a.get("localDate") or ""
+    def t12(hm):
+        try: return datetime.strptime(hm,"%H:%M").strftime("%I:%M %p").lstrip("0")
+        except (TypeError,ValueError): return hm
+    refund=a.get("refund") or {}
+    return dict(id=a.get("appointmentId"),date=a.get("localDate"),pretty_date=pretty,start=t12(a.get("localStart")),end=t12(a.get("localEnd")),
+                patient=name,booked_by=booked_by,type=(a.get("consultationType") or {}).get("name") or "Consultation",
+                status=label,state=state,fee=_money(a.get("fee")),refund=_money(refund.get("refundAmount")) if refund else None,
+                note=a.get("cancellationNote"))
+def load_bookings(tab,page,size):
+    """Doctor's appointments from the booking API. Returns dict(ok, items, groups, total, ...)."""
+    out=dict(ok=False,tab=tab,page=page,items=[],groups=[],total=0,total_pages=1,has_prev=False,has_next=False)
+    try:
+        r=api("GET","/appointments",params={**APPT_TABS[tab],"page":page,"pageSize":size})
+        data=r.json() if r.ok else None
+    except SessionExpired: raise
+    except (requests.RequestException,ValueError) as e:
+        app.logger.warning("doctor appointments upstream error: %s",e); return out
+    if not isinstance(data,dict):
+        app.logger.warning("doctor appointments failed: HTTP %s %s",r.status_code,r.text[:300]); return out
+    items=[]
+    for raw in data.get("items") or []:
+        try: items.append(booking_card(raw))
+        except (KeyError,TypeError,AttributeError): app.logger.warning("skipped unreadable appointment: %s",str(raw)[:200])
+    groups=[]
+    for c in items:   # the API already sorts them; group consecutive rows by local date
+        if groups and groups[-1]["date"]==c["date"]: groups[-1]["items"].append(c)
+        else: groups.append(dict(date=c["date"],label=c["pretty_date"],items=[c]))
+    out.update(ok=True,items=items,groups=groups,total=_num(data.get("total"),len(items)),total_pages=_num(data.get("totalPages"),1),
+               has_prev=bool(data.get("hasPrevious")),has_next=bool(data.get("hasNext")))
+    return out
 def _clock(dt):
     return dt.strftime("%I:%M %p").lstrip("0")
 def _money(v):
