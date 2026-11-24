@@ -91,3 +91,4 @@ def test_reconcile_ignores_other_doctors_and_past_slots():
                "start_at": "2026-11-24T02:00:00Z", "status": "OPEN", "booked_count": 0, "held_count": 0})
     assert materialiser.reconcile_doctor(table, 12, IST, {}, NOW, 7) == (0, 0, 0)
     assert table.updates == []
+#
