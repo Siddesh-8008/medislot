@@ -1,7 +1,6 @@
 """scripts/seed_doctors.py: the 15 demo doctors are valid for the real API rules, and re-running is harmless."""
 import importlib.util
 import re
-from pathlib import Path
 
 from support import ROOT, load_lambda
 
@@ -67,13 +66,7 @@ class FakeApi:
     """Records calls; remembers what each doctor created so a second run can be checked."""
 
     def __init__(self):
-        self.users, self.types, self.patterns, self.photos, self.calls, self.puts = {}, {}, {}, {}, [], []
-
-    def put(self, url, data, headers):
-        assert data.startswith(b"\x89PNG") and headers["Content-Type"] == "image/png"
-        assert headers["x-amz-server-side-encryption"] == "AES256"          # signed into the pre-signed URL
-        self.puts.append(url)
-        return 200
+        self.users, self.types, self.patterns, self.calls = {}, {}, {}, []
 
     def __call__(self, api, method, path, token=None, body=None):
         self.calls.append((method, path))
@@ -89,14 +82,6 @@ class FakeApi:
                 return 200, {"items": [{"consultation_type_id": t} for t in self.types.get(token, [])]}
             self.types.setdefault(token, []).append(body["consultationTypeId"])
             return 201, {}
-        if path == "/doctors/me" and method == "GET":
-            return 200, {"profile": {"photo_key": self.photos.get(token)}}
-        if path == "/doctors/me/photo-upload-url":
-            assert body["contentType"] == "image/png"
-            return 200, {"uploadUrl": f"https://s3.test/{token}", "photoKey": f"doctors/{token}/x.png"}
-        if path == "/doctors/me" and method == "PATCH":
-            self.photos[token] = body["photoKey"]
-            return 200, {}
         if path == "/doctors/me/availability-patterns":
             if method == "GET":
                 return 200, {"items": self.patterns.get(token, [])}
@@ -110,32 +95,14 @@ class FakeApi:
 def test_seeding_creates_everything_once_and_a_rerun_changes_nothing(monkeypatch, capsys):
     fake = FakeApi()
     monkeypatch.setattr(seed, "call", fake)
-    monkeypatch.setattr(seed, "put_file", fake.put)
     assert all(seed.seed_one("http://api", n, d) for n, d in enumerate(seed.DOCTORS, start=1))
     assert len(fake.users) == 15
     assert sum(len(v) for v in fake.types.values()) == sum(len(d[7]) for d in seed.DOCTORS)
     assert sum(len(v) for v in fake.patterns.values()) == sum(len(d[8]) for d in seed.DOCTORS)
-    assert len(fake.photos) == 15 and len(fake.puts) == 15                                    # every doctor has a photo
     fake.calls.clear()
-    fake.puts.clear()
     assert all(seed.seed_one("http://api", n, d) for n, d in enumerate(seed.DOCTORS, start=1))
-    assert not [c for c in fake.calls if c[0] in ("POST", "PATCH") and c[1].startswith("/doctors/me")]   # nothing re-created
-    assert fake.puts == []                                                                    # photos not re-uploaded
+    assert not [c for c in fake.calls if c[0] == "POST" and c[1].startswith("/doctors/me")]      # nothing re-created
     assert "account already exists" in capsys.readouterr().out
-
-
-def test_no_photos_flag_skips_uploads(monkeypatch):
-    fake = FakeApi()
-    monkeypatch.setattr(seed, "call", fake)
-    monkeypatch.setattr(seed, "put_file", fake.put)
-    assert seed.seed_one("http://api", 1, seed.DOCTORS[0], photos=False)
-    assert fake.puts == [] and not [c for c in fake.calls if "photo" in c[1]]
-
-
-def test_every_doctor_has_a_photo_the_api_accepts():
-    for n in range(1, 16):
-        data = seed.photo_path(n).read_bytes()
-        assert data.startswith(b"\x89PNG") and 0 < len(data) <= 5 * 1024 * 1024        # PNG, within the 5 MB limit
 
 
 def test_dry_run_prints_every_password(capsys, monkeypatch):
@@ -143,4 +110,83 @@ def test_dry_run_prints_every_password(capsys, monkeypatch):
     assert seed.main() == 0
     out = capsys.readouterr().out
     assert all(seed.account(n, d[0], d[1])["password"] in out for n, d in enumerate(seed.DOCTORS, start=1))
-    assert Path(seed.__file__).name == "seed_doctors.py"
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# End to end against the REAL Lambda code: the seed script's HTTP calls are routed into the authentication and
+# doctor-domain handlers, backed by the SQLite stand-in that runs their real SQL. This catches any payload the API
+# would reject (the fake API above cannot).
+import json as _json  # noqa: E402
+
+import pytest  # noqa: E402
+
+from support import FakeAuthTable, FakeMysql, api_event  # noqa: E402
+
+doctor_api = load_lambda("doctor_domain", "doctor_domain_for_seed")
+EXTRA_SCHEMA = """
+ALTER TABLE doctors ADD COLUMN created_at TEXT DEFAULT CURRENT_TIMESTAMP;
+ALTER TABLE doctors ADD COLUMN updated_at TEXT DEFAULT CURRENT_TIMESTAMP;
+ALTER TABLE doctor_consultation_types ADD COLUMN created_at TEXT DEFAULT CURRENT_TIMESTAMP;
+ALTER TABLE doctor_consultation_types ADD COLUMN updated_at TEXT DEFAULT CURRENT_TIMESTAMP;
+CREATE TABLE availability_patterns (pattern_id INTEGER PRIMARY KEY AUTOINCREMENT, doctor_id INTEGER NOT NULL,
+    consultation_type_id INTEGER NOT NULL, day_of_week INTEGER NOT NULL, start_time TEXT NOT NULL, end_time TEXT NOT NULL,
+    is_active INTEGER NOT NULL DEFAULT 1, created_at TEXT DEFAULT CURRENT_TIMESTAMP, updated_at TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE blackout_dates (blackout_id INTEGER PRIMARY KEY AUTOINCREMENT, doctor_id INTEGER NOT NULL, blackout_date TEXT NOT NULL,
+    reason TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP, UNIQUE (doctor_id, blackout_date));
+"""
+
+
+class RealApi:
+    def __init__(self, monkeypatch):
+        self.db = FakeMysql()
+        self.db.db.executescript(EXTRA_SCHEMA)
+        # every hospital / specialization the seed uses, exactly as rds_check seeds them
+        self.db.db.executemany("INSERT OR IGNORE INTO hospitals (hospital_id, hospital_name, address) VALUES (?,?,?)",
+                               [(i, n, "Hyderabad") for i, n, *_ in rds.HOSPITAL_SEED])
+        self.db.db.executemany("INSERT OR IGNORE INTO specializations (specialization_id, specialization_name) VALUES (?,?)",
+                               list(enumerate(rds.SPECIALIZATION_SEED, start=1)))
+        self.db.db.executemany("INSERT OR IGNORE INTO consultation_types VALUES (?,?,?,?,?,?)", rds.CONSULTATION_TYPE_SEED)
+        self.db.db.commit()
+        self.tokens, self.statuses = {}, []
+        cfg = {"env": "dev", "prefix": "/medislot/dev", "jwt": "unit-test-signing-secret-0123456789"}
+        monkeypatch.setattr(auth, "config", lambda: cfg)
+        monkeypatch.setattr(auth, "dbconn", lambda c: self.db)
+        monkeypatch.setattr(auth, "get_param", lambda name, *a, **k: "12" if "password-min-length" in name else "15")
+        monkeypatch.setattr(auth, "auth_table", lambda: FakeAuthTable())
+        monkeypatch.setattr(doctor_api, "config", lambda: cfg)
+        monkeypatch.setattr(doctor_api, "dbconn", lambda c: self.db)
+        monkeypatch.setattr(doctor_api, "refresh_slots", lambda uid, cid: None)       # slot materialiser not under test
+
+    def __call__(self, api, method, path, token=None, body=None):
+        if path.startswith("/auth/"):
+            res = auth.handler(api_event(method, path, body=body), None)
+        else:
+            res = doctor_api.handler(api_event(method, path, user_id=self.tokens[token], role="DOCTOR", body=body), None)
+        data = _json.loads(res["body"]) if res.get("body") else {}
+        if path == "/auth/login" and res["statusCode"] == 200:
+            self.tokens[data["accessToken"]] = int(data["userId"])
+        self.statuses.append((method, path, res["statusCode"], data.get("message")))
+        return res["statusCode"], data
+
+
+@pytest.fixture
+def real_api(monkeypatch):
+    api = RealApi(monkeypatch)
+    monkeypatch.setattr(seed, "call", api)
+    return api
+
+
+def test_all_fifteen_doctors_are_accepted_by_the_real_api(real_api):
+    assert all(seed.seed_one("http://api", n, d) for n, d in enumerate(seed.DOCTORS, start=1))
+    rejected = [s for s in real_api.statuses if s[2] >= 400]
+    assert rejected == [], rejected                                          # no request was refused
+    one = real_api.db.one
+    assert one("SELECT COUNT(*) AS n FROM doctors")["n"] == 15
+    assert one("SELECT COUNT(*) AS n FROM users WHERE role='DOCTOR' AND phone IS NOT NULL")["n"] == 15
+    assert one("SELECT COUNT(*) AS n FROM doctor_consultation_types")["n"] == sum(len(d[7]) for d in seed.DOCTORS)
+    assert one("SELECT COUNT(*) AS n FROM availability_patterns")["n"] == sum(len(d[8]) for d in seed.DOCTORS)
+    # a second deploy changes nothing and is not refused anywhere
+    real_api.statuses.clear()
+    assert all(seed.seed_one("http://api", n, d) for n, d in enumerate(seed.DOCTORS, start=1))
+    assert [s[:3] for s in real_api.statuses if s[2] >= 400] == [("POST", "/auth/register/doctor", 409)] * 15
+    assert one("SELECT COUNT(*) AS n FROM availability_patterns")["n"] == sum(len(d[8]) for d in seed.DOCTORS)

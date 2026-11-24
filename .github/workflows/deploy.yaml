@@ -371,10 +371,10 @@ jobs:
           '
 
       # Runs after rds-connection-check has created the hospitals, specializations and consultation types.
-      # Safe on every deploy: existing doctors, types, weekly hours and photos are skipped. To turn it off,
+      # Safe on every deploy: existing doctors, consultation types and weekly hours are skipped. To turn it off,
       # set the GitHub Actions variable SEED_DEMO_DOCTORS to "false". A seeding problem is reported as a
       # warning and never blocks the deployment.
-      - name: Seed demo doctors (15 accounts, consultation types, weekly hours, photos)
+      - name: Seed demo doctors (15 accounts, consultation types, weekly hours)
         if: ${{ vars.SEED_DEMO_DOCTORS != 'false' }}
         continue-on-error: true
         shell: bash

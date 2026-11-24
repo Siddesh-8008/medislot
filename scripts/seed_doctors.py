@@ -3,12 +3,8 @@
 Everything goes through the real endpoints, exactly like a doctor using the dashboard:
     POST /auth/register/doctor  ->  POST /auth/login  ->  POST /doctors/me/consultation-types
                                                        ->  POST /doctors/me/availability-patterns
-                                                       ->  profile photo: POST /doctors/me/photo-upload-url,
-                                                           PUT the image to the pre-signed S3 URL,
-                                                           PATCH /doctors/me {"photoKey": ...}
 so passwords are hashed by the authentication Lambda and the slot materialiser builds the bookable slots
-automatically after each weekly pattern is added (give it a minute). The photos are the illustrated avatars
-in scripts/seed_photos/ (doctor-01.png ... doctor-15.png); a doctor who already has a photo keeps it.
+automatically after each weekly pattern is added (give it a minute).
 
 The deploy workflow (.github/workflows/deploy.yaml, step "Seed demo doctors") runs this after every deploy.
 
@@ -17,7 +13,6 @@ weekly patterns that are already there are skipped. Standard library only.
 
     python scripts/seed_doctors.py --api https://<id>.execute-api.ap-south-1.amazonaws.com/dev
     python scripts/seed_doctors.py --dry-run            # just print the doctors, types, hours and passwords
-    python scripts/seed_doctors.py --api ... --no-photos   # skip the profile photos
 
 Run `rds_check` first (it creates the hospitals, specializations and the four consultation types used here).
 """
@@ -26,9 +21,6 @@ import json
 import sys
 import urllib.error
 import urllib.request
-from pathlib import Path
-
-PHOTOS = Path(__file__).resolve().parent / "seed_photos"
 
 # Reference data seeded by lambdas/rds_check (ids are fixed there).
 HOSPITALS = {1: "Apollo Hospitals Jubilee Hills", 2: "Yashoda Hospitals Somajiguda", 3: "KIMS Hospitals Secunderabad",
@@ -97,9 +89,10 @@ DOCTORS = [
 
 
 def account(n, first, last):
-    """Login details for doctor number n (1-15). Passwords meet the sign-up rules (12+ chars, upper, lower, digit, symbol)."""
+    """Login details for doctor number n (1-15). Passwords meet the sign-up rules (12+ chars, upper, lower, digit, symbol).
+    Doctors must register with a unique 10-digit phone number (authentication Lambda rule)."""
     return {"email": f"{first}.{last}@medislot.demo".lower(), "password": f"{first}@MediSlot{n:02d}",
-            "license": f"TS-{7000 + n}"}
+            "license": f"TS-{7000 + n}", "phone": f"900007{n:04d}"}
 
 
 def call(api, method, path, token=None, body=None):
@@ -119,58 +112,22 @@ def call(api, method, path, token=None, body=None):
             return e.code, {"message": raw[:200].decode(errors="replace")}
 
 
-def put_file(url, data, headers):
-    """PUT bytes to a pre-signed S3 URL. Returns the HTTP status."""
-    req = urllib.request.Request(url, method="PUT", data=data, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=60) as r:
-            return r.status
-    except urllib.error.HTTPError as e:
-        return e.code
-
-
-def photo_path(n):
-    return PHOTOS / f"doctor-{n:02d}.png"
-
-
-def add_photo(api, token, n):
-    """Same three steps as the dashboard's photo upload. Skipped if the doctor already has a photo."""
-    st, body = call(api, "GET", "/doctors/me", token)
-    if st == 200 and (body.get("profile") or {}).get("photo_key"):
-        return
-    path = photo_path(n)
-    if not path.is_file():
-        print(f"      ! photo {path.name} not found, skipped")
-        return
-    st, body = call(api, "POST", "/doctors/me/photo-upload-url", token, {"fileName": path.name, "contentType": "image/png"})
-    if st != 200 or not body.get("uploadUrl"):
-        print(f"      ! photo upload URL failed HTTP {st}: {body.get('message')}")
-        return
-    put = put_file(body["uploadUrl"], path.read_bytes(),
-                   {"Content-Type": "image/png", "x-amz-server-side-encryption": "AES256"})   # must match the signed request
-    if put not in (200, 204):
-        print(f"      ! photo upload to S3 failed HTTP {put}")
-        return
-    st, saved = call(api, "PATCH", "/doctors/me", token, {"photoKey": body["photoKey"]})
-    print("      + profile photo" if st == 200 else f"      ! photo uploaded but profile update failed HTTP {st}: {saved.get('message')}")
-
-
 def hhmm(v):
     return str(v)[:5]
 
 
-def seed_one(api, n, doc, photos=True):
+def seed_one(api, n, doc):
     first, last, hospital, spec, years, langs, quals, types, patterns = doc
     acc = account(n, first, last)
     name = f"Dr. {first} {last}"
     st, body = call(api, "POST", "/auth/register/doctor", body={
-        "email": acc["email"], "password": acc["password"], "firstName": first, "lastName": last,
+        "email": acc["email"], "password": acc["password"], "phone": acc["phone"], "firstName": first, "lastName": last,
         "hospitalId": hospital, "specializationId": spec, "licenseNumber": acc["license"], "yearsExperience": years,
         "clinicAddress": HOSPITALS[hospital], "qualifications": quals, "languages_spoken": langs})
     if st == 201:
         print(f"[{n:02d}] {name}: account created")
     elif st == 409:
-        print(f"[{n:02d}] {name}: account already exists, signing in")
+        print(f"[{n:02d}] {name}: account already exists (or the email/phone/license is taken), signing in")
     else:
         print(f"[{n:02d}] {name}: registration failed HTTP {st}: {body.get('message')}")
         return False
@@ -200,8 +157,6 @@ def seed_one(api, n, doc, photos=True):
                         {"consultationTypeId": tid, "dayOfWeek": dow, "startTime": start, "endTime": end})
         ok = st in (200, 201)
         print(f"      {'+' if ok else '!'} {DAYS[dow]} {start}-{end} {TYPES[tid][0]}" + ("" if ok else f"  HTTP {st}: {body.get('message')}"))
-    if photos:
-        add_photo(api, token, n)
     return True
 
 
@@ -217,7 +172,6 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--api", help="API base URL including the stage, e.g. https://<id>.execute-api.<region>.amazonaws.com/dev")
     ap.add_argument("--dry-run", action="store_true", help="print the plan and the credentials; call nothing")
-    ap.add_argument("--no-photos", action="store_true", help="do not upload the illustrated profile photos")
     a = ap.parse_args()
     if a.dry_run or not a.api:
         for n, (first, last, hospital, spec, years, _l, _q, types, patterns) in enumerate(DOCTORS, start=1):
@@ -228,7 +182,7 @@ def main():
         if not a.api and not a.dry_run:
             print("\nPass --api <url> to create these doctors.")
         return 0
-    failures = sum(not seed_one(a.api, n, doc, photos=not a.no_photos) for n, doc in enumerate(DOCTORS, start=1))
+    failures = sum(not seed_one(a.api, n, doc) for n, doc in enumerate(DOCTORS, start=1))
     print("\n" + credentials_table())
     print(f"\nDone: {len(DOCTORS) - failures} of {len(DOCTORS)} doctors ready. Slots appear within a minute (slot materialiser).")
     return 1 if failures else 0
