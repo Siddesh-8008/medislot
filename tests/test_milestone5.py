@@ -32,6 +32,7 @@ import yaml
 from botocore.exceptions import ClientError
 
 from support import FakeMysql, api_event, load_lambda
+from common import make_slot_id, slot_key
 from test_patient_dashboard import FakeResp, doc_profile, env, login_patient, slots_payload  # noqa: F401 (env is a fixture)
 
 
@@ -331,6 +332,12 @@ class FakeDynamo:
         raise AssertionError(f"unexpected table {name}")
 
     def _key(self, table, key):
+        if table == "Slots":
+            # The real table key is (doctor_id N, slot_key S). Tests index slots by their public slotId, which
+            # encodes exactly that key, so translate - and refuse any other key shape (e.g. the old slot_id key).
+            assert set(key) == {"doctor_id", "slot_key"}, f"Slots key must be doctor_id + slot_key, got {sorted(key)}"
+            start, type_id = to_py(key["slot_key"]).rsplit("#", 1)
+            return make_slot_id(int(to_py(key["doctor_id"])), int(type_id), start)
         return to_py(key[self.KEYS[table]])
 
     def _maybe_fail(self, op):
@@ -459,12 +466,12 @@ class FakeSsm:
 
 
 # =========================================================================== world builder
-def slot_id_for(doctor_id, type_id, start):
-    return "SLOT#" + hashlib.sha256(f"{doctor_id}#{type_id}#{start.isoformat()}".encode()).hexdigest()[:40]
-
-
 def iso_z(dt):
     return dt.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def slot_id_for(doctor_id, type_id, start):
+    return make_slot_id(doctor_id, type_id, iso_z(start))
 
 
 class World:
@@ -507,8 +514,8 @@ class World:
         start = start or (datetime.now(timezone.utc) + timedelta(days=3)).replace(minute=0, second=0, microsecond=0)
         sid = slot_id_for(doctor_id, type_id, start)
         self.dynamo.tables["Slots"][sid] = {
-            "slot_id": sid, "doctor_id": doctor_id, "consultation_type_id": type_id,
-            "doctor_date": f"DOCTOR#{doctor_id}#{start.date().isoformat()}", "start_at": iso_z(start),
+            "slot_id": sid, "doctor_id": doctor_id, "slot_key": slot_key(iso_z(start), type_id), "consultation_type_id": type_id,
+            "start_at": iso_z(start),
             "end_at": iso_z(start + timedelta(minutes=minutes)), "timezone": "Asia/Kolkata", "capacity": capacity,
             "booked_count": booked, "held_count": held, "version": version, "status": status,
             "local_date": start.date().isoformat()}
@@ -1072,9 +1079,9 @@ def test_access_rules(w_api):
     ({}, 422, "SLOT_ID_INVALID"),
     ({"slotId": "SLOT#xyz"}, 422, "SLOT_ID_INVALID"),
     ({"slotId": 12}, 422, "SLOT_ID_INVALID"),
-    ({"slotId": "SLOT#" + "a" * 40, "patientId": 99}, 422, "UNKNOWN_FIELDS"),
-    ({"slotId": "SLOT#" + "a" * 40, "fee": 1}, 422, "UNKNOWN_FIELDS"),
-    ({"slotId": "SLOT#" + "a" * 40}, 404, "SLOT_NOT_FOUND"),
+    ({"slotId": "SLOT#999_20300101T000000Z_1", "patientId": 99}, 422, "UNKNOWN_FIELDS"),
+    ({"slotId": "SLOT#999_20300101T000000Z_1", "fee": 1}, 422, "UNKNOWN_FIELDS"),
+    ({"slotId": "SLOT#999_20300101T000000Z_1"}, 404, "SLOT_NOT_FOUND"),
 ])
 def test_booking_body_validation(w_api, payload, status, code):
     st, data = call_api("POST", "/appointments", w_api.p1, body=payload)
@@ -1403,7 +1410,7 @@ def test_doctor_cannot_cancel_someone_elses_or_a_started_slot(w_api):
     theirs = w_api.slot(w_api.doc2, type_id=2, minutes=30)
     assert doctor_cancel(w_api, theirs)[1]["code"] == "SLOT_NOT_FOUND"
     assert w_api.dynamo.slot(theirs)["status"] == "OPEN"
-    assert doctor_cancel(w_api, "SLOT#" + "b" * 40)[1]["code"] == "SLOT_NOT_FOUND"
+    assert doctor_cancel(w_api, "SLOT#999_20300101T000000Z_1")[1]["code"] == "SLOT_NOT_FOUND"
     assert doctor_cancel(w_api, mine_started)[1]["code"] == "SLOT_STARTED"
     assert w_api.dynamo.slot(mine_started)["status"] == "OPEN"
 
@@ -1726,8 +1733,8 @@ def test_profile_required_before_adding_family(w_family):
 # Milestone 5 dashboard pages: Book button (with its own Idempotency-Key), My appointments, cancel with refund
 # preview, Refunds, and the doctor's "Cancel this slot". Same harness as test_patient_dashboard.py (fake API).
 
-SLOT_A = "SLOT#" + "a" * 40
-SLOT_B = "SLOT#" + "b" * 40
+SLOT_A = "SLOT#1_20301120T043000Z_1"
+SLOT_B = "SLOT#1_20301120T050000Z_2"
 
 
 def appt(i=11, status="CONFIRMED", preview=True, refund=None):
@@ -1933,30 +1940,60 @@ def iso(dt):
     return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def owner_view(day, slots, appointments=()):
+    """What GET /doctors/{id}/slots returns to the doctor asking about their own id (owner view)."""
+    return {"doctorId": 3, "timezone": "UTC", "view": "owner", "from": day, "to": day, "fromWasInThePast": False,
+            "days": [{"date": day, "weekday": "Monday", "slots": slots, "freeSlots": 0}],
+            "totalSlots": len(slots), "totalFreeSeats": 0, "appointments": list(appointments)}
+
+
+SLOT_C = "SLOT#3_20301120T060000Z_1"
+
+
 def test_doctor_schedule_offers_cancel_only_for_future_open_slots(env):
     login_doctor(env)
     future, past = datetime.now(timezone.utc) + timedelta(days=2), datetime.now(timezone.utc) - timedelta(hours=2)
     slots = [
-        {"slot_id": SLOT_A, "start_at": iso(future), "end_at": iso(future + timedelta(minutes=60)), "capacity": 3, "booked_count": 2, "status": "OPEN"},
-        {"slot_id": SLOT_B, "start_at": iso(past), "end_at": iso(past + timedelta(minutes=15)), "capacity": 1, "booked_count": 0, "status": "OPEN"},
-        {"slot_id": "SLOT#" + "c" * 40, "start_at": iso(future + timedelta(hours=2)), "end_at": iso(future + timedelta(hours=3)), "capacity": 3,
-         "booked_count": 3, "status": "CANCELLED", "closed_reason": "DOCTOR_CANCELLED"}]
-    env.route("GET", "/doctors/me/schedule", FakeResp(200, {"date": future.date().isoformat(), "timezone": "UTC", "slots": slots, "appointments": []}))
-    page = env.client.get("/schedule?date=" + future.date().isoformat()).get_data(as_text=True)
-    assert page.count('action="/schedule/slots/cancel"') == 1 and 'value="' + "a" * 40 + '"' in page
+        {"slotId": SLOT_A, "startAt": iso(future), "endAt": iso(future + timedelta(minutes=60)), "capacity": 3, "bookedCount": 2, "status": "OPEN"},
+        {"slotId": SLOT_B, "startAt": iso(past), "endAt": iso(past + timedelta(minutes=15)), "capacity": 1, "bookedCount": 0, "status": "OPEN"},
+        {"slotId": SLOT_C, "startAt": iso(future + timedelta(hours=2)), "endAt": iso(future + timedelta(hours=3)), "capacity": 3,
+         "bookedCount": 3, "status": "CANCELLED", "closedReason": "DOCTOR_CANCELLED"}]
+    day = future.date().isoformat()
+    env.route("GET", "/doctors/3/slots", FakeResp(200, owner_view(day, slots)))
+    page = env.client.get("/schedule?date=" + day).get_data(as_text=True)
+    assert page.count('action="/schedule/slots/cancel"') == 1 and 'value="' + SLOT_A[5:] + '"' in page
     assert "Cancel and refund 2 patients in full" in page and "Cancelled" in page
+    call = [c for c in env.calls if c[1] == "/doctors/3/slots"][0]
+    assert call[2]["params"] == {"from": day, "to": day}                     # the shared endpoint, one day
+
+
+def test_doctor_schedule_lists_appointments_from_the_owner_view(env):
+    login_doctor(env)
+    future = datetime.now(timezone.utc) + timedelta(days=2)
+    day = future.date().isoformat()
+    appts = [{"appointmentId": 41, "patientId": 9, "slotId": SLOT_A, "consultationTypeId": 1, "consultationTypeName": "Quick Consult",
+              "startAt": iso(future), "endAt": iso(future + timedelta(minutes=15)), "fee": "300.00", "status": "CONFIRMED"}]
+    env.route("GET", "/doctors/3/slots", FakeResp(200, owner_view(day, [], appts)))
+    page = env.client.get("/schedule?date=" + day).get_data(as_text=True)
+    assert "Quick Consult" in page and "41" in page and "Confirmed" in page
+
+
+def test_doctor_schedule_rejects_a_bad_date_without_calling_the_api(env):
+    login_doctor(env)
+    env.client.get("/schedule?date=yesterday")
+    assert not [c for c in env.calls if c[1].endswith("/slots")]
 
 
 def test_doctor_cancel_slot_calls_the_api_and_reports(env):
     login_doctor(env)
-    env.route("POST", "/doctors/me/slots/" + "a" * 40 + "/cancel", FakeResp(200, {"cancelledAppointments": 2}))
-    r = env.client.post("/schedule/slots/cancel", data={"slot": "a" * 40, "date": "2026-11-20", "confirm": "yes", "reason": "  Surgery  "})
+    env.route("POST", "/doctors/me/slots/" + SLOT_A[5:] + "/cancel", FakeResp(200, {"cancelledAppointments": 2}))
+    r = env.client.post("/schedule/slots/cancel", data={"slot": SLOT_A[5:], "date": "2026-11-20", "confirm": "yes", "reason": "  Surgery  "})
     assert r.headers["Location"].endswith("/schedule?date=2026-11-20")
     call = [c for c in env.calls if c[1].endswith("/cancel")][0]
     assert call[2]["json"] == {"reason": "Surgery"}
 
 
-@pytest.mark.parametrize("form", [{"slot": "a" * 40, "date": "2026-11-20"}, {"slot": "../x", "confirm": "yes", "date": "2026-11-20"}])
+@pytest.mark.parametrize("form", [{"slot": SLOT_A[5:], "date": "2026-11-20"}, {"slot": "../x", "confirm": "yes", "date": "2026-11-20"}])
 def test_doctor_cancel_slot_needs_confirmation_and_a_valid_id(env, form):
     login_doctor(env)
     r = env.client.post("/schedule/slots/cancel", data=form)
@@ -2165,16 +2202,16 @@ def test_every_booking_route_is_an_api_method_wired_to_the_booking_lambda_and_de
               ("/patients/me/refunds", "GET"), ("/patients/me/dependents", "GET"), ("/patients/me/dependents", "POST"),
               ("/patients/me/dependents/{dependentId}", "PATCH"), ("/patients/me/dependents/{dependentId}", "DELETE")]
     deployments = [k for k, v in r.items() if v["Type"] == "AWS::ApiGateway::Deployment"]
-    assert deployments == ["ApiDeploymentM5Family"]
-    assert r["ApiStage"]["Properties"]["DeploymentId"] == "ApiDeploymentM5Family"
+    assert deployments == ["ApiDeploymentM6Family"]
+    assert r["ApiStage"]["Properties"]["DeploymentId"] == "ApiDeploymentM6Family"
     for route in wanted:
         name = methods.get(route)
         assert name, route
         m = r[name]["Properties"]
         assert m["AuthorizationType"] == "CUSTOM" and "BookingFunction.Arn" in m["Integration"]["Uri"], route
-        assert name in r["ApiDeploymentM5Family"]["DependsOn"], route
+        assert name in r["ApiDeploymentM6Family"]["DependsOn"], route
     # every method that existed before is still deployed
-    assert all(k in r["ApiDeploymentM5Family"]["DependsOn"] for k, v in r.items() if v["Type"] == "AWS::ApiGateway::Method")
+    assert all(k in r["ApiDeploymentM6Family"]["DependsOn"] for k, v in r.items() if v["Type"] == "AWS::ApiGateway::Method")
 
 
 def test_booking_role_is_least_privilege():

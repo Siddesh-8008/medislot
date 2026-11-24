@@ -272,11 +272,6 @@ Resources:
                 Action: [s3:PutObject]
                 Resource: !Sub 'arn:${AWS::Partition}:s3:::medislot-${Environment}-doctor-photos-${AWS::AccountId}-${AWS::Region}/doctors/*'
               - Effect: Allow
-                Action: [dynamodb:Query]
-                Resource:
-                  - !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/MediSlot-${Environment}-Slots'
-                  - !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/MediSlot-${Environment}-Slots/index/GSI_DoctorDate'
-              - Effect: Allow
                 Action: [lambda:InvokeFunction]
                 Resource: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:medislot-${Environment}-slot-materialiser'
   DoctorDomainFunction:
@@ -331,7 +326,7 @@ Resources:
                 Resource: !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/MediSlot-${Environment}-Slots'
               - Effect: Allow
                 Action: [dynamodb:Query]
-                Resource: !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/MediSlot-${Environment}-Slots/index/GSI_DoctorDate'
+                Resource: !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/MediSlot-${Environment}-Slots'
   SlotMaterialiserFunction:
     Type: AWS::Lambda::Function
     Properties:
@@ -463,9 +458,7 @@ Resources:
                 Resource: '*'
               - Effect: Allow
                 Action: [dynamodb:Query]
-                Resource:
-                  - !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/MediSlot-${Environment}-Slots'
-                  - !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/MediSlot-${Environment}-Slots/index/GSI_DoctorDate'
+                Resource: !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/MediSlot-${Environment}-Slots'
   DoctorDiscoveryFunction:
     Type: AWS::Lambda::Function
     Properties:
@@ -697,12 +690,6 @@ Resources:
       RestApiId: !Ref RestApi
       ParentId: !Ref DoctorsMeBlackoutDatesResource
       PathPart: '{blackoutId}'
-  DoctorsMeScheduleResource:
-    Type: AWS::ApiGateway::Resource
-    Properties:
-      RestApiId: !Ref RestApi
-      ParentId: !Ref DoctorsMeResource
-      PathPart: 'schedule'
   DoctorsMeGetMethod:
     Type: AWS::ApiGateway::Method
     Properties:
@@ -931,19 +918,6 @@ Resources:
         Type: AWS_PROXY
         IntegrationHttpMethod: POST
         Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DoctorDomainFunction.Arn}/invocations'
-  DoctorsMeScheduleGetMethod:
-    Type: AWS::ApiGateway::Method
-    Properties:
-      RestApiId: !Ref RestApi
-      ResourceId: !Ref DoctorsMeScheduleResource
-      HttpMethod: GET
-      AuthorizationType: CUSTOM
-      AuthorizerId: !Ref ApiAuthorizer
-      Integration:
-        Type: AWS_PROXY
-        IntegrationHttpMethod: POST
-        Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DoctorDomainFunction.Arn}/invocations'
-
   # ---- Milestone 4 endpoints. Same REST API, stage and JWT authorizer as everything above; the dashboard calls
   # exactly these methods. /patients/* -> patient-domain Lambda (PATIENT role only, checked in the Lambda).
   # /doctors/search|filters|{doctorId}[/slots] -> doctor-discovery Lambda (any signed-in user).
@@ -1375,7 +1349,7 @@ Resources:
     Properties: {FunctionName: !Ref ProtectedFunction, Action: lambda:InvokeFunction, Principal: apigateway.amazonaws.com, SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*/GET/*'}
   # NOTE: API Gateway only publishes a NEW snapshot when this resource is REPLACED. Changing its Description does not.
   # So the logical ID carries the milestone: rename it (ApiDeploymentM5, ...) whenever routes are added or changed.
-  ApiDeploymentM5Family:
+  ApiDeploymentM6Family:
     Type: AWS::ApiGateway::Deployment
     DependsOn:
       - PatientsMeDependentsGetMethod
@@ -1409,7 +1383,6 @@ Resources:
       - DoctorsMeBlackoutDatesGetMethod
       - DoctorsMeBlackoutDatesPostMethod
       - DoctorsMeBlackoutIdDeleteMethod
-      - DoctorsMeScheduleGetMethod
       - PatientsMeGetMethod
       - PatientsMePostMethod
       - PatientsMePutMethod
@@ -1432,7 +1405,7 @@ Resources:
     Type: AWS::ApiGateway::Stage
     Properties:
       RestApiId: !Ref RestApi
-      DeploymentId: !Ref ApiDeploymentM5Family
+      DeploymentId: !Ref ApiDeploymentM6Family
       StageName: !Ref Environment
       TracingEnabled: true
       AccessLogSetting:

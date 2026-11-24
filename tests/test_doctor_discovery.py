@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from support import FakeDdb, FakeMysql, FakeSlotsTable, api_event, call, load_lambda
+from common import make_slot_id
 
 discovery = load_lambda("doctor_discovery", "doctor_discovery_under_test")
 IST = ZoneInfo("Asia/Kolkata")
@@ -288,12 +289,11 @@ def test_deactivated_doctor_has_no_public_profile(env):
 
 # ------------------------------------------------------------------ slot availability
 def slot(env, doctor, start_utc, *, type_id=1, cap=1, booked=0, held=0, status="OPEN", minutes=15):
-    local_day = start_utc.astimezone(IST).date().isoformat()
-    sid = f"SLOT#{len(env.slots.items)}"
-    env.slots.items.append({
+    start_iso = start_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+    sid = make_slot_id(doctor, type_id, start_iso)
+    env.slots.add({
         "slot_id": sid, "doctor_id": doctor, "consultation_type_id": type_id,
-        "doctor_date": f"DOCTOR#{doctor}#{local_day}",
-        "start_at": start_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "start_at": start_iso,
         "end_at": (start_utc + timedelta(minutes=minutes)).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "capacity": cap, "booked_count": booked, "held_count": held, "status": status, "version": 1})
     return sid
@@ -367,7 +367,78 @@ def test_date_range_and_default_window(env):
     assert len(ranged["days"]) == 3 and [s["slotId"] for day in ranged["days"] for s in day["slots"]] == [b]
     one_day = get(f"/doctors/{d}/slots", {"from": q["from"], "to": q["from"]})[1]
     assert len(one_day["days"]) == 1
-    assert env.slots.queries == sorted(set(env.slots.queries), key=env.slots.queries.index) or True
+    assert len(env.slots.queries) == 3                       # one DynamoDB Query per request, whatever the range
+
+
+def test_a_whole_month_is_read_with_one_query_on_the_table_keys(env):
+    d = env.d["ravi"]
+    ids = [slot(env, d, future(n, 9)) for n in range(1, 31)]
+    env.slots.queries.clear()
+    q = {"from": ist_today().isoformat(), "to": (ist_today() + timedelta(days=30)).isoformat()}
+    data = get(f"/doctors/{d}/slots", q)[1]
+    assert [s["slotId"] for day in data["days"] for s in day["slots"]] == ids and len(data["days"]) == 31
+    (doctor, lo, hi), = env.slots.queries                    # exactly one Query, keyed on doctor_id + slot_key range
+    assert doctor == d and lo < hi and hi.startswith((ist_today() + timedelta(days=30)).isoformat())
+
+
+def test_large_ranges_follow_dynamodb_pagination(env):
+    d = env.d["ravi"]
+    env.slots.page_size = 4                                  # force several LastEvaluatedKey pages
+    ids = [slot(env, d, future(2, 9, m)) for m in range(0, 60, 5)]
+    data = get(f"/doctors/{d}/slots")[1]
+    assert [s["slotId"] for s in data["days"][2]["slots"]] == ids
+    assert len(env.slots.queries) == 3                       # 12 items / 4 per page; nothing lost or repeated
+
+
+# ------------------------------------------------------------------ one endpoint, two views (role based)
+def test_doctor_asking_for_their_own_id_gets_the_owner_view(env):
+    d = env.d["ravi"]
+    open_ = slot(env, d, future(1, 9), booked=1, cap=2)
+    closed = slot(env, d, future(1, 10), status="CLOSED")
+    cancelled = slot(env, d, future(1, 11), status="CANCELLED")
+    status, data = get(f"/doctors/{d}/slots", user=d, role="DOCTOR")
+    assert status == 200 and data["view"] == "owner"
+    day = data["days"][1]["slots"]
+    assert [s["slotId"] for s in day] == [open_, closed, cancelled]
+    assert [s["status"] for s in day] == ["OPEN", "CLOSED", "CANCELLED"]
+    assert day[0]["bookedCount"] == 1 and day[0]["freeSeats"] == 1 and day[1]["freeSeats"] == 0
+    assert data["appointments"] == []                         # appointments table missing in this fake -> empty list
+
+
+def test_patients_and_other_doctors_get_the_public_view_only(env):
+    d = env.d["ravi"]
+    open_ = slot(env, d, future(1, 9))
+    slot(env, d, future(1, 10), status="CLOSED")
+    for user, role in ((7, "PATIENT"), (env.d["anil"], "DOCTOR"), (d, "PATIENT")):
+        data = get(f"/doctors/{d}/slots", user=user, role=role)[1]
+        assert data["view"] == "public" and "appointments" not in data, (user, role)
+        assert [s["slotId"] for day in data["days"] for s in day["slots"]] == [open_]
+        assert all("bookedCount" not in s and "status" not in s for day in data["days"] for s in day["slots"])
+
+
+def test_owner_view_can_look_at_past_days(env):
+    d = env.d["ravi"]
+    past = slot(env, d, future(-2, 9))
+    yesterday = (ist_today() - timedelta(days=2)).isoformat()
+    data = get(f"/doctors/{d}/slots", {"from": yesterday, "to": yesterday}, user=d, role="DOCTOR")[1]
+    assert [s["slotId"] for s in data["days"][0]["slots"]] == [past]
+    assert get(f"/doctors/{d}/slots", {"from": yesterday, "to": yesterday})[0] == 422          # patients: no past days
+
+
+def test_owner_view_includes_the_doctors_appointments(env):
+    d = env.d["ravi"]
+    sid = slot(env, d, future(1, 9))
+    env.db.executescript("""CREATE TABLE appointments (appointment_id INTEGER PRIMARY KEY, patient_id INTEGER, doctor_id INTEGER,
+        consultation_type_id INTEGER, slot_id TEXT, start_at TEXT, end_at TEXT, fee_snapshot REAL, status TEXT);""")
+    start = future(1, 9).replace(tzinfo=None)
+    env.db.execute("INSERT INTO appointments VALUES (41, 7, ?, 1, ?, ?, ?, 300.0, 'CONFIRMED')",
+                   (d, sid, str(start), str(start + timedelta(minutes=15))))
+    env.db.execute("INSERT INTO appointments VALUES (42, 8, ?, 1, 'x', ?, ?, 300.0, 'CONFIRMED')",
+                   (env.d["anil"], str(start), str(start + timedelta(minutes=15))))       # another doctor's
+    env.db.commit()
+    data = get(f"/doctors/{d}/slots", user=d, role="DOCTOR")[1]
+    assert [(a["appointmentId"], a["slotId"], a["consultationTypeName"]) for a in data["appointments"]] == [(41, sid, "Quick Consult")]
+    assert "appointments" not in get(f"/doctors/{d}/slots")[1]                                 # never in the public view
 
 
 def test_range_validation(env):
@@ -409,9 +480,8 @@ def test_slots_use_the_doctors_timezone_for_days_and_clock_times(env):
     tokyo = ZoneInfo("Asia/Tokyo")
     local_today = datetime.now(timezone.utc).astimezone(tokyo).date()
     start = datetime(local_today.year, local_today.month, local_today.day, 9, 0, tzinfo=tokyo) + timedelta(days=1)
-    env.slots.items.append({
+    env.slots.add({
         "slot_id": "SLOT#tokyo", "doctor_id": d, "consultation_type_id": 1,
-        "doctor_date": f"DOCTOR#{d}#{start.date().isoformat()}",
         "start_at": start.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "end_at": (start + timedelta(minutes=15)).astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "capacity": 1, "booked_count": 0, "held_count": 0, "status": "OPEN"})

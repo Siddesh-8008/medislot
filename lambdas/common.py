@@ -353,3 +353,62 @@ def clean_patient_fields(data, required=(), allowed=PATIENT_FIELDS, today=None):
 
 def valid_email(value):
     return isinstance(value, str) and len(value) <= 254 and bool(_EMAIL_RE.fullmatch(value))
+
+
+# --------------------------------------------------------------------------- DynamoDB Slots table keys
+# Table layout: partition key doctor_id (N), sort key slot_key (S) = "<start_at UTC ISO>#<consultation_type_id>".
+#   * All of one doctor's slots live in one partition, sorted by start time, so "doctor X between two instants"
+#     is ONE Query on the base table (no GSI, so every slot write is billed once, not twice).
+#   * The "#<type>" suffix keeps two consultation types that start at the same minute as separate items.
+# The public slotId carries the whole key in a URL-safe form, so any Lambda can address a slot from the id alone:
+#   SLOT#<doctorId>_<YYYYMMDDTHHMMSSZ>_<consultationTypeId>     e.g. SLOT#12_20261125T043000Z_3
+SLOT_ID_RE = re.compile(r"SLOT#([1-9][0-9]{0,17})_([0-9]{8}T[0-9]{6}Z)_([1-9][0-9]{0,8})")
+SLOT_REF_RE = re.compile(r"[1-9][0-9]{0,17}_[0-9]{8}T[0-9]{6}Z_[1-9][0-9]{0,8}")   # slotId without "SLOT#" (URL paths)
+
+
+def slot_key(start_iso, consultation_type_id):
+    return f"{start_iso}#{int(consultation_type_id)}"
+
+
+def make_slot_id(doctor_id, consultation_type_id, start_iso):
+    compact = start_iso.replace("-", "").replace(":", "")          # 2026-11-25T04:30:00Z -> 20261125T043000Z
+    return f"SLOT#{int(doctor_id)}_{compact}_{int(consultation_type_id)}"
+
+
+def parse_slot_id(slot_id):
+    """slotId -> (doctor_id, slot_key), or None if it is not a well-formed slot id."""
+    m = SLOT_ID_RE.fullmatch(slot_id or "") if isinstance(slot_id, str) else None
+    if not m:
+        return None
+    c = m.group(2)
+    start_iso = f"{c[0:4]}-{c[4:6]}-{c[6:8]}T{c[9:11]}:{c[11:13]}:{c[13:15]}Z"
+    return int(m.group(1)), slot_key(start_iso, m.group(3))
+
+
+def utc_iso(dt):
+    return dt.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def local_day_bounds(first, last, zone):
+    """[first local midnight, day-after-last local midnight) in the doctor's zone, as UTC ISO strings."""
+    lo = datetime.combine(first, dt_time.min, tzinfo=zone)
+    hi = datetime.combine(last + timedelta(days=1), dt_time.min, tzinfo=zone)
+    return utc_iso(lo), utc_iso(hi)
+
+
+def query_doctor_slots(table, doctor_id, start_from_iso, start_before_iso, open_only=False):
+    """Every slot of one doctor whose start_at is in [start_from_iso, start_before_iso): ONE Query on the base
+    table, paginated over LastEvaluatedKey, already sorted by start time. slot_key starts with the start time, so a
+    BETWEEN on the sort key is a time range ("<hi>" sorts before "<hi>#<type>", which keeps hi exclusive)."""
+    from boto3.dynamodb.conditions import Attr, Key
+    kwargs = {"KeyConditionExpression": Key("doctor_id").eq(int(doctor_id))
+              & Key("slot_key").between(start_from_iso, start_before_iso)}
+    if open_only:
+        kwargs["FilterExpression"] = Attr("status").eq("OPEN")
+    items = []
+    while True:
+        res = table.query(**kwargs)
+        items.extend(res.get("Items", []))
+        if "LastEvaluatedKey" not in res:
+            return items
+        kwargs["ExclusiveStartKey"] = res["LastEvaluatedKey"]

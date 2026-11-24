@@ -15,12 +15,11 @@ Safety rules (so booking/business logic is never disturbed):
     (checked atomically in the same DynamoDB write). Booked slots are never touched.
   * Only slots this module closed (closed_reason = SCHEDULE_CHANGE) are ever reopened.
 """
-import os, json, logging, hashlib
+import os, json, logging
 from datetime import datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 import boto3
-from boto3.dynamodb.conditions import Key
-from common import dbconn, emit, get_param, instrument
+from common import dbconn, emit, get_param, instrument, local_day_bounds, make_slot_id, query_doctor_slots, slot_key
 
 log = logging.getLogger()
 log.setLevel(logging.INFO)
@@ -41,8 +40,8 @@ def resolve_local(local_naive, zone):
 
 
 def stable_slot_id(doctor_id, consultation_type_id, start_iso):
-    stable = f"{doctor_id}#{consultation_type_id}#{start_iso}"
-    return "SLOT#" + hashlib.sha256(stable.encode()).hexdigest()[:40]
+    """Deterministic public id (same inputs -> same id on every run). It encodes the table key; see common.py."""
+    return make_slot_id(doctor_id, consultation_type_id, start_iso)
 
 
 def iso_z(dt):
@@ -75,10 +74,10 @@ def slots_for_pattern_day(p, day, zone, now):
         elif start_utc > now:
             start_iso, end_iso = iso_z(start_utc), iso_z(end_utc)
             items.append({
+                "doctor_id": int(p["doctor_id"]),                                          # partition key
+                "slot_key": slot_key(start_iso, p["consultation_type_id"]),                 # sort key
                 "slot_id": stable_slot_id(p["doctor_id"], p["consultation_type_id"], start_iso),
-                "doctor_id": int(p["doctor_id"]),
                 "consultation_type_id": int(p["consultation_type_id"]),
-                "doctor_date": f"DOCTOR#{p['doctor_id']}#{day.isoformat()}",
                 "start_at": start_iso, "end_at": end_iso,
                 "timezone": p["timezone"], "capacity": int(p["capacity"]),
                 "booked_count": 0, "held_count": 0, "version": 1, "status": "OPEN",
@@ -116,7 +115,7 @@ def create_missing(table, desired, errors):
     made = existing = 0
     for item in desired.values():
         try:
-            table.put_item(Item=item, ConditionExpression="attribute_not_exists(slot_id)")
+            table.put_item(Item=item, ConditionExpression="attribute_not_exists(slot_key)")
             made += 1
         except Exception as e:
             if _code(e) == "ConditionalCheckFailedException":
@@ -131,44 +130,36 @@ def reconcile_doctor(table, doctor_id, zone, desired, now, days):
     closed = reopened = kept = 0
     now_iso = iso_z(now)
     local_today = now.astimezone(zone).date()
-    for offset in range(days):
-        day = local_today + timedelta(days=offset)
-        kwargs = {"IndexName": "GSI_DoctorDate",
-                  "KeyConditionExpression": Key("doctor_date").eq(f"DOCTOR#{doctor_id}#{day.isoformat()}")}
-        existing = []
-        while True:
-            res = table.query(**kwargs)
-            existing.extend(res.get("Items", []))
-            if "LastEvaluatedKey" not in res:
-                break
-            kwargs["ExclusiveStartKey"] = res["LastEvaluatedKey"]
-        for it in existing:
-            if it["start_at"] <= now_iso:
-                continue
-            sid, status = it["slot_id"], it.get("status")
-            try:
-                if sid not in desired and status == "OPEN":
-                    table.update_item(
-                        Key={"slot_id": sid},
-                        UpdateExpression="SET #s=:closed, closed_reason=:r, closed_at=:t, version=version+:one",
-                        ConditionExpression="#s=:open AND booked_count=:zero AND held_count=:zero",
-                        ExpressionAttributeNames={"#s": "status"},
-                        ExpressionAttributeValues={":closed": "CLOSED", ":open": "OPEN", ":r": CLOSED_REASON,
-                                                   ":t": now_iso, ":zero": 0, ":one": 1})
-                    closed += 1
-                elif sid in desired and status == "CLOSED" and it.get("closed_reason") == CLOSED_REASON:
-                    table.update_item(
-                        Key={"slot_id": sid},
-                        UpdateExpression="SET #s=:open, version=version+:one REMOVE closed_reason, closed_at",
-                        ConditionExpression="#s=:closed AND closed_reason=:r",
-                        ExpressionAttributeNames={"#s": "status"},
-                        ExpressionAttributeValues={":closed": "CLOSED", ":open": "OPEN", ":r": CLOSED_REASON, ":one": 1})
-                    reopened += 1
-            except Exception as e:
-                if _code(e) == "ConditionalCheckFailedException":
-                    kept += 1          # a patient booked/held it meanwhile -> leave it alone
-                else:
-                    raise
+    # The whole window in ONE paginated Query (it used to be one Query per day: 45 round trips per doctor).
+    lo, hi = local_day_bounds(local_today, local_today + timedelta(days=days - 1), zone)
+    for it in query_doctor_slots(table, doctor_id, max(lo, now_iso), hi):
+        if it["start_at"] <= now_iso:
+            continue
+        sid, status = it["slot_id"], it.get("status")
+        key = {"doctor_id": int(it["doctor_id"]), "slot_key": it["slot_key"]}
+        try:
+            if sid not in desired and status == "OPEN":
+                table.update_item(
+                    Key=key,
+                    UpdateExpression="SET #s=:closed, closed_reason=:r, closed_at=:t, version=version+:one",
+                    ConditionExpression="#s=:open AND booked_count=:zero AND held_count=:zero",
+                    ExpressionAttributeNames={"#s": "status"},
+                    ExpressionAttributeValues={":closed": "CLOSED", ":open": "OPEN", ":r": CLOSED_REASON,
+                                               ":t": now_iso, ":zero": 0, ":one": 1})
+                closed += 1
+            elif sid in desired and status == "CLOSED" and it.get("closed_reason") == CLOSED_REASON:
+                table.update_item(
+                    Key=key,
+                    UpdateExpression="SET #s=:open, version=version+:one REMOVE closed_reason, closed_at",
+                    ConditionExpression="#s=:closed AND closed_reason=:r",
+                    ExpressionAttributeNames={"#s": "status"},
+                    ExpressionAttributeValues={":closed": "CLOSED", ":open": "OPEN", ":r": CLOSED_REASON, ":one": 1})
+                reopened += 1
+        except Exception as e:
+            if _code(e) == "ConditionalCheckFailedException":
+                kept += 1          # a patient booked/held it meanwhile -> leave it alone
+            else:
+                raise
     return closed, reopened, kept
 
 

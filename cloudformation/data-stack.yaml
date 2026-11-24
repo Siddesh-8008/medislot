@@ -52,25 +52,19 @@ Resources:
     Properties:
       TableName: !Sub 'MediSlot-${Environment}-Slots'
       BillingMode: PAY_PER_REQUEST
+      # One partition per doctor, sorted by start time: slot_key = "<start_at UTC ISO>#<consultation_type_id>".
+      # "Doctor X's slots between two instants" is one Query on the base table, so no GSI is needed and every
+      # slot write (booking, hold, cancel) is billed once. The public slotId encodes both key parts.
       AttributeDefinitions:
-        - AttributeName: slot_id
-          AttributeType: S
-        - AttributeName: doctor_date
-          AttributeType: S
-        - AttributeName: start_at
+        - AttributeName: doctor_id
+          AttributeType: N
+        - AttributeName: slot_key
           AttributeType: S
       KeySchema:
-        - AttributeName: slot_id
+        - AttributeName: doctor_id
           KeyType: HASH
-      GlobalSecondaryIndexes:
-        - IndexName: GSI_DoctorDate
-          KeySchema:
-            - AttributeName: doctor_date
-              KeyType: HASH
-            - AttributeName: start_at
-              KeyType: RANGE
-          Projection:
-            ProjectionType: ALL
+        - AttributeName: slot_key
+          KeyType: RANGE
       PointInTimeRecoverySpecification:
         PointInTimeRecoveryEnabled: true
       SSESpecification:

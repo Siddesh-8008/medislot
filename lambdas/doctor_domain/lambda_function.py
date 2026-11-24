@@ -4,14 +4,12 @@ from datetime import datetime, date, time, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import boto3
 import pymysql
-from boto3.dynamodb.conditions import Key
 from botocore.exceptions import ClientError
 from common import config, dbconn, body, response, emit, correlation, instrument
 
 log=logging.getLogger()
 log.setLevel(logging.INFO)
 s3=boto3.client("s3", config=boto3.session.Config(signature_version="s3v4"))
-ddb=boto3.resource("dynamodb")
 lambda_client=boto3.client("lambda",config=boto3.session.Config(connect_timeout=2,read_timeout=3,retries={"max_attempts":1}))
 
 def refresh_slots(uid,cid):
@@ -323,50 +321,7 @@ def handler(event, context):
                 if m and method=="DELETE":
                     cur.execute("DELETE FROM blackout_dates WHERE blackout_id=%s AND doctor_id=%s",(int(m.group(1)),uid)); conn.commit(); emit("info","blackout_date_removed",cid,doctorId=uid,blackoutId=int(m.group(1))); refresh_slots(uid,cid)
                     return out(200,{"message":"Blackout date removed; slots for that day are reopened automatically","correlationId":cid})
-                # Schedule day view
-                if path=="/doctors/me/schedule" and method=="GET":
-                    q=event.get("queryStringParameters") or {}
-                    try: day=date.fromisoformat(q.get("date",""))
-                    except Exception: return out(422,{"message":"date query parameter must be YYYY-MM-DD","correlationId":cid})
-                    local_start=datetime.combine(day,time.min,ZoneInfo("UTC"))
-                    local_end=local_start+timedelta(days=1)
-                    cur.execute("SELECT doctor_id,timezone FROM doctors WHERE doctor_id=%s",(uid,)); dr=cur.fetchone()
-                    tz=ZoneInfo(dr["timezone"])
-                    start_utc=datetime.combine(day,time.min,tzinfo=tz).astimezone(timezone.utc).replace(tzinfo=None)
-                    end_utc=datetime.combine(day+timedelta(days=1),time.min,tzinfo=tz).astimezone(timezone.utc).replace(tzinfo=None)
-                    try:
-                        cur.execute("""SELECT appointment_id,patient_id,consultation_type_id,slot_id,start_at,end_at,fee_snapshot,status
-                            FROM appointments WHERE doctor_id=%s AND start_at >= %s AND start_at < %s ORDER BY start_at""",(uid,start_utc,end_utc))
-                        appointments=cur.fetchall()
-                    except pymysql.err.ProgrammingError as e:
-                        # 1146 = table doesn't exist yet (appointments arrive with the booking milestone).
-                        if e.args and e.args[0]==1146:
-                            emit("warning","appointments_table_missing",cid)
-                            appointments=[]
-                        else:
-                            raise
-                    table=ddb.Table(f"MediSlot-{c['env']}-Slots")
-                    items=[]; kwargs={"IndexName":"GSI_DoctorDate","KeyConditionExpression":Key("doctor_date").eq(f"DOCTOR#{uid}#{day.isoformat()}")}
-                    try:
-                        while True:
-                            res=table.query(**kwargs); items.extend(res.get("Items",[]))
-                            if "LastEvaluatedKey" not in res: break
-                            kwargs["ExclusiveStartKey"]=res["LastEvaluatedKey"]
-                    except Exception as e:
-                        emit("warning","schedule_slots_read_failed",cid,error=type(e).__name__)
-                    # Add readable consultation-type details so the dashboard never has to show raw IDs.
-                    cur.execute("""SELECT dct.consultation_type_id,ct.name,ct.duration_minutes,dct.fee
-                        FROM doctor_consultation_types dct JOIN consultation_types ct ON ct.consultation_type_id=dct.consultation_type_id
-                        WHERE dct.doctor_id=%s""",(uid,))
-                    types={int(t["consultation_type_id"]):t for t in cur.fetchall()}
-                    for row in list(items)+list(appointments):
-                        t=types.get(int(row.get("consultation_type_id") or 0))
-                        if t:
-                            row["consultation_type_name"]=t["name"]; row["duration_minutes"]=t["duration_minutes"]
-                            row.setdefault("fee",t["fee"])
-                    items.sort(key=lambda r:str(r.get("start_at","")))
-                    emit("info","schedule_viewed",cid,doctorId=uid,date=day.isoformat(),slots=len(items),appointments=len(appointments))
-                    return out(200,{"date":day.isoformat(),"timezone":dr["timezone"],"slots":items,"appointments":appointments,"correlationId":cid})
+                # The schedule day view moved to GET /doctors/{doctorId}/slots (doctor_discovery, owner view).
                 return out(404,{"message":"Doctor endpoint not found","path":path,"correlationId":cid})
     except Exception as e:
         emit("error","doctor_domain_error",cid,error=type(e).__name__,path=path,method=method,detail=str(e)[:300],traceback=traceback.format_exc()[-1500:])

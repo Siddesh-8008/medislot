@@ -4,7 +4,9 @@ Routes (behind the JWT authorizer; any signed-in PATIENT or DOCTOR):
     GET /doctors/filters             reference lists for the search form (hospitals, specializations, cities)
     GET /doctors/search              multi-attribute search with pagination
     GET /doctors/{doctorId}          public doctor profile with consultation types and fees
-    GET /doctors/{doctorId}/slots    free seats per slot for a date range (read from DynamoDB)
+    GET /doctors/{doctorId}/slots    slots for a date range (DynamoDB). ONE endpoint for both roles:
+                                     patients get the public view (open, future, free seats);
+                                     the doctor asking for their OWN id gets every slot + their appointments
 
 Only information a patient needs is returned. Licence number, email and phone are never exposed.
 
@@ -25,9 +27,10 @@ from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import boto3
-from boto3.dynamodb.conditions import Key
+import pymysql
 
-from common import correlation, db_config, dbconn, emit, instrument, json_out
+from common import (correlation, db_config, dbconn, emit, instrument, json_out, local_day_bounds, query_doctor_slots,
+                    utc_iso)
 
 ddb = boto3.resource("dynamodb")
 
@@ -314,30 +317,74 @@ def profile(doctor_id, cid):
     })
 
 
-def read_day(table, doctor_id, day):
-    items, kwargs = [], {"IndexName": "GSI_DoctorDate",
-                         "KeyConditionExpression": Key("doctor_date").eq(f"DOCTOR#{doctor_id}#{day.isoformat()}")}
-    while True:
-        res = table.query(**kwargs)
-        items.extend(res.get("Items", []))
-        if "LastEvaluatedKey" not in res:
-            return items
-        kwargs["ExclusiveStartKey"] = res["LastEvaluatedKey"]
-
-
 def parse_utc(text):
     return datetime.fromisoformat(str(text).replace("Z", "+00:00"))
 
 
+def db_utc(text):
+    """UTC ISO string -> naive UTC datetime, the form appointments.start_at is stored in."""
+    return parse_utc(text).astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def owner_appointments(cur, doctor_id, lo_iso, hi_iso):
+    """The doctor's own appointments in [lo, hi). Only ever called for the signed-in doctor's own id."""
+    try:
+        cur.execute(
+            """SELECT appointment_id, patient_id, consultation_type_id, slot_id, start_at, end_at, fee_snapshot, status
+               FROM appointments WHERE doctor_id = %s AND start_at >= %s AND start_at < %s ORDER BY start_at""",
+            (doctor_id, db_utc(lo_iso), db_utc(hi_iso)),
+        )
+        return cur.fetchall()
+    except pymysql.err.ProgrammingError as exc:
+        if exc.args and exc.args[0] == 1146:          # appointments table not created yet (fresh environment)
+            return []
+        raise
+
+
+def utc_text(value):
+    if isinstance(value, datetime):
+        value = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    return str(value) if value is not None else None
+
+
 def slots(event, doctor_id, cid, now=None):
+    """GET /doctors/{doctorId}/slots - ONE endpoint for both roles; what you get depends on who you are.
+
+    Patient, or a doctor looking at a colleague (public view):
+        only OPEN, future slots of consultation types the doctor still offers; past dates are rejected.
+    The doctor looking at their OWN id (owner view, used by the doctor dashboard schedule):
+        every slot in the range whatever its status (OPEN / CLOSED / CANCELLED, past ones too), the seat counters,
+        and the doctor's appointments for the same range. Patient data never leaves the owner view.
+
+    Either way the range [from, to] is read with ONE DynamoDB Query on the Slots base table
+    (doctor_id = X AND slot_key BETWEEN <from local midnight> AND <day after to, local midnight>), instead of one
+    Query per day, and the items come back already sorted by start time.
+    """
     q = query_params(event)
+    ctx = (event.get("requestContext") or {}).get("authorizer") or {}
+    owner = ctx.get("role") == "DOCTOR" and str(ctx.get("userId")) == str(doctor_id)
     with dbconn(db_config()) as conn:
         with conn.cursor() as cur:
-            cur.execute(f"SELECT d.doctor_id, d.timezone {LISTED_FROM} WHERE d.doctor_id = %s", (doctor_id,))
+            if owner:
+                # The doctor always sees their own schedule, even while not publicly listed.
+                cur.execute("SELECT doctor_id, timezone FROM doctors WHERE doctor_id = %s", (doctor_id,))
+            else:
+                cur.execute(f"SELECT d.doctor_id, d.timezone {LISTED_FROM} WHERE d.doctor_id = %s", (doctor_id,))
             doc = cur.fetchone()
             if not doc:
-                return json_out(404, msg(cid, "Doctor not found"))
+                return json_out(404, msg(cid, "Doctor profile not found; create it first" if owner else "Doctor not found"))
             types = {int(t["consultation_type_id"]): t for t in offered_types(cur, doctor_id)}
+            if owner:
+                # Owner view also names types the doctor has since switched off (their old slots still exist).
+                cur.execute(
+                    """SELECT dct.consultation_type_id, ct.name, ct.duration_minutes, dct.fee, dct.capacity
+                       FROM doctor_consultation_types dct
+                       JOIN consultation_types ct ON ct.consultation_type_id = dct.consultation_type_id
+                       WHERE dct.doctor_id = %s""",
+                    (doctor_id,),
+                )
+                all_types = {int(t["consultation_type_id"]): t for t in cur.fetchall()}
     try:
         zone = ZoneInfo(doc["timezone"])
     except Exception:  # noqa: BLE001 - a bad stored timezone must not break browsing
@@ -347,66 +394,79 @@ def slots(event, doctor_id, cid, now=None):
     today = now.astimezone(zone).date()
     first = date_param(q, "from", today)
     last = date_param(q, "to", first + timedelta(days=DEFAULT_RANGE_DAYS - 1))
-    if last < today:
-        raise BadRequest("Dates in the past have no bookable slots")
     if last < first:
         raise BadRequest("to must be on or after from")
-    clamped = first < today
-    if clamped:
-        first = today
+    clamped = False
+    if not owner:
+        if last < today:
+            raise BadRequest("Dates in the past have no bookable slots")
+        clamped = first < today
+        if clamped:
+            first = today
     if (last - first).days + 1 > MAX_RANGE_DAYS:
         raise BadRequest(f"Choose a range of at most {MAX_RANGE_DAYS} days")
     type_id = int_param(q, "consultationTypeId")
-    if type_id is not None and type_id not in types:
+    if type_id is not None and type_id not in (all_types if owner else types):
         raise BadRequest("This doctor does not offer that consultation type")
     only_available = bool_param(q, "availableOnly")
 
     table = ddb.Table(f"MediSlot-{os.environ.get('ENVIRONMENT', 'dev')}-Slots")
-    now_iso = now.isoformat(timespec="seconds").replace("+00:00", "Z")
-    days, total_slots, total_free = [], 0, 0
+    now_iso = utc_iso(now)
+    lo_iso, hi_iso = local_day_bounds(first, last, zone)
     try:
-        day = first
-        while day <= last:
-            out = []
-            for it in read_day(table, doctor_id, day):
-                t = types.get(int(it.get("consultation_type_id", 0)))
-                if it.get("status") != "OPEN" or t is None or str(it.get("start_at", "")) <= now_iso:
-                    continue
-                if type_id is not None and int(it["consultation_type_id"]) != type_id:
-                    continue
-                capacity = max(int(it.get("capacity", 1)), 1)
-                free = max(capacity - int(it.get("booked_count", 0)) - int(it.get("held_count", 0)), 0)
-                if only_available and free == 0:
-                    continue
-                start, end = parse_utc(it["start_at"]), parse_utc(it["end_at"])
-                out.append({
-                    "slotId": it["slot_id"],
-                    "startAt": it["start_at"],
-                    "endAt": it["end_at"],
-                    "localStart": start.astimezone(zone).strftime("%H:%M"),
-                    "localEnd": end.astimezone(zone).strftime("%H:%M"),
-                    "consultationTypeId": int(it["consultation_type_id"]),
-                    "consultationTypeName": t["name"],
-                    "durationMinutes": int(t["duration_minutes"]),
-                    "fee": t["fee"],
-                    "capacity": capacity,
-                    "freeSeats": free,
-                    "available": free > 0,
-                })
-            out.sort(key=lambda s: s["startAt"])
-            days.append({"date": day.isoformat(), "weekday": WEEKDAYS[day.weekday()], "slots": out,
-                         "freeSlots": sum(1 for s in out if s["available"])})
-            total_slots += len(out)
-            total_free += sum(s["freeSeats"] for s in out)
-            day += timedelta(days=1)
+        items = query_doctor_slots(table, doctor_id, lo_iso if owner else max(lo_iso, now_iso), hi_iso,
+                                   open_only=not owner)
     except Exception as exc:  # noqa: BLE001
         emit("error", "slots_read_failed", cid, doctorId=doctor_id, error=type(exc).__name__, detail=str(exc)[:200])
         return json_out(503, msg(cid, "Slot availability is temporarily unavailable. Please try again."))
-    emit("info", "doctor_slots_viewed", cid, doctorId=doctor_id, fromDate=first.isoformat(), toDate=last.isoformat(),
-         slots=total_slots, freeSeats=total_free)
-    return json_out(200, {
+
+    by_day = {}
+    total_slots = total_free = 0
+    for it in items:
+        tid = int(it.get("consultation_type_id", 0))
+        t = (all_types if owner else types).get(tid)
+        if not owner and (it.get("status") != "OPEN" or t is None or str(it.get("start_at", "")) <= now_iso):
+            continue
+        if type_id is not None and tid != type_id:
+            continue
+        capacity = max(int(it.get("capacity", 1)), 1)
+        booked, held = int(it.get("booked_count", 0)), int(it.get("held_count", 0))
+        free = max(capacity - booked - held, 0) if it.get("status") == "OPEN" else 0
+        if only_available and free == 0:
+            continue
+        start, end = parse_utc(it["start_at"]), parse_utc(it["end_at"])
+        slot = {
+            "slotId": it["slot_id"],
+            "startAt": it["start_at"],
+            "endAt": it["end_at"],
+            "localStart": start.astimezone(zone).strftime("%H:%M"),
+            "localEnd": end.astimezone(zone).strftime("%H:%M"),
+            "consultationTypeId": tid,
+            "consultationTypeName": t["name"] if t else None,
+            "durationMinutes": int(t["duration_minutes"]) if t else int((end - start).total_seconds() // 60),
+            "fee": t["fee"] if t else None,
+            "capacity": capacity,
+            "freeSeats": free,
+            "available": free > 0,
+        }
+        if owner:
+            slot.update(status=it.get("status"), bookedCount=booked, heldCount=held,
+                        closedReason=it.get("closed_reason"), version=it.get("version"))
+        by_day.setdefault(start.astimezone(zone).date().isoformat(), []).append(slot)
+        total_slots += 1
+        total_free += free
+
+    days, day = [], first
+    while day <= last:
+        out = by_day.get(day.isoformat(), [])          # already in start-time order (sort key order)
+        days.append({"date": day.isoformat(), "weekday": WEEKDAYS[day.weekday()], "slots": out,
+                     "freeSlots": sum(1 for s in out if s["available"])})
+        day += timedelta(days=1)
+
+    result = {
         "doctorId": doctor_id,
         "timezone": str(zone),
+        "view": "owner" if owner else "public",
         "from": first.isoformat(),
         "to": last.isoformat(),
         "fromWasInThePast": clamped,
@@ -414,7 +474,25 @@ def slots(event, doctor_id, cid, now=None):
         "totalSlots": total_slots,
         "totalFreeSeats": total_free,
         "correlationId": cid,
-    })
+    }
+    if owner:
+        with dbconn(db_config()) as conn:
+            with conn.cursor() as cur:
+                rows = owner_appointments(cur, doctor_id, lo_iso, hi_iso)
+        result["appointments"] = [{
+            "appointmentId": int(r["appointment_id"]),
+            "patientId": int(r["patient_id"]),
+            "slotId": r["slot_id"],
+            "consultationTypeId": int(r["consultation_type_id"]),
+            "consultationTypeName": (all_types.get(int(r["consultation_type_id"])) or {}).get("name"),
+            "startAt": utc_text(r["start_at"]),
+            "endAt": utc_text(r["end_at"]),
+            "fee": r["fee_snapshot"],
+            "status": r["status"],
+        } for r in rows]
+    emit("info", "doctor_slots_viewed", cid, doctorId=doctor_id, view=result["view"], fromDate=first.isoformat(),
+         toDate=last.isoformat(), slots=total_slots, freeSeats=total_free, queries=1)
+    return json_out(200, result)
 
 
 # --------------------------------------------------------------------------- entrypoint

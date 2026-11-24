@@ -238,6 +238,7 @@ def login():
             return redirect("/?mode=signin&role=patient" if role=="PATIENT" else "/")
         else:
             session["access_token"]=payload["accessToken"]; session["refresh_token"]=payload.get("refreshToken"); session["role"]=role
+            if str(payload.get("userId") or "").isdigit(): session["user_id"]=int(payload["userId"])
             app.logger.info("login_succeeded cid=%s userId=%s",g.cid,payload.get("userId"))
     else:
         app.logger.warning("login_failed cid=%s HTTP %s %s",g.cid,r.status_code,r.text[:300])
@@ -490,10 +491,12 @@ def _money(v):
 def _num(v,default=0):
     try: return int(v)
     except (TypeError,ValueError): return default
+SLOT_REF_RE=re.compile(r"[1-9][0-9]{0,17}_[0-9]{8}T[0-9]{6}Z_[1-9][0-9]{0,8}")   # slotId without "SLOT#" (see lambdas/common.py)
 def slot_card(s,zone):
-    """Turn a raw slot record into something a person can read at a glance (times in the doctor's own timezone)."""
-    start=_utc(s["start_at"]).astimezone(zone); end=_utc(s["end_at"]).astimezone(zone)
-    cap=max(_num(s.get("capacity"),1),1); booked=_num(s.get("booked_count")); held=_num(s.get("held_count"))
+    """Turn one slot from the owner view of GET /doctors/{id}/slots into something a person can read at a glance
+    (times in the doctor's own timezone)."""
+    start=_utc(s["startAt"]).astimezone(zone); end=_utc(s["endAt"]).astimezone(zone)
+    cap=max(_num(s.get("capacity"),1),1); booked=_num(s.get("bookedCount")); held=_num(s.get("heldCount"))
     raw=str(s.get("status") or "").upper()
     if raw=="CLOSED": state,label="closed","Closed"
     elif booked>=cap: state,label="booked","Fully booked"
@@ -501,38 +504,53 @@ def slot_card(s,zone):
     elif held>0: state,label="hold","On hold"
     elif raw in ("","OPEN"): state,label="open","Open"
     else: state,label="closed",raw.title()
-    mins=s.get("duration_minutes") or int((end-start).total_seconds()//60)
-    details=[("Slot ID",s.get("slot_id")),("Starts (UTC)",s.get("start_at")),("Ends (UTC)",s.get("end_at")),("Seats held",held),("Closed because","Schedule changed" if s.get("closed_reason")=="SCHEDULE_CHANGE" else s.get("closed_reason")),("Version",s.get("version"))]
-    sid=str(s.get("slot_id") or "")
+    mins=s.get("durationMinutes") or int((end-start).total_seconds()//60)
+    details=[("Slot ID",s.get("slotId")),("Starts (UTC)",s.get("startAt")),("Ends (UTC)",s.get("endAt")),("Seats held",held),("Closed because","Schedule changed" if s.get("closedReason")=="SCHEDULE_CHANGE" else s.get("closedReason")),("Version",s.get("version"))]
+    sid=str(s.get("slotId") or "")
     # Milestone 5: a future slot that is not already cancelled can be cancelled by the doctor (patients refunded in full).
-    cancellable=raw!="CANCELLED" and _utc(s["start_at"])>datetime.now(timezone.utc) and bool(re.fullmatch(r"SLOT#[0-9a-f]{40}",sid))
+    cancellable=raw!="CANCELLED" and _utc(s["startAt"])>datetime.now(timezone.utc) and sid.startswith("SLOT#") and bool(SLOT_REF_RE.fullmatch(sid[5:]))
     if raw=="CANCELLED": state,label="closed","Cancelled"
-    return dict(start=_clock(start),end=_clock(end),hour=start.hour,sort=start,state=state,label=label,minutes=mins,type=s.get("consultation_type_name") or "Consultation",
+    return dict(start=_clock(start),end=_clock(end),hour=start.hour,sort=start,state=state,label=label,minutes=mins,type=s.get("consultationTypeName") or "Consultation",
                 fee=_money(s.get("fee")),capacity=cap,booked=booked,free=max(cap-booked-held,0),details=[(k,v) for k,v in details if v not in (None,"")],
-                slot_hex=sid[5:] if cancellable else None,cancellable=cancellable)
+                slot_ref=sid[5:] if cancellable else None,cancellable=cancellable)
 def appointment_card(a,zone):
-    start=_utc(a["start_at"]).astimezone(zone); end=_utc(a["end_at"]).astimezone(zone) if a.get("end_at") else None
+    start=_utc(a["startAt"]).astimezone(zone); end=_utc(a["endAt"]).astimezone(zone) if a.get("endAt") else None
     status=str(a.get("status") or "").replace("_"," ").title() or "Scheduled"
-    details=[("Appointment ref",a.get("appointment_id")),("Patient ref",a.get("patient_id")),("Slot ID",a.get("slot_id"))]
-    return dict(start=_clock(start),end=_clock(end) if end else None,type=a.get("consultation_type_name") or "Consultation",status=status,fee=_money(a.get("fee_snapshot") if a.get("fee_snapshot") is not None else a.get("fee")),details=[(k,v) for k,v in details if v not in (None,"")])
+    details=[("Appointment ref",a.get("appointmentId")),("Patient ref",a.get("patientId")),("Slot ID",a.get("slotId"))]
+    return dict(start=_clock(start),end=_clock(end) if end else None,type=a.get("consultationTypeName") or "Consultation",status=status,fee=_money(a.get("fee")),details=[(k,v) for k,v in details if v not in (None,"")])
+def own_doctor_id():
+    """The signed-in doctor's id: remembered at login, otherwise read once from GET /doctors/me."""
+    uid=session.get("user_id")
+    if not uid:
+        prof=load_profile() or {}
+        if str(prof.get("doctor_id") or "").isdigit(): uid=session["user_id"]=int(prof["doctor_id"])
+    return uid
 PARTS=[("Morning",0,12),("Afternoon",12,17),("Evening",17,24)]
 @app.get("/schedule")
 def schedule():
     day=request.args.get("date","")
-    r=api("GET","/doctors/me/schedule",params={"date":day})
+    sched=dict(date=day,ok=False,data=None,error="Could not load the schedule: choose a date (YYYY-MM-DD).",groups=[],appointments=[],counts={},pretty_date=day)
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}",day):
+        return render_dashboard("schedule",sched=sched)
+    uid=own_doctor_id()
+    if not uid:
+        sched["error"]="Could not load the schedule: create your doctor profile first."
+        return render_dashboard("schedule",sched=sched)
+    # The same endpoint patients use; asking for our OWN id returns the owner view (every slot + our appointments).
+    r=api("GET",f"/doctors/{uid}/slots",params={"from":day,"to":day})
     # Rendered directly (not stored in the cookie session) so a long day can never overflow the 4 KB cookie.
     if not r.ok: app.logger.warning("schedule failed: HTTP %s %s",r.status_code,r.text[:300])
-    sched=dict(date=day,ok=r.ok,data=None,error=f"Could not load the schedule: {api_message(r)}",groups=[],appointments=[],counts={},pretty_date=day)
+    sched.update(ok=r.ok,error=f"Could not load the schedule: {api_message(r)}")
     try:
         data=r.json()
         if r.ok and isinstance(data,dict):
             sched["data"]=data
             try: zone=ZoneInfo(data.get("timezone") or "Asia/Kolkata")
             except Exception: zone=ZoneInfo("Asia/Kolkata")
-            try: d=datetime.strptime(data.get("date") or day,"%Y-%m-%d"); sched["pretty_date"]=f"{d:%A}, {d.day} {d:%B %Y}"
+            try: d=datetime.strptime(data.get("from") or day,"%Y-%m-%d"); sched["pretty_date"]=f"{d:%A}, {d.day} {d:%B %Y}"
             except ValueError: pass
             cards=[]
-            for raw in data.get("slots") or []:
+            for raw in [s for d in data.get("days") or [] for s in d.get("slots") or []]:
                 try: cards.append(slot_card(raw,zone))
                 except (KeyError,ValueError,TypeError): app.logger.warning("skipped unreadable slot record: %s",str(raw)[:200])
             cards.sort(key=lambda c:c["sort"])
@@ -548,14 +566,14 @@ def schedule():
 @app.post("/schedule/slots/cancel")
 def schedule_cancel_slot():
     """Milestone 5: the doctor cancels one slot. Every patient booked in it is cancelled with a 100% refund (booking API)."""
-    slot_hex=request.form.get("slot","")
+    slot_ref=request.form.get("slot","")
     day=request.form.get("date","")
     back="/schedule?date="+day if re.fullmatch(r"\d{4}-\d{2}-\d{2}",day) else "/?m=schedule"
-    if not re.fullmatch(r"[0-9a-f]{40}",slot_hex) or request.form.get("confirm")!="yes":
+    if not SLOT_REF_RE.fullmatch(slot_ref) or request.form.get("confirm")!="yes":
         notify("Tick the confirmation box to cancel the slot.","error")
         return redirect(back)
     reason=" ".join(request.form.get("reason","").split())[:255]
-    r=api("POST",f"/doctors/me/slots/{slot_hex}/cancel",json={"reason":reason} if reason else {})
+    r=api("POST",f"/doctors/me/slots/{slot_ref}/cancel",json={"reason":reason} if reason else {})
     if r.ok:
         n=r.json().get("cancelledAppointments",0)
         notify("Slot cancelled."+(f" {n} patient{'s' if n!=1 else ''} refunded in full." if n else " Nobody was booked in it."),"success")

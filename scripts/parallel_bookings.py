@@ -11,7 +11,7 @@ with one patient access token per line.
         --doctor-id 42 --type-id 4 --days-ahead 9 --contenders 25
 
     # or a specific slot:
-    python scripts/parallel_bookings.py --api ... --slot-id 'SLOT#<40 hex>' --contenders 25 --cleanup
+    python scripts/parallel_bookings.py --api ... --slot-id 'SLOT#<doctorId>_<YYYYMMDDTHHMMSSZ>_<typeId>' --contenders 25 --cleanup
 """
 import argparse
 import json

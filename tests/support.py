@@ -5,6 +5,7 @@ The Lambdas talk to MySQL through PyMySQL. For fast, offline tests this module s
   * `LIKE ?` gets `ESCAPE '\\'` because MySQL treats backslash as the LIKE escape character by default
   * UTC_TIMESTAMP(6) exists as a SQLite function
   * SQLite UNIQUE violations are re-raised as pymysql IntegrityError(1062, "Duplicate entry ...")
+  * A missing table is re-raised as pymysql ProgrammingError(1146), as MySQL reports it
 So the queries exercised here are the same strings that run in production, not hand-written fakes.
 (The MySQL-specific parts - index usage, collation - are reviewed in MILESTONE4.md and on RDS.)
 """
@@ -87,6 +88,10 @@ class _Cursor:
             cur = self.owner.db.execute(sql, tuple(args))
         except sqlite3.IntegrityError as exc:
             raise pymysql.err.IntegrityError(1062, f"Duplicate entry for key ({exc})")
+        except sqlite3.OperationalError as exc:
+            if "no such table" in str(exc):          # MySQL: ER_NO_SUCH_TABLE
+                raise pymysql.err.ProgrammingError(1146, str(exc))
+            raise
         self.lastrowid = cur.lastrowid
         self.rows = [dict(r) for r in cur.fetchall()] if cur.description else []
         return len(self.rows)
@@ -202,27 +207,84 @@ class FakeAuthTable:
         self.items[(Key["token_key"], Key["token_type"])]["status"] = ExpressionAttributeValues[":r"]
 
 
-def condition_value(cond):
-    """The value inside Key('doctor_date').eq(value) for both real boto3 and the offline stub."""
-    return cond.get_expression()["values"][1] if hasattr(cond, "get_expression") else cond[2]
+def _cond(cond, item):
+    """Evaluate a boto3 Key()/Attr() condition (real boto3 or the offline stub) against one item."""
+    expr = cond.get_expression()
+    op, vals = expr["operator"], expr["values"]
+    if op == "AND":
+        return _cond(vals[0], item) and _cond(vals[1], item)
+    name = vals[0].name
+    if name not in item:
+        return False
+    if op == "=":
+        return item[name] == vals[1]
+    if op == "BETWEEN":
+        return vals[1] <= item[name] <= vals[2]
+    raise AssertionError(f"condition {op} not modelled")
+
+
+def _key_attrs(cond):
+    expr = cond.get_expression()
+    if expr["operator"] == "AND":
+        return _key_attrs(expr["values"][0]) | _key_attrs(expr["values"][1])
+    return {expr["values"][0].name}
 
 
 class FakeSlotsTable:
-    """DynamoDB Slots table with the GSI_DoctorDate query the Lambdas use."""
+    """DynamoDB Slots table: partition key doctor_id, sort key slot_key, no secondary index.
+    Query enforces the real rules - key condition only on the table keys, partition key equality required,
+    results sorted by sort key, FilterExpression applied after the read - and returns pages of `page_size`
+    items with LastEvaluatedKey so callers must paginate."""
 
-    def __init__(self, items=(), fail=False):
+    def __init__(self, items=(), fail=False, page_size=1000):
         self.items = list(items)
         self.fail = fail
-        self.queries = []
+        self.page_size = page_size
+        self.queries = []            # one entry per Query call: (doctor_id, lo, hi)
+        self.updates = []
+
+    def add(self, item):
+        item = dict(item)
+        item.setdefault("slot_key", f"{item['start_at']}#{int(item['consultation_type_id'])}")
+        self.items.append(item)
+        return item
 
     def query(self, **kwargs):
         if self.fail:
             raise RuntimeError("dynamodb unavailable")
-        assert kwargs["IndexName"] == "GSI_DoctorDate"
-        wanted = condition_value(kwargs["KeyConditionExpression"])
-        self.queries.append(wanted)
-        hits = sorted((i for i in self.items if i["doctor_date"] == wanted), key=lambda i: i["start_at"])
-        return {"Items": hits}
+        assert "IndexName" not in kwargs, "the Slots table has no secondary index"
+        key = kwargs["KeyConditionExpression"]
+        assert _key_attrs(key) <= {"doctor_id", "slot_key"} and "doctor_id" in _key_attrs(key), _key_attrs(key)
+        parts = key.get_expression()["values"]
+        rng = parts[1].get_expression()["values"] if key.get_expression()["operator"] == "AND" else None
+        self.queries.append((parts[0].get_expression()["values"][1] if rng else parts[1],
+                             rng[1] if rng else None, rng[2] if rng else None))
+        hits = sorted((i for i in self.items if _cond(key, i)), key=lambda i: i["slot_key"])
+        start = kwargs.get("ExclusiveStartKey")
+        if start:
+            hits = [i for i in hits if i["slot_key"] > start["slot_key"]]
+        page, rest = hits[:self.page_size], hits[self.page_size:]
+        if "FilterExpression" in kwargs:
+            page = [i for i in page if _cond(kwargs["FilterExpression"], i)]
+        out = {"Items": [dict(i) for i in page]}
+        if rest:
+            last = hits[self.page_size - 1]
+            out["LastEvaluatedKey"] = {"doctor_id": last["doctor_id"], "slot_key": last["slot_key"]}
+        return out
+
+    def put_item(self, Item, ConditionExpression=None, **_):
+        exists = any(i["doctor_id"] == Item["doctor_id"] and i["slot_key"] == Item["slot_key"] for i in self.items)
+        if exists and ConditionExpression == "attribute_not_exists(slot_key)":
+            from botocore.exceptions import ClientError
+            raise ClientError({"Error": {"Code": "ConditionalCheckFailedException", "Message": "exists"}}, "PutItem")
+        self.items = [i for i in self.items if not (i["doctor_id"] == Item["doctor_id"] and i["slot_key"] == Item["slot_key"])]
+        self.items.append(dict(Item))
+        return {}
+
+    def update_item(self, Key, **kwargs):
+        assert set(Key) == {"doctor_id", "slot_key"}, Key
+        self.updates.append((Key, kwargs))
+        return {}
 
 
 class FakeDdb:

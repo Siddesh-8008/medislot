@@ -65,7 +65,10 @@ import boto3
 import pymysql
 
 from common import (FieldErrors, body, clean_date_of_birth, clean_gender, clean_person_name, correlation, db_config,
-                    dbconn, emit, instrument, json_out)
+                    dbconn, emit, instrument, json_out, parse_slot_id)
+# slotId = "SLOT#<doctorId>_<YYYYMMDDTHHMMSSZ>_<typeId>" carries the Slots table key; SLOT_REF_RE is the same id
+# without "SLOT#", as used in the doctor's cancel URL. Both live in common.py so every Lambda agrees on the format.
+from common import SLOT_ID_RE, SLOT_REF_RE  # noqa: E402
 
 _cfg = boto3.session.Config(connect_timeout=3, read_timeout=5, retries={"max_attempts": 3, "mode": "standard"})
 ddb = boto3.client("dynamodb", config=_cfg)
@@ -76,8 +79,6 @@ events = boto3.client("events", config=boto3.session.Config(connect_timeout=2, r
 
 UTC = timezone.utc
 CENT = Decimal("0.01")
-SLOT_ID_RE = re.compile(r"SLOT#[0-9a-f]{40}")
-SLOT_HEX_RE = re.compile(r"[0-9a-f]{40}")
 IDEMPOTENCY_KEY_RE = re.compile(r"[A-Za-z0-9._:\-]{8,128}")
 TIER_NAME_RE = re.compile(r"[A-Z][A-Z0-9_]{0,29}")
 CANCELLED = ("CANCELLED_BY_PATIENT", "CANCELLED_BY_DOCTOR")
@@ -388,8 +389,19 @@ def _code(exc):
     return (getattr(exc, "response", None) or {}).get("Error", {}).get("Code")
 
 
+def slot_table_key(slot_id):
+    """Low-level DynamoDB key {doctor_id, slot_key} for a slotId (decoded from the id itself, no lookup)."""
+    parsed = parse_slot_id(slot_id)
+    if parsed is None:
+        raise ValueError("not a slot id")
+    doctor_id, sk = parsed
+    return {"doctor_id": {"N": str(doctor_id)}, "slot_key": {"S": sk}}
+
+
 def get_slot(slot_id):
-    res = ddb.get_item(TableName=slots_table(), Key={"slot_id": {"S": slot_id}}, ConsistentRead=True)
+    if parse_slot_id(slot_id) is None:
+        return None
+    res = ddb.get_item(TableName=slots_table(), Key=slot_table_key(slot_id), ConsistentRead=True)
     return _item(res["Item"]) if res.get("Item") else None
 
 
@@ -403,7 +415,7 @@ def claim_seat(slot, idem_key, attempt_id, now):
     -> 'ok' | 'conflict' (someone else changed the slot; retry) | 'lost' (our idempotency record was taken over)."""
     version = slot.get("version")
     slot_update = {
-        "TableName": slots_table(), "Key": {"slot_id": {"S": slot["slot_id"]}},
+        "TableName": slots_table(), "Key": slot_table_key(slot["slot_id"]),
         "UpdateExpression": "SET booked_count = :nb, version = :nv, updated_at = :now",
         "ConditionExpression": ("version = :v" if version is not None else "attribute_not_exists(version)") + " AND #st = :open",
         "ExpressionAttributeNames": {"#st": "status"},
@@ -439,7 +451,7 @@ def release_seat(slot_id, cid, reason):
     for attempt in range(1, 4):
         try:
             res = ddb.update_item(
-                TableName=slots_table(), Key={"slot_id": {"S": slot_id}},
+                TableName=slots_table(), Key=slot_table_key(slot_id),
                 UpdateExpression="SET booked_count = booked_count - :one, version = version + :one, updated_at = :now",
                 ConditionExpression="booked_count > :zero",
                 ExpressionAttributeValues=_vals(one=1, zero=0, now=iso(utcnow())), ReturnValues="ALL_NEW")
@@ -463,7 +475,7 @@ def mark_slot_cancelled(slot_id, doctor_id, now):
     -> 'cancelled' | 'already' | 'started' | 'missing'"""
     try:
         ddb.update_item(
-            TableName=slots_table(), Key={"slot_id": {"S": slot_id}},
+            TableName=slots_table(), Key=slot_table_key(slot_id),
             UpdateExpression="SET #st = :c, closed_reason = :r, cancelled_at = :now, version = version + :one",
             ConditionExpression="doctor_id = :d AND start_at > :now AND #st <> :c",
             ExpressionAttributeNames={"#st": "status"},
@@ -1076,7 +1088,7 @@ def cancel_by_patient(appointment_id, uid, cid):
 
 def cancel_slot_by_doctor(event, raw_slot, uid, cid):
     slot_id = unquote(raw_slot or "")
-    if SLOT_HEX_RE.fullmatch(slot_id):
+    if SLOT_REF_RE.fullmatch(slot_id):
         slot_id = "SLOT#" + slot_id
     if not SLOT_ID_RE.fullmatch(slot_id):
         return respond(422, msg(cid, "slotId is not valid", "SLOT_ID_INVALID"))
