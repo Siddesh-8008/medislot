@@ -67,7 +67,13 @@ class FakeApi:
     """Records calls; remembers what each doctor created so a second run can be checked."""
 
     def __init__(self):
-        self.users, self.types, self.patterns, self.calls = {}, {}, {}, []
+        self.users, self.types, self.patterns, self.photos, self.calls, self.puts = {}, {}, {}, {}, [], []
+
+    def put(self, url, data, headers):
+        assert data.startswith(b"\x89PNG") and headers["Content-Type"] == "image/png"
+        assert headers["x-amz-server-side-encryption"] == "AES256"          # signed into the pre-signed URL
+        self.puts.append(url)
+        return 200
 
     def __call__(self, api, method, path, token=None, body=None):
         self.calls.append((method, path))
@@ -83,6 +89,14 @@ class FakeApi:
                 return 200, {"items": [{"consultation_type_id": t} for t in self.types.get(token, [])]}
             self.types.setdefault(token, []).append(body["consultationTypeId"])
             return 201, {}
+        if path == "/doctors/me" and method == "GET":
+            return 200, {"profile": {"photo_key": self.photos.get(token)}}
+        if path == "/doctors/me/photo-upload-url":
+            assert body["contentType"] == "image/png"
+            return 200, {"uploadUrl": f"https://s3.test/{token}", "photoKey": f"doctors/{token}/x.png"}
+        if path == "/doctors/me" and method == "PATCH":
+            self.photos[token] = body["photoKey"]
+            return 200, {}
         if path == "/doctors/me/availability-patterns":
             if method == "GET":
                 return 200, {"items": self.patterns.get(token, [])}
@@ -96,14 +110,32 @@ class FakeApi:
 def test_seeding_creates_everything_once_and_a_rerun_changes_nothing(monkeypatch, capsys):
     fake = FakeApi()
     monkeypatch.setattr(seed, "call", fake)
+    monkeypatch.setattr(seed, "put_file", fake.put)
     assert all(seed.seed_one("http://api", n, d) for n, d in enumerate(seed.DOCTORS, start=1))
     assert len(fake.users) == 15
     assert sum(len(v) for v in fake.types.values()) == sum(len(d[7]) for d in seed.DOCTORS)
     assert sum(len(v) for v in fake.patterns.values()) == sum(len(d[8]) for d in seed.DOCTORS)
+    assert len(fake.photos) == 15 and len(fake.puts) == 15                                    # every doctor has a photo
     fake.calls.clear()
+    fake.puts.clear()
     assert all(seed.seed_one("http://api", n, d) for n, d in enumerate(seed.DOCTORS, start=1))
-    assert not [c for c in fake.calls if c[0] == "POST" and c[1].startswith("/doctors/me")]      # nothing re-created
+    assert not [c for c in fake.calls if c[0] in ("POST", "PATCH") and c[1].startswith("/doctors/me")]   # nothing re-created
+    assert fake.puts == []                                                                    # photos not re-uploaded
     assert "account already exists" in capsys.readouterr().out
+
+
+def test_no_photos_flag_skips_uploads(monkeypatch):
+    fake = FakeApi()
+    monkeypatch.setattr(seed, "call", fake)
+    monkeypatch.setattr(seed, "put_file", fake.put)
+    assert seed.seed_one("http://api", 1, seed.DOCTORS[0], photos=False)
+    assert fake.puts == [] and not [c for c in fake.calls if "photo" in c[1]]
+
+
+def test_every_doctor_has_a_photo_the_api_accepts():
+    for n in range(1, 16):
+        data = seed.photo_path(n).read_bytes()
+        assert data.startswith(b"\x89PNG") and 0 < len(data) <= 5 * 1024 * 1024        # PNG, within the 5 MB limit
 
 
 def test_dry_run_prints_every_password(capsys, monkeypatch):
