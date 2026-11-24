@@ -1780,6 +1780,8 @@ def test_only_free_slots_with_valid_ids_get_a_book_button_each_with_its_own_key(
     second = env.client.get("/patient/doctors/1").get_data(as_text=True)
     assert re.findall(r'name="key" value="([0-9a-f]{32})"', second) != keys           # a new page = a new key
     assert 'name="back" value="/patient/doctors/1"' in page
+    assert page.count('<span class="go">Book</span>') == 1                     # a visible Book button on the free slot
+    assert '<span class="go off">Full</span>' in page                          # the full slot says so instead
 
 
 def test_booking_sends_the_form_key_as_idempotency_key_and_opens_the_appointment(env):

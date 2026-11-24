@@ -111,9 +111,9 @@
      {% for grp in day.groups %}
       <div class="part">{{grp.label}} <small>{{ grp.cards|length }} slot{{ '' if grp.cards|length==1 else 's' }}</small></div>
       <div class="times">{% for s in grp.cards %}
-       {% if s.bookable %}<form method="post" action="/patient/book" class="tform" onsubmit="var f=document.getElementById('book-for'),i=this.querySelector('[name=dependentId]');if(f&&i)i.value=f.value;var b=this.querySelector('button');b.disabled=true;b.querySelector('b').textContent='Booking…'"><input type="hidden" name="slotId" value="{{s.id}}"><input type="hidden" name="key" value="{{s.key}}"><input type="hidden" name="back" value="{{ here }}">{% if family %}<input type="hidden" name="dependentId" value="">{% endif %}
-        <button class="tchip {{s.state}}" title="Book {{s.type}} at {{s.start}}" aria-label="Book {{s.type}} at {{s.start}}, {{ day.title }}"><b>{{s.start}}</b><small>{{s.type}} · {{s.minutes}} min</small><small>{% if s.fee %}{{s.fee}} · {% endif %}<span class="seat">{{s.seats}}</span></small></button></form>
-       {% else %}<div class="tchip {{s.state}}" title="{{ s.label }}"><b>{{s.start}}</b><small>{{s.type}} · {{s.minutes}} min</small><small>{% if s.fee %}{{s.fee}} · {% endif %}<span class="seat">{{s.seats}}</span></small></div>{% endif %}
+       {% if s.bookable %}<form method="post" action="/patient/book" class="tform" onsubmit="var f=document.getElementById('book-for'),i=this.querySelector('[name=dependentId]');if(f&&i)i.value=f.value;var b=this.querySelector('button');b.disabled=true;b.querySelector('.go').textContent='Booking…'"><input type="hidden" name="slotId" value="{{s.id}}"><input type="hidden" name="key" value="{{s.key}}"><input type="hidden" name="back" value="{{ here }}">{% if family %}<input type="hidden" name="dependentId" value="">{% endif %}
+        <button class="tchip {{s.state}}" title="Book {{s.type}} at {{s.start}}" aria-label="Book {{s.type}} at {{s.start}}, {{ day.title }}"><b>{{s.start}}</b><small>{{s.type}} · {{s.minutes}} min</small><small>{% if s.fee %}{{s.fee}} · {% endif %}<span class="seat">{{s.seats}}</span></small><span class="go">Book</span></button></form>
+       {% else %}<div class="tchip {{s.state}}" title="{{ s.label }}"><b>{{s.start}}</b><small>{{s.type}} · {{s.minutes}} min</small><small>{% if s.fee %}{{s.fee}} · {% endif %}<span class="seat">{{s.seats}}</span></small>{% if s.state=='booked' %}<span class="go off">Full</span>{% endif %}</div>{% endif %}
       {% endfor %}</div>
      {% endfor %}</section>
     {% endfor %}
