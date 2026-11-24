@@ -370,6 +370,24 @@ jobs:
           print("All required indexes are present.")
           '
 
+      # Runs after rds-connection-check has created the hospitals, specializations and consultation types.
+      # Safe on every deploy: existing doctors, types, weekly hours and photos are skipped. To turn it off,
+      # set the GitHub Actions variable SEED_DEMO_DOCTORS to "false". A seeding problem is reported as a
+      # warning and never blocks the deployment.
+      - name: Seed demo doctors (15 accounts, consultation types, weekly hours, photos)
+        if: ${{ vars.SEED_DEMO_DOCTORS != 'false' }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          API_URL="$(aws cloudformation describe-stacks --stack-name "medislot-${ENVIRONMENT}-auth" --region "$AWS_REGION" \
+            --query "Stacks[0].Outputs[?OutputKey=='ApiUrl'].OutputValue | [0]" --output text)"
+          [[ -n "$API_URL" && "$API_URL" != "None" ]] || { echo "::error::Could not find ApiUrl output on the auth stack."; exit 1; }
+          if ! python scripts/seed_doctors.py --api "${API_URL%/}"; then
+            echo "::warning::Some demo doctors could not be fully seeded. See the log above; re-running the deploy retries only what is missing."
+            exit 1
+          fi
+
       - name: Integration tests against the deployed API
         shell: bash
         run: |
