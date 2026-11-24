@@ -25,13 +25,13 @@ WEEKDAYS=[(1,"Monday"),(2,"Tuesday"),(3,"Wednesday"),(4,"Thursday"),(5,"Friday")
 # The dashboard reads them through the API, so there is a single source of truth.
 # key, label, icon, accent colour, one-line description
 MODULES=[
- ("overview","Overview","home","#0f6b73","Your practice at a glance and what to set up next."),
- ("profile","Profile","user","#7a4fd6","Your name, hospital, specialization and credentials."),
- ("photo","Profile photo","camera","#e0572f","The picture patients see when they find you."),
- ("consultation","Consultation types","list","#b9801c","What you offer, how long it takes and what it costs."),
- ("availability","Availability","clock","#1f7a4d","Weekly working hours and the days you are away."),
- ("appointments","Appointments","clipboard","#c2417a","Patients who have booked with you."),
- ("schedule","Schedule","calendar","#2563b8","Look up slots and appointments for any day."),
+ ("overview","Overview","home","#2c9a73","Your practice at a glance and what to set up next."),
+ ("profile","Profile","user","#3a8dd6","Your name, hospital, specialization and credentials."),
+ ("photo","Profile photo","camera","#46b3a5","The picture patients see when they find you."),
+ ("consultation","Consultation types","list","#4fa86a","What you offer, how long it takes and what it costs."),
+ ("availability","Availability","clock","#2f86c9","Weekly working hours and the days you are away."),
+ ("appointments","Appointments","clipboard","#2a9d8f","Patients who have booked with you."),
+ ("schedule","Schedule","calendar","#4a7fd4","Look up slots and appointments for any day."),
 ]
 # Tabs of the Appointments module -> query for GET /appointments (the booking API filters by the signed-in doctor).
 APPT_TABS={"upcoming":{"when":"upcoming","status":"CONFIRMED"},"past":{"when":"past"},"cancelled":{"status":"CANCELLED"}}
@@ -171,6 +171,8 @@ def home():
         extra["appts"]=load_bookings(tab,page,APPT_PAGE_SIZE)
     if module=="overview":
         extra["upcoming"]=load_bookings("upcoming",1,5)
+    if module=="profile":
+        extra["upcoming"]=load_bookings("upcoming",1,6)     # the profile page also shows who is coming next
     if module in ("overview","profile","photo"):
         profile=load_profile()
         extra.update(profile=profile,p=profile or {})

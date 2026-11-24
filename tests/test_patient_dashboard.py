@@ -443,9 +443,39 @@ def test_doctor_page_shows_fees_and_slot_cards_by_part_of_day(env):
     assert "Dr. Anil Rao" in page and "Quick Consult" in page and "₹300" in page and "₹150" in page and "up to 10 patients" in page
     assert "Morning" in page and "Afternoon" in page and "Evening" in page
     assert "1 seat" in page and "2 of 10 seats free" in page and "No seats left" in page and "Few seats left" in page
-    assert "slot open" in page and "slot partial" in page and "slot booked" in page
+    assert "tchip open" in page and "tchip partial" in page and "tchip booked" in page
     assert "<table" not in page.split("Available slots", 1)[1]
     assert "No slots on: Thu 5" in page and "2 of 3 slots free" in page
+
+
+def test_searching_one_date_asks_the_api_for_just_that_day(env):
+    open_doctor(env)
+    env.client.get("/patient/doctors/1?on=2026-11-06&from=2026-11-01&to=2026-11-30&type=1")
+    assert env.last_slot_params == {"from": "2026-11-06", "to": "2026-11-06", "consultationTypeId": "1"}   # on wins over a range
+    env.client.get("/patient/doctors/1?on=not-a-date")
+    assert env.last_slot_params == {}                                                                       # default: next 7 days
+
+
+def test_quick_date_links_and_week_at_a_glance(env):
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+    open_doctor(env)
+    page = env.client.get("/patient/doctors/1?type=4").get_data(as_text=True)
+    today = datetime.now(ZoneInfo("Asia/Kolkata")).date()
+    for label in ("Today", "Tomorrow", "This week", "Next week"):
+        assert f">{label}</a>" in page
+    assert f"on={today.isoformat()}&amp;type=4" in page                                                  # filters are kept
+    assert f"from={(today + timedelta(days=7)).isoformat()}&amp;to={(today + timedelta(days=13)).isoformat()}" in page
+    assert 'class="week"' in page and 'href="#day-2026-11-04"' in page and "2 free" in page             # one tile per day
+    assert "No slots</span>" in page and 'id="day-2026-11-04"' in page
+
+
+def test_single_day_view_has_no_week_strip(env):
+    one = slots_payload(days=slots_payload()["days"][:1])
+    one.update({"from": "2026-11-04", "to": "2026-11-04"})
+    open_doctor(env, slots=FakeResp(200, one))
+    page = env.client.get("/patient/doctors/1?on=2026-11-04").get_data(as_text=True)
+    assert 'class="week"' not in page and "Showing 2026-11-04 ·" in page and 'value="2026-11-04"' in page
 
 
 def test_slot_filters_are_forwarded(env):

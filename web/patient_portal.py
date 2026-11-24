@@ -45,12 +45,12 @@ KEY_RE = re.compile(r"^[A-Za-z0-9._:\-]{8,128}$")
 FILTERS_TTL = 300
 _filters = {"at": 0.0, "data": None}
 NAV = [
-    ("home", "Home", "home", "#0f6b73", "/patient", "Your account and where to start."),
-    ("doctors", "Find a doctor", "search", "#2563b8", "/patient/doctors", "Search by name, hospital, specialization or city."),
-    ("appointments", "My appointments", "calendar", "#1f7a4d", "/patient/appointments", "Your bookings, and cancelling with a refund."),
-    ("refunds", "Refunds", "list", "#b9801c", "/patient/refunds", "Every refund calculated for a cancelled appointment."),
-    ("family", "Family members", "user", "#c2417a", "/patient/family", "People you book appointments for, like a parent or child."),
-    ("profile", "My profile", "user", "#7a4fd6", "/patient/profile", "Your details, kept private to you."),
+    ("home", "Home", "home", "#2c9a73", "/patient", "Your account and where to start."),
+    ("doctors", "Find a doctor", "search", "#3a8dd6", "/patient/doctors", "Search by name, hospital, specialization or city."),
+    ("appointments", "My appointments", "calendar", "#2a9d8f", "/patient/appointments", "Your bookings, and cancelling with a refund."),
+    ("refunds", "Refunds", "list", "#4fa86a", "/patient/refunds", "Every refund calculated for a cancelled appointment."),
+    ("family", "Family members", "user", "#46b3a5", "/patient/family", "People you book appointments for, like a parent or child."),
+    ("profile", "My profile", "user", "#4a7fd4", "/patient/profile", "Your details, kept private to you."),
 ]
 
 
@@ -307,11 +307,27 @@ def slot_days(data):
             empty.append(pretty_day(day["date"]).split(",")[0][:3] + " " + day["date"][8:10].lstrip("0"))
             continue
         days.append({
-            "title": pretty_day(day["date"]), "free": day.get("freeSlots", 0), "total": len(cards),
+            "id": "day-" + day["date"], "title": pretty_day(day["date"]), "free": day.get("freeSlots", 0), "total": len(cards),
             "groups": [{"label": lbl, "cards": [c for c in cards if lo <= c["hour"] < hi]} for lbl, lo, hi in PARTS
                        if any(lo <= c["hour"] < hi for c in cards)],
         })
     return days, empty
+
+
+def week_strip(data, today):
+    """One tile per day of the shown window: weekday, date and how many slots are still free (links to that day)."""
+    out = []
+    for day in data.get("days", []):
+        try:
+            d = date.fromisoformat(day["date"])
+        except (KeyError, ValueError):
+            continue
+        slots = day.get("slots") or []
+        free = sum(1 for s in slots if int(s.get("freeSeats") or 0) > 0)
+        out.append({"id": "day-" + day["date"], "weekday": f"{d:%a}", "day": d.day, "month": f"{d:%b}", "today": d == today,
+                    "state": "none" if not slots else ("full" if free == 0 else ""), "has_slots": bool(slots),
+                    "label": "No slots" if not slots else (f"{free} free" if free else "Full")})
+    return out
 
 
 def doctor_url(doctor_id, **params):
@@ -336,13 +352,18 @@ def doctor_page(doctor_id):
 
     start = request.args.get("from", "").strip()
     end = request.args.get("to", "").strip()
+    on = request.args.get("on", "").strip()          # "Find slots on a date": one day, wins over from/to
     type_id = request.args.get("type", "").strip()
     only_free = request.args.get("free") == "1"
     params = {}
-    if DATE_RE.match(start):
-        params["from"] = start
-    if DATE_RE.match(end):
-        params["to"] = end
+    if DATE_RE.match(on):
+        params["from"] = params["to"] = on
+    else:
+        on = ""
+        if DATE_RE.match(start):
+            params["from"] = start
+        if DATE_RE.match(end):
+            params["to"] = end
     if re.fullmatch(r"[0-9]{1,9}", type_id):
         params["consultationTypeId"] = type_id
     if only_free:
@@ -363,15 +384,26 @@ def doctor_page(doctor_id):
             d("app").logger.error("slots upstream error: %s", exc)
             slot_error = "Slot availability is unavailable right now. Please try again in a moment."
 
+    try:
+        today = datetime.now(ZoneInfo(doc.get("timezone") or "Asia/Kolkata")).date()
+    except Exception:  # noqa: BLE001
+        today = date.today()
+    common = {"type": params.get("consultationTypeId"), "free": "1" if only_free else None}
+    # Quick date searches. "This week" is the default view: the next 7 days from today.
+    quick = []
+    for label, first_day, days_long in (("Today", today, 1), ("Tomorrow", today + timedelta(days=1), 1),
+                                        ("This week", today, 7), ("Next week", today + timedelta(days=7), 7)):
+        last_day = first_day + timedelta(days=days_long - 1)
+        url = (doctor_url(doctor_id, on=first_day.isoformat(), **common) if days_long == 1 else
+               doctor_url(doctor_id, **{"from": first_day.isoformat(), "to": last_day.isoformat()}, **common))
+        quick.append({"label": label, "url": url,
+                      "on": bool(window) and window == (first_day.isoformat(), last_day.isoformat())})
+    week = week_strip(slots, today) if slots and window and window[0] != window[1] else []
+
     prev_url = next_url = None
     if window:
         first, last = date.fromisoformat(window[0]), date.fromisoformat(window[1])
         span = (last - first).days + 1
-        try:
-            today = datetime.now(ZoneInfo(doc.get("timezone") or "Asia/Kolkata")).date()
-        except Exception:  # noqa: BLE001
-            today = date.today()
-        common = {"type": params.get("consultationTypeId"), "free": "1" if only_free else None}
         if first > today:
             new_first = max(first - timedelta(days=span), today)
             prev_url = doctor_url(doctor_id, **{"from": new_first.isoformat(), "to": (first - timedelta(days=1)).isoformat()}, **common)
@@ -390,6 +422,7 @@ def doctor_page(doctor_id):
         experience=f"{exp} years" if isinstance(exp, int) and exp > 0 else None,
         types=[dict(t, fee_label=rupees(t.get("fee"))) for t in types], days=days, empty_days=empty, slots=slots,
         slot_error=slot_error, window=window, selected_type=params.get("consultationTypeId", ""), only_free=only_free,
+        on_date=on, today=today.isoformat(), quick=quick, week=week, custom_range=bool(not on and (start or end)),
         prev_url=prev_url, next_url=next_url, back_url="/patient/doctors" + ("?" + session["last_search"] if session.get("last_search") else ""),
         here=request.full_path.rstrip("?"),
     )

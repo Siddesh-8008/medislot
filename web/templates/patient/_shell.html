@@ -16,9 +16,9 @@
 {% if page=='home' %}
   <section class="hello"><div><h2>{{ greeting }}{{ ', '+profile.firstName if profile }}</h2><p>Find a doctor by name, hospital, specialization or city, and see which time slots are free.</p></div></section>
   <ul class="todo">
-   <li><a href="/patient/doctors"><span class="tick" style="background:#2563b8;border-color:#2563b8">{{ icon('search') }}</span><span class="t"><b>Find a doctor</b><span>Search with any mix of filters and browse their free slots.</span></span><span class="go">Start →</span></a></li>
-   <li><a href="/patient/appointments"><span class="tick" style="background:#1f7a4d;border-color:#1f7a4d">{{ icon('calendar') }}</span><span class="t"><b>My appointments</b><span>See what you have booked, or cancel with a refund.</span></span><span class="go">Open →</span></a></li>
-   <li><a href="/patient/profile"><span class="tick" style="background:#7a4fd6;border-color:#7a4fd6">{{ icon('user') }}</span><span class="t"><b>Check your profile</b><span>Keep your phone number and details up to date.</span></span><span class="go">Open →</span></a></li>
+   <li><a href="/patient/doctors"><span class="tick" style="background:#3a8dd6;border-color:#3a8dd6">{{ icon('search') }}</span><span class="t"><b>Find a doctor</b><span>Search with any mix of filters and browse their free slots.</span></span><span class="go">Start →</span></a></li>
+   <li><a href="/patient/appointments"><span class="tick" style="background:#2c9a73;border-color:#2c9a73">{{ icon('calendar') }}</span><span class="t"><b>My appointments</b><span>See what you have booked, or cancel with a refund.</span></span><span class="go">Open →</span></a></li>
+   <li><a href="/patient/profile"><span class="tick" style="background:#46b3a5;border-color:#46b3a5">{{ icon('user') }}</span><span class="t"><b>Check your profile</b><span>Keep your phone number and details up to date.</span></span><span class="go">Open →</span></a></li>
   </ul>
   {% if profile %}<div class="tiles"><div class="tile"><small>Name</small><strong style="font-size:22px;padding-top:10px">{{ profile.firstName }} {{ profile.lastName }}</strong></div><div class="tile"><small>Phone</small><strong style="font-size:22px;padding-top:10px">{{ profile.phone or '—' }}</strong></div></div>
   {% else %}<div class="banner error" style="margin-top:28px"><span>Your profile could not be loaded right now. Please refresh in a moment.</span></div>{% endif %}
@@ -86,34 +86,41 @@
 
   {% if types %}
   <h2 class="sub-h">Available slots</h2>
-  <section class="panel"><form method="get" class="slotbar">
-   <label>From<input type="date" name="from" value="{{ window[0] if window else '' }}"></label>
-   <label>To<input type="date" name="to" value="{{ window[1] if window else '' }}"></label>
+  <section class="panel"><form method="get" class="datesearch">
+   <label>Find slots on a date<input type="date" name="on" min="{{ today }}" value="{{ on_date }}"></label>
    <label>Type<select name="type"><option value="">All types</option>{% for t in types %}<option value="{{t.consultationTypeId}}" {{ 'selected' if selected_type==(t.consultationTypeId|string) }}>{{t.name}}</option>{% endfor %}</select></label>
-   <div class="row"><label class="check"><input type="checkbox" name="free" value="1" {{ 'checked' if only_free }}> Free only</label><button>Show slots</button></div>
+   <div class="row" style="display:flex;gap:14px;align-items:center;flex-wrap:wrap"><label class="check"><input type="checkbox" name="free" value="1" {{ 'checked' if only_free }}> Free only</label><button>Search</button></div>
+   <div class="quick"><span>Quick:</span>{% for q in quick %}<a class="qchip {{ 'on' if q.on }}" href="{{ q.url }}">{{ q.label }}</a>{% endfor %}</div>
+   <details {{ 'open' if custom_range }}><summary>Custom date range</summary><div>
+    <label>From<input type="date" name="from" value="{{ window[0] if window and not on_date else '' }}"></label>
+    <label>To<input type="date" name="to" value="{{ window[1] if window and not on_date else '' }}"></label>
+    <span class="hint" style="grid-column:span 2">Leave “Find slots on a date” empty to use a range (up to 31 days).</span>
+   </div></details>
   </form></section>
 
   {% if slot_error %}<div class="banner error" style="margin-top:24px"><span>{{ slot_error }}</span></div>
   {% elif slots %}
    {% if slots.fromWasInThePast %}<p class="quiet" style="margin-top:16px">Dates in the past were skipped; showing slots from today.</p>{% endif %}
-   <p class="day-sub" style="margin-top:20px">Showing {{ window[0] }} to {{ window[1] }} · times in {{ slots.timezone }} · {{ slots.totalFreeSeats }} free seat{{ '' if slots.totalFreeSeats==1 else 's' }}</p>
+   <p class="day-sub" style="margin-top:20px">{% if window[0]==window[1] %}Showing {{ window[0] }}{% else %}Showing {{ window[0] }} to {{ window[1] }}{% endif %} · times in {{ slots.timezone }} · {{ slots.totalFreeSeats }} free seat{{ '' if slots.totalFreeSeats==1 else 's' }}</p>
+   {% if week %}<nav class="week" aria-label="Week at a glance">{% for w in week %}<a class="wday {{ w.state }} {{ 'today' if w.today }}" href="{{ '#'~w.id if w.has_slots else '#' }}"><small>{{ 'Today' if w.today else w.weekday }}</small><b>{{ w.day }}</b><small style="letter-spacing:0;text-transform:none;font-weight:500">{{ w.month }}</small><span>{{ w.label }}</span></a>{% endfor %}</nav>{% endif %}
    {% if days %}
-    <div class="legend"><span style="--c:var(--ok)"><i></i>Free</span><span style="--c:#c98a12"><i></i>Few seats left</span><span style="--c:var(--coral)"><i></i>Full</span></div>
+    <div class="legend" style="margin-top:14px"><span style="--c:var(--teal)"><i></i>Free</span><span style="--c:#c98a12"><i></i>Few seats left</span><span style="--c:#a7b9bd"><i></i>Full</span></div>
+    {% if family %}<div class="bookfor"><label for="book-for" style="display:inline">Booking for</label><select id="book-for"><option value="">Me</option>{% for f in family %}<option value="{{f.id}}">{{f.name}} ({{f.relation}})</option>{% endfor %}</select><span style="font-weight:500">Then pick a time below.</span></div>{% endif %}
     {% for day in days %}
-     <h3 class="day-title">{{ day.title }}</h3><p class="day-sub">{{ day.free }} of {{ day.total }} slot{{ '' if day.total==1 else 's' }} free</p>
+     <section class="dayblock" id="{{ day.id }}"><div class="dhead"><h3>{{ day.title }}</h3><p>{{ day.free }} of {{ day.total }} slot{{ '' if day.total==1 else 's' }} free</p></div>
      {% for grp in day.groups %}
       <div class="part">{{grp.label}} <small>{{ grp.cards|length }} slot{{ '' if grp.cards|length==1 else 's' }}</small></div>
-      <div class="cards">{% for s in grp.cards %}
-       <article class="slot {{s.state}}"><div class="top"><div class="time">{{s.start}}<small>to {{s.end}} · {{s.minutes}} min</small></div><span class="chip">{{s.label}}</span></div>
-        <div class="what">{{s.type}}</div>
-        <div class="facts">{% if s.fee %}<span>Fee <b>{{s.fee}}</b></span>{% endif %}<span>{{s.seats}}</span></div>
-        {% if s.bookable %}<form method="post" action="/patient/book" class="bookform" onsubmit="var b=this.querySelector('button');b.disabled=true;b.textContent='Booking…'"><input type="hidden" name="slotId" value="{{s.id}}"><input type="hidden" name="key" value="{{s.key}}"><input type="hidden" name="back" value="{{ here }}">{% if family %}<label class="for">Booking for<select name="dependentId"><option value="">Me</option>{% for f in family %}<option value="{{f.id}}">{{f.name}} ({{f.relation}})</option>{% endfor %}</select></label>{% endif %}<button>Book this slot</button></form>{% endif %}</article>{% endfor %}</div>
-     {% endfor %}
+      <div class="times">{% for s in grp.cards %}
+       {% if s.bookable %}<form method="post" action="/patient/book" class="tform" onsubmit="var f=document.getElementById('book-for'),i=this.querySelector('[name=dependentId]');if(f&&i)i.value=f.value;var b=this.querySelector('button');b.disabled=true;b.querySelector('b').textContent='Booking…'"><input type="hidden" name="slotId" value="{{s.id}}"><input type="hidden" name="key" value="{{s.key}}"><input type="hidden" name="back" value="{{ here }}">{% if family %}<input type="hidden" name="dependentId" value="">{% endif %}
+        <button class="tchip {{s.state}}" title="Book {{s.type}} at {{s.start}}" aria-label="Book {{s.type}} at {{s.start}}, {{ day.title }}"><b>{{s.start}}</b><small>{{s.type}} · {{s.minutes}} min</small><small>{% if s.fee %}{{s.fee}} · {% endif %}<span class="seat">{{s.seats}}</span></small></button></form>
+       {% else %}<div class="tchip {{s.state}}" title="{{ s.label }}"><b>{{s.start}}</b><small>{{s.type}} · {{s.minutes}} min</small><small>{% if s.fee %}{{s.fee}} · {% endif %}<span class="seat">{{s.seats}}</span></small></div>{% endif %}
+      {% endfor %}</div>
+     {% endfor %}</section>
     {% endfor %}
     {% if empty_days %}<p class="quiet" style="margin-top:26px">No slots on: {{ empty_days|join(', ') }}.</p>{% endif %}
-   {% else %}<div class="empty" style="margin-top:20px"><b>No slots in this date range</b>Try another week or choose “All types”{% if only_free %} and untick “Free only”{% endif %}.</div>{% endif %}
+   {% else %}<div class="empty" style="margin-top:20px"><b>No slots in this date range</b>Try another date or choose “All types”{% if only_free %} and untick “Free only”{% endif %}.</div>{% endif %}
    <div class="winnav"><span>{% if prev_url %}<a class="btn ghost" href="{{prev_url}}">← Earlier</a>{% endif %}</span><span>{% if next_url %}<a class="btn ghost" href="{{next_url}}">Later →</a>{% endif %}</span></div>
-   <p class="soon">Free seats shown here are live. Pressing <b>Book</b> twice never books twice. Booking for a parent or child? <a href="/patient/family">Add them as a family member</a> and pick them under “Booking for”.</p>
+   <p class="soon">Free seats shown here are live. Click a time to book it; pressing twice never books twice. Booking for a parent or child? <a href="/patient/family">Add them as a family member</a> and pick them under “Booking for”.</p>
   {% endif %}
   {% endif %}
 {% elif page=='appointments' %}

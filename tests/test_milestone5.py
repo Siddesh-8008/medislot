@@ -1984,6 +1984,28 @@ def test_doctor_schedule_rejects_a_bad_date_without_calling_the_api(env):
     assert not [c for c in env.calls if c[1].endswith("/slots")]
 
 
+def test_doctor_profile_page_shows_upcoming_appointments(env):
+    login_doctor(env)
+    env.route("GET", "/doctors/me", FakeResp(200, {"profile": {"doctor_id": 3, "first_name": "Arjun", "last_name": "Reddy",
+        "specialization_name": "Cardiology", "hospital_name": "Apollo", "license_number": "TS-7001", "years_experience": 14, "timezone": "Asia/Kolkata"}}))
+    item = {"appointmentId": 41, "status": "CONFIRMED", "patientId": 9, "localDate": "2030-11-20", "localStart": "09:00", "localEnd": "09:30",
+            "fee": 800, "consultationType": {"name": "Standard Consult"}, "patient": {"id": 9, "name": "Asha Rao"}}
+    env.route("GET", "/appointments", FakeResp(200, {"items": [item], "total": 1, "totalPages": 1}))
+    page = env.client.get("/?m=profile").get_data(as_text=True)
+    assert "Profile editor" in page and "Upcoming appointments" in page and "Asha Rao" in page and "Standard Consult" in page
+    assert "1 appointment</dd>" in page and "TS-7001" in page
+    params = [c[2].get("params") for c in env.calls if c[1] == "/appointments"][0]
+    assert params["when"] == "upcoming" and params["status"] == "CONFIRMED"
+
+
+def test_doctor_profile_page_survives_an_appointments_outage(env):
+    login_doctor(env)
+    env.route("GET", "/doctors/me", FakeResp(200, {"profile": {"doctor_id": 3, "first_name": "Arjun", "last_name": "Reddy"}}))
+    env.route("GET", "/appointments", FakeResp(503, {"message": "down"}))
+    page = env.client.get("/?m=profile").get_data(as_text=True)
+    assert "Profile editor" in page and "Couldn’t load your appointments" in page
+
+
 def test_doctor_cancel_slot_calls_the_api_and_reports(env):
     login_doctor(env)
     env.route("POST", "/doctors/me/slots/" + SLOT_A[5:] + "/cancel", FakeResp(200, {"cancelledAppointments": 2}))
@@ -2014,6 +2036,14 @@ def test_book_form_offers_booking_for_family_members(env):
     page = env.client.get("/patient/doctors/1").get_data(as_text=True)
     assert 'name="dependentId"' in page and '<option value="">Me</option>' in page
     assert '<option value="5">Lakshmi O&#39;Neil (Mother)</option>' in page and '<option value="6">Anu Rao (Child)</option>' in page
+
+
+def test_one_booking_for_picker_fills_every_time_slot_form(env):
+    open_doctor_with_bookable_slots(env)
+    env.route("GET", "/patients/me/dependents", FakeResp(200, FAMILY))
+    page = env.client.get("/patient/doctors/1").get_data(as_text=True)
+    assert page.count('id="book-for"') == 1                                     # one picker for the page...
+    assert page.count('name="dependentId" value=""') == page.count('action="/patient/book"') == 1   # ...copied into each form
 
 
 def test_no_family_means_no_selector(env):
