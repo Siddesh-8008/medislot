@@ -13,7 +13,9 @@ Safety rules (so booking/business logic is never disturbed):
     overwrites a slot that already has bookings/holds.
   * A slot is only ever CLOSED if it is OPEN with booked_count = 0 and held_count = 0
     (checked atomically in the same DynamoDB write). Booked slots are never touched.
-  * Only slots this module closed (closed_reason = SCHEDULE_CHANGE) are ever reopened.
+  * Only slots this module closed (closed_reason = SCHEDULE_CHANGE) are ever reopened, plus booked slots that a
+    blackout date cancelled (status CANCELLED, closed_reason = BLACKOUT) once that blackout is removed or moved.
+    Slots the doctor cancelled one by one (DOCTOR_CANCELLED) are never reopened.
 """
 import os, json, logging
 from datetime import datetime, time, timedelta, timezone
@@ -26,6 +28,7 @@ log.setLevel(logging.INFO)
 ddb = boto3.resource("dynamodb")
 
 CLOSED_REASON = "SCHEDULE_CHANGE"
+BLACKOUT_REASON = "BLACKOUT"   # set by the booking Lambda on booked slots it cancelled for a blackout date
 
 
 # --------------------------------------------------------------------------- helpers (unchanged API)
@@ -154,6 +157,18 @@ def reconcile_doctor(table, doctor_id, zone, desired, now, days):
                     ConditionExpression="#s=:closed AND closed_reason=:r",
                     ExpressionAttributeNames={"#s": "status"},
                     ExpressionAttributeValues={":closed": "CLOSED", ":open": "OPEN", ":r": CLOSED_REASON, ":one": 1})
+                reopened += 1
+            elif sid in desired and status == "CANCELLED" and it.get("closed_reason") == BLACKOUT_REASON:
+                # The doctor removed (or moved) the blackout and the weekly pattern still covers this slot. Its
+                # appointments were all cancelled and refunded by the blackout, so it comes back as an empty slot.
+                table.update_item(
+                    Key=key,
+                    UpdateExpression="SET #s=:open, booked_count=:zero, held_count=:zero, version=version+:one "
+                                     "REMOVE closed_reason, closed_at, cancelled_at",
+                    ConditionExpression="#s=:cancelled AND closed_reason=:r",
+                    ExpressionAttributeNames={"#s": "status"},
+                    ExpressionAttributeValues={":cancelled": "CANCELLED", ":open": "OPEN", ":r": BLACKOUT_REASON,
+                                               ":zero": 0, ":one": 1})
                 reopened += 1
         except Exception as e:
             if _code(e) == "ConditionalCheckFailedException":

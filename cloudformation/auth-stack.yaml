@@ -922,6 +922,19 @@ Resources:
         Type: AWS_PROXY
         IntegrationHttpMethod: POST
         Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DoctorDomainFunction.Arn}/invocations'
+  # Edit a blackout (change its date and/or reason).
+  DoctorsMeBlackoutIdPatchMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref DoctorsMeBlackoutIdResource
+      HttpMethod: PATCH
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DoctorDomainFunction.Arn}/invocations'
   # ---- Milestone 4 endpoints. Same REST API, stage and JWT authorizer as everything above; the dashboard calls
   # exactly these methods. /patients/* -> patient-domain Lambda (PATIENT role only, checked in the Lambda).
   # /doctors/search|filters|{doctorId}[/slots] -> doctor-discovery Lambda (any signed-in user).
@@ -1371,7 +1384,7 @@ Resources:
     Properties: {FunctionName: !Ref ProtectedFunction, Action: lambda:InvokeFunction, Principal: apigateway.amazonaws.com, SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*/GET/*'}
   # NOTE: API Gateway only publishes a NEW snapshot when this resource is REPLACED. Changing its Description does not.
   # So the logical ID carries the milestone: rename it (ApiDeploymentM5, ...) whenever routes are added or changed.
-  ApiDeploymentM6Status:
+  ApiDeploymentM6Blackout:
     Type: AWS::ApiGateway::Deployment
     DependsOn:
       - PatientsMeDependentsGetMethod
@@ -1406,6 +1419,7 @@ Resources:
       - DoctorsMeBlackoutDatesGetMethod
       - DoctorsMeBlackoutDatesPostMethod
       - DoctorsMeBlackoutIdDeleteMethod
+      - DoctorsMeBlackoutIdPatchMethod
       - PatientsMeGetMethod
       - PatientsMePostMethod
       - PatientsMePutMethod
@@ -1428,7 +1442,7 @@ Resources:
     Type: AWS::ApiGateway::Stage
     Properties:
       RestApiId: !Ref RestApi
-      DeploymentId: !Ref ApiDeploymentM6Status
+      DeploymentId: !Ref ApiDeploymentM6Blackout
       StageName: !Ref Environment
       TracingEnabled: true
       AccessLogSetting:

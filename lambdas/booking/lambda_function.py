@@ -100,6 +100,7 @@ DOCTOR_TIER = "DOCTOR_CANCELLED"
 DOCTOR_SETTABLE = ("COMPLETED", "NO_SHOW", "CANCELLED_BY_DOCTOR")
 ATTENDANCE = ("COMPLETED", "NO_SHOW")
 BLACKOUT_NOTE = "The doctor is unavailable on this day"
+BLACKOUT_REASON = "BLACKOUT"          # closed_reason on slots cancelled by a blackout (reopened when it is removed)
 RELATIONS = ("Mother", "Father", "Spouse", "Child", "Sibling", "Grandparent", "Grandchild", "Other")
 _RELATION_LOOKUP = {r.lower(): r for r in RELATIONS}
 MAX_DEPENDENTS = 10
@@ -483,8 +484,11 @@ def release_seat(slot_id, cid, reason):
     return None
 
 
-def mark_slot_cancelled(slot_id, doctor_id, now):
-    """Doctor cancels the slot: status CANCELLED so nobody can book it and the materialiser never reopens it.
+def mark_slot_cancelled(slot_id, doctor_id, now, reason="DOCTOR_CANCELLED"):
+    """Doctor cancels the slot: status CANCELLED so nobody can book it.
+    reason DOCTOR_CANCELLED (the 'Cancel slot' button): the materialiser never reopens it.
+    reason BLACKOUT (the doctor blocked the whole day): the materialiser reopens it as an empty slot if the blackout
+    is removed or moved and the weekly pattern still covers it.
     -> 'cancelled' | 'already' | 'started' | 'missing'"""
     try:
         ddb.update_item(
@@ -492,7 +496,7 @@ def mark_slot_cancelled(slot_id, doctor_id, now):
             UpdateExpression="SET #st = :c, closed_reason = :r, cancelled_at = :now, version = version + :one",
             ConditionExpression="doctor_id = :d AND start_at > :now AND #st <> :c",
             ExpressionAttributeNames={"#st": "status"},
-            ExpressionAttributeValues=_vals(c="CANCELLED", r="DOCTOR_CANCELLED", now=iso(now), one=1, d=int(doctor_id)))
+            ExpressionAttributeValues=_vals(c="CANCELLED", r=reason, now=iso(now), one=1, d=int(doctor_id)))
         return "cancelled"
     except Exception as exc:  # noqa: BLE001
         if _code(exc) != "ConditionalCheckFailedException":
@@ -1140,7 +1144,8 @@ def doctor_cancel_slot(slot_id, uid, now, note, cid, source="slot"):
         return "missing", []
     if parse_utc(slot["start_at"]) <= now and slot.get("status") != "CANCELLED":
         return "started", []
-    state = "already" if slot.get("status") == "CANCELLED" else mark_slot_cancelled(slot_id, uid, now)
+    reason = BLACKOUT_REASON if source == "blackout" else "DOCTOR_CANCELLED"
+    state = "already" if slot.get("status") == "CANCELLED" else mark_slot_cancelled(slot_id, uid, now, reason)
     if state in ("missing", "started"):
         return state, []
 

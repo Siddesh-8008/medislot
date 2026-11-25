@@ -32,8 +32,14 @@ def cancel_blackout_day(uid,day,reason,cid):
     except Exception as e:
         emit("error","blackout_sweep_failed",cid,doctorId=uid,date=day.isoformat(),error=type(e).__name__); return None
 
-def blackout_reply(status,day,sweep,cid,already=False):
-    base="This date was already blocked." if already else "Blackout date added."
+def doctor_today(cur,uid):
+    """Today's date in the doctor's own timezone (blackout dates are local calendar days)."""
+    cur.execute("SELECT timezone FROM doctors WHERE doctor_id=%s",(uid,))
+    try: return datetime.now(ZoneInfo((cur.fetchone() or {}).get("timezone") or "Asia/Kolkata")).date()
+    except (ZoneInfoNotFoundError,ValueError): return datetime.now(ZoneInfo("Asia/Kolkata")).date()
+
+def blackout_reply(status,day,sweep,cid,already=False,base=None,**extra):
+    base=base or ("This date was already blocked." if already else "Blackout date added.")
     if sweep is None:
         text=base+" Existing appointments on this day could NOT be cancelled automatically right now - add the same date again to retry."
     else:
@@ -42,7 +48,7 @@ def blackout_reply(status,day,sweep,cid,already=False):
         if sweep.get("skippedSlots"): text+=" Some slots could not be cancelled - add the same date again to retry."
     return out(status,{"message":text,"blackoutDate":day.isoformat(),"alreadyExisted":already,
                        "cancelledAppointments":(sweep or {}).get("cancelledAppointments",0),"sweepOk":bool(sweep and sweep.get("ok")),
-                       "correlationId":cid})
+                       **extra,"correlationId":cid})
 
 def refresh_slots(uid,cid):
     """Ask the slot materialiser to rebuild this doctor's bookable slots. Fire-and-forget:
@@ -344,10 +350,7 @@ def handler(event, context):
                     if data is None: return out(400,{"message":"Invalid JSON body","correlationId":cid})
                     try: bd=date.fromisoformat(str(data["blackoutDate"]))
                     except Exception: return out(422,{"message":"blackoutDate must be YYYY-MM-DD","correlationId":cid})
-                    cur.execute("SELECT timezone FROM doctors WHERE doctor_id=%s",(uid,))
-                    try: today=datetime.now(ZoneInfo((cur.fetchone() or {}).get("timezone") or "Asia/Kolkata")).date()
-                    except (ZoneInfoNotFoundError,ValueError): today=datetime.now(ZoneInfo("Asia/Kolkata")).date()
-                    if bd<today: return out(422,{"message":"A blackout date cannot be in the past","correlationId":cid})
+                    if bd<doctor_today(cur,uid): return out(422,{"message":"A blackout date cannot be in the past","correlationId":cid})
                     reason=(str(data.get("reason") or "").strip()[:255]) or None
                     already=False
                     try:
@@ -363,9 +366,43 @@ def handler(event, context):
                     refresh_slots(uid,cid)
                     return blackout_reply(200 if already else 201,bd,sweep,cid,already)
                 m=re.fullmatch(re.escape(prefix)+r"/(\d+)",path)
-                if m and method=="DELETE":
-                    cur.execute("DELETE FROM blackout_dates WHERE blackout_id=%s AND doctor_id=%s",(int(m.group(1)),uid)); conn.commit(); emit("info","blackout_date_removed",cid,doctorId=uid,blackoutId=int(m.group(1))); refresh_slots(uid,cid)
-                    return out(200,{"message":"Blackout date removed; open slots for that day are reopened automatically. Appointments that were cancelled for the blackout stay cancelled.","correlationId":cid})
+                if m and method in ("DELETE","PATCH","PUT"):
+                    bid=int(m.group(1))
+                    cur.execute("SELECT blackout_id,blackout_date,reason FROM blackout_dates WHERE blackout_id=%s AND doctor_id=%s",(bid,uid))
+                    row=cur.fetchone()
+                    if not row: return out(404,{"message":"Blackout date not found","correlationId":cid})
+                    old=row["blackout_date"] if isinstance(row["blackout_date"],date) else date.fromisoformat(str(row["blackout_date"])[:10])
+                    if method=="DELETE":
+                        cur.execute("DELETE FROM blackout_dates WHERE blackout_id=%s AND doctor_id=%s",(bid,uid)); conn.commit()
+                        emit("info","blackout_date_removed",cid,doctorId=uid,blackoutId=bid,blackoutDate=old.isoformat())
+                        refresh_slots(uid,cid)     # recreates / reopens that day's slots from the weekly pattern
+                        return out(200,{"message":f"Blackout on {old.isoformat()} removed. You are open again that day: slots from your weekly pattern are being reopened (refresh in a few seconds). Appointments already cancelled for the blackout stay cancelled and refunded.",
+                                        "blackoutDate":old.isoformat(),"correlationId":cid})
+                    # Edit: change the date and/or the reason.
+                    if data is None: return out(400,{"message":"Invalid JSON body","correlationId":cid})
+                    today=doctor_today(cur,uid)
+                    if old<today: return out(409,{"message":"This blackout date is in the past and can no longer be edited","correlationId":cid})
+                    new=old
+                    if "blackoutDate" in data:
+                        try: new=date.fromisoformat(str(data["blackoutDate"]))
+                        except Exception: return out(422,{"message":"blackoutDate must be YYYY-MM-DD","correlationId":cid})
+                        if new<today: return out(422,{"message":"A blackout date cannot be in the past","correlationId":cid})
+                    reason=(str(data.get("reason") or "").strip()[:255] or None) if "reason" in data else row["reason"]
+                    try:
+                        cur.execute("UPDATE blackout_dates SET blackout_date=%s,reason=%s WHERE blackout_id=%s AND doctor_id=%s",(new,reason,bid,uid))
+                        conn.commit()
+                    except pymysql.err.IntegrityError as e:
+                        conn.rollback()
+                        if e.args and e.args[0]==1062: return out(409,{"message":f"{new.isoformat()} is already one of your blackout dates","correlationId":cid})
+                        raise
+                    emit("info","blackout_date_updated",cid,doctorId=uid,blackoutId=bid,oldDate=old.isoformat(),newDate=new.isoformat())
+                    if new==old:
+                        return out(200,{"message":"Blackout reason updated","blackoutDate":new.isoformat(),"alreadyExisted":True,"cancelledAppointments":0,"sweepOk":True,"correlationId":cid})
+                    # Moved to another day: cancel what is booked on the NEW day, and reopen the OLD day's slots.
+                    sweep=cancel_blackout_day(uid,new,reason,cid)
+                    refresh_slots(uid,cid)
+                    return blackout_reply(200,new,sweep,cid,previousDate=old.isoformat(),
+                        base=f"Blackout moved from {old.isoformat()} to {new.isoformat()}. {old.isoformat()} is open again (its slots are being reopened).")
                 # The schedule day view moved to GET /doctors/{doctorId}/slots (doctor_discovery, owner view).
                 return out(404,{"message":"Doctor endpoint not found","path":path,"correlationId":cid})
     except Exception as e:

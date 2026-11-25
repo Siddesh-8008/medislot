@@ -196,6 +196,7 @@ def home():
         extra["patterns"]=items_of(read_json("/doctors/me/availability-patterns"))
     if module=="availability":
         extra["blackouts"]=items_of(read_json("/doctors/me/blackout-dates"))
+        extra["today"]=datetime.now(ZoneInfo("Asia/Kolkata")).date().isoformat()   # past blackouts can only be removed
     if module=="overview":
         prof=extra.get("profile"); types=extra.get("types"); patterns=extra.get("patterns")
         try: hour=datetime.now(ZoneInfo((prof or {}).get("timezone") or "Asia/Kolkata")).hour
@@ -386,6 +387,27 @@ def blackout():
     else:
         report(r,"Blackout date added","Blackout date")
     return redirect("/?m=availability")
+def _blackout_notice(r,label):
+    """Banner for a blackout change: the API's own message (it says what was cancelled / reopened)."""
+    if r.ok:
+        try: data=r.json()
+        except ValueError: data={}
+        notify(data.get("message") or f"{label} saved","success" if data.get("sweepOk",True) else "error")
+    else:
+        app.logger.warning("%s failed: HTTP %s %s",label,r.status_code,r.text[:300])
+        notify(f"{label} failed: {api_message(r)}","error")
+@app.post("/blackout/<int:bid>/update")
+def blackout_update(bid):
+    """Edit a blackout: move it to another date and/or change the reason. The old day opens again (its slots are
+    rebuilt from the weekly pattern); appointments already booked on the new day are cancelled with a full refund."""
+    data={"blackoutDate":request.form.get("blackoutDate",""),"reason":request.form.get("reason","")}
+    _blackout_notice(api("PATCH",f"/doctors/me/blackout-dates/{bid}",json=data),"Blackout update")
+    return redirect("/?m=availability")
+@app.post("/blackout/<int:bid>/remove")
+def blackout_remove(bid):
+    """Remove a blackout: the day opens again and its slots come back from the weekly pattern."""
+    _blackout_notice(api("DELETE",f"/doctors/me/blackout-dates/{bid}"),"Remove blackout")
+    return redirect("/?m=availability")
 @app.post("/consultation-types")
 def consultation():
     """The doctor picks one of the standard types (by id) and sets only the fee, plus capacity for Health Camp.
@@ -527,7 +549,8 @@ def slot_card(s,zone):
     elif raw in ("","OPEN"): state,label="open","Open"
     else: state,label="closed",raw.title()
     mins=s.get("durationMinutes") or int((end-start).total_seconds()//60)
-    details=[("Slot ID",s.get("slotId")),("Starts (UTC)",s.get("startAt")),("Ends (UTC)",s.get("endAt")),("Seats held",held),("Closed because","Schedule changed" if s.get("closedReason")=="SCHEDULE_CHANGE" else s.get("closedReason")),("Version",s.get("version"))]
+    reasons={"SCHEDULE_CHANGE":"Schedule changed","BLACKOUT":"Blackout date","DOCTOR_CANCELLED":"Cancelled by you"}
+    details=[("Slot ID",s.get("slotId")),("Starts (UTC)",s.get("startAt")),("Ends (UTC)",s.get("endAt")),("Seats held",held),("Closed because",reasons.get(s.get("closedReason"),s.get("closedReason"))),("Version",s.get("version"))]
     sid=str(s.get("slotId") or "")
     # Milestone 5: a future slot that is not already cancelled can be cancelled by the doctor (patients refunded in full).
     cancellable=raw!="CANCELLED" and _utc(s["startAt"])>datetime.now(timezone.utc) and sid.startswith("SLOT#") and bool(SLOT_REF_RE.fullmatch(sid[5:]))

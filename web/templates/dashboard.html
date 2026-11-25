@@ -366,7 +366,12 @@ pre{background:#1e3a4c;color:#d6ece9;padding:20px;border-radius:12px;overflow:au
    {% else %}<div class="empty"><b>No weekly hours yet</b>Add your first pattern above.</div>{% endif %}
    <h3 class="list-title">Blackout dates</h3>
    {% if blackouts is none %}<div class="empty"><b>Couldn’t load your blackout dates</b>Refresh to try again.</div>
-   {% elif blackouts %}<div class="tbl-wrap"><table><thead><tr><th>Date</th><th>Reason</th></tr></thead><tbody>{% for b in blackouts %}<tr><td>{{b.blackout_date}}</td><td>{{ b.reason or '—' }}</td></tr>{% endfor %}</tbody></table></div>
+   {% elif blackouts %}<div class="tbl-wrap"><table><thead><tr><th>Date</th><th>Reason</th><th>Status</th><th>Edit</th></tr></thead><tbody>{% for b in blackouts %}{% set bd = (b.blackout_date|string)[:10] %}{% set past = today and bd < today %}<tr>
+    <td>{{ bd }}</td><td>{{ b.reason or '—' }}</td>
+    <td><span class="pill {{ 'off' if past else 'ok' }}">{{ 'Past' if past else 'Blocked' }}</span></td>
+    <td><div class="actions">{% if not past %}<form class="rowform" method="post" action="/blackout/{{ b.blackout_id }}/update" onsubmit="return this.blackoutDate.value==='{{bd}}'||confirm('Move this blackout to '+this.blackoutDate.value+'? {{bd}} opens again, and appointments booked on the new date are cancelled and refunded in full.')"><input type="date" name="blackoutDate" value="{{ bd }}" min="{{ today }}" required><input name="reason" value="{{ b.reason or '' }}" maxlength="255" placeholder="Reason" style="width:150px"><button>Save</button></form>{% endif %}
+     <form class="rowform" method="post" action="/blackout/{{ b.blackout_id }}/remove" onsubmit="return confirm('Remove the blackout on {{bd}}? You will be open that day again and slots from your weekly pattern come back.')"><button class="ghost">Remove</button></form></div></td></tr>{% endfor %}</tbody></table></div>
+   <p class="day-sub" style="margin-top:12px">Removing or moving a blackout opens that day again: slots from your weekly pattern come back within a few seconds. Appointments that were cancelled for it stay cancelled (the patients were refunded).</p>
    {% else %}<div class="empty"><b>No blackout dates</b>You’re open on every pattern day.</div>{% endif %}
 
   {% elif cur=='appointments' %}

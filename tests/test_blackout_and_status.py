@@ -287,3 +287,141 @@ def test_blackout_banner_reports_the_cancelled_bookings(env):
     env.route("GET", "/doctors/me/blackout-dates", FakeResp(200, {"items": []}))
     page = env.client.get("/?m=availability").get_data(as_text=True)
     assert "2 booked appointments on this day were cancelled" in page
+
+
+# ================================================================================================ edit / remove a blackout
+def blackout_row(w, day):
+    rows = w.db.rows("SELECT * FROM blackout_dates WHERE doctor_id = ? AND blackout_date = ?", (w.doc, day.isoformat()))
+    return rows[0] if rows else None
+
+
+def edit_blackout(w, bid, body, method="PATCH", doctor=None):
+    ev = api_event(method, f"/doctors/me/blackout-dates/{bid}", user_id=doctor or w.doc, role="DOCTOR", body=body)
+    res = doctor_domain.handler(ev, None)
+    return res["statusCode"], json.loads(res["body"])
+
+
+def test_removing_a_blackout_opens_the_day_again(w):
+    start = at_api(6)
+    s = w.slot(w.doc, start=start)
+    add_blackout(w, local_day(start))
+    assert book_api(w.p1, s)[1]["code"] == "DOCTOR_UNAVAILABLE"
+    bid = blackout_row(w, local_day(start))["blackout_id"]
+    w.refreshes.clear()
+    st, data = edit_blackout(w, bid, None, method="DELETE")
+    assert st == 200 and "open again" in data["message"]
+    assert blackout_row(w, local_day(start)) is None
+    assert w.refreshes == [w.doc]                     # the materialiser rebuilds / reopens that day's slots
+    assert book_api(w.p1, s)[0] == 201                # patients can book that day again
+    assert edit_blackout(w, bid, None, method="DELETE")[0] == 404
+    assert edit_blackout(w, 999, None, method="DELETE")[0] == 404
+
+
+def test_another_doctor_cannot_edit_or_remove_my_blackout(w):
+    day = local_day(at_api(6))
+    add_blackout(w, day)
+    bid = blackout_row(w, day)["blackout_id"]
+    assert edit_blackout(w, bid, None, method="DELETE", doctor=w.doc2)[0] == 404
+    assert edit_blackout(w, bid, {"reason": "x"}, doctor=w.doc2)[0] == 404
+    assert blackout_row(w, day) is not None
+
+
+def test_moving_a_blackout_cancels_the_new_day_and_opens_the_old_day(w):
+    old_start, new_start = at_api(5), at_api(8)
+    old_slot, new_slot = w.slot(w.doc, start=old_start), w.slot(w.doc, start=new_start)
+    booked_new = book_api(w.p2, new_slot)[1]["appointment"]["appointmentId"]
+    add_blackout(w, local_day(old_start))
+    bid = blackout_row(w, local_day(old_start))["blackout_id"]
+    st, data = edit_blackout(w, bid, {"blackoutDate": local_day(new_start).isoformat(), "reason": "Travel"})
+    assert st == 200 and data["previousDate"] == local_day(old_start).isoformat()
+    assert data["cancelledAppointments"] == 1 and "is open again" in data["message"]
+    assert blackout_row(w, local_day(old_start)) is None and blackout_row(w, local_day(new_start))["reason"] == "Travel"
+    assert w.appointments(appointment_id=booked_new)[0]["status"] == "CANCELLED_BY_DOCTOR"
+    assert w.dynamo.slot(new_slot)["closed_reason"] == "BLACKOUT"             # reopenable if this blackout goes away
+    assert book_api(w.p1, old_slot)[0] == 201                                  # old day bookable again
+
+
+def test_editing_only_the_reason_does_not_cancel_anything_again(w):
+    start = at_api(5)
+    day = local_day(start)
+    add_blackout(w, day, reason="Leave")
+    bid = blackout_row(w, day)["blackout_id"]
+    calls = len(w.booking_lambda.calls)
+    st, data = edit_blackout(w, bid, {"blackoutDate": day.isoformat(), "reason": "Family function"})
+    assert st == 200 and data["message"] == "Blackout reason updated"
+    assert blackout_row(w, day)["reason"] == "Family function" and len(w.booking_lambda.calls) == calls
+
+
+def test_edit_validation(w):
+    d1, d2 = local_day(at_api(5)), local_day(at_api(6))
+    add_blackout(w, d1)
+    add_blackout(w, d2)
+    bid = blackout_row(w, d1)["blackout_id"]
+    assert edit_blackout(w, bid, {"blackoutDate": d2.isoformat()})[0] == 409          # already blocked
+    yesterday = datetime.now(IST).date() - timedelta(days=1)
+    assert edit_blackout(w, bid, {"blackoutDate": yesterday.isoformat()})[0] == 422
+    assert edit_blackout(w, bid, {"blackoutDate": "soon"})[0] == 422
+    with w.db.lock:      # a blackout that is already over can be removed but not edited
+        w.db.db.execute("UPDATE blackout_dates SET blackout_date = ? WHERE blackout_id = ?", (yesterday.isoformat(), bid))
+        w.db.db.commit()
+    assert edit_blackout(w, bid, {"reason": "x"})[0] == 409
+    assert edit_blackout(w, bid, None, method="DELETE")[0] == 200
+
+
+# ------------------------------------------------------------------------------- slot materialiser reopens blackout slots
+from test_slot_materialiser_window import IST as _IST, NOW, GuardedSlotsTable, materialiser, pattern  # noqa: E402
+
+
+def test_materialiser_reopens_slots_a_removed_blackout_cancelled_but_not_hand_cancelled_ones():
+    table = GuardedSlotsTable()
+    desired, _ = materialiser.desired_slots_for_doctor([pattern()], set(), _IST, NOW, 7)   # Wed 25 Nov 09:00 + 09:30 IST
+    materialiser.create_missing(table, desired, [])
+    a, b = sorted(table.items, key=lambda i: i["slot_key"])
+    a.update(status="CANCELLED", closed_reason="BLACKOUT", booked_count=1)
+    b.update(status="CANCELLED", closed_reason="DOCTOR_CANCELLED", booked_count=1)
+    # while 25 Nov is still blacked out the day is not desired: nothing is reopened
+    blocked, _ = materialiser.desired_slots_for_doctor([pattern()], {"2026-11-25"}, _IST, NOW, 7)
+    assert materialiser.reconcile_doctor(table, 12, _IST, blocked, NOW, 7) == (0, 0, 0)
+    assert a["status"] == "CANCELLED"
+    # blackout removed -> the blackout-cancelled slot comes back as an EMPTY open slot; the hand-cancelled one does not
+    assert materialiser.reconcile_doctor(table, 12, _IST, desired, NOW, 7) == (0, 1, 0)
+    assert a["status"] == "OPEN" and b["status"] == "CANCELLED"
+    key, upd = table.updates[-1]
+    assert key["slot_key"] == a["slot_key"] and "booked_count=:zero" in upd["UpdateExpression"]
+    assert "REMOVE closed_reason" in upd["UpdateExpression"] and upd["ExpressionAttributeValues"][":r"] == "BLACKOUT"
+
+
+def test_materialiser_creates_slots_for_a_day_that_was_blocked_before_they_were_ever_built():
+    table = GuardedSlotsTable()
+    blocked, _ = materialiser.desired_slots_for_doctor([pattern()], {"2026-11-25"}, _IST, NOW, 7)
+    materialiser.create_missing(table, blocked, [])
+    assert not [i for i in table.items if i["local_date"] == "2026-11-25"]
+    desired, _ = materialiser.desired_slots_for_doctor([pattern()], set(), _IST, NOW, 7)
+    assert materialiser.create_missing(table, desired, [])[0] == 2
+    assert len([i for i in table.items if i["local_date"] == "2026-11-25" and i["status"] == "OPEN"]) == 2
+
+
+# ------------------------------------------------------------------------------- dashboard: blackout table actions
+def test_availability_page_has_edit_and_remove_for_each_blackout(env):
+    login_doctor(env)
+    tomorrow = (datetime.now(IST).date() + timedelta(days=1)).isoformat()
+    yesterday = (datetime.now(IST).date() - timedelta(days=1)).isoformat()
+    env.route("GET", "/doctors/me/blackout-dates", FakeResp(200, {"items": [
+        {"blackout_id": 7, "blackout_date": yesterday, "reason": None},
+        {"blackout_id": 8, "blackout_date": tomorrow, "reason": "Leave"}]}))
+    page = env.client.get("/?m=availability").get_data(as_text=True)
+    assert 'action="/blackout/8/update"' in page and 'action="/blackout/8/remove"' in page
+    assert 'action="/blackout/7/update"' not in page and 'action="/blackout/7/remove"' in page    # past: remove only
+    assert f'value="{tomorrow}"' in page and 'value="Leave"' in page and ">Past<" in page
+
+
+def test_blackout_edit_and_remove_call_the_api(env):
+    login_doctor(env)
+    env.route("PATCH", "/doctors/me/blackout-dates/8", FakeResp(200, {"message": "Blackout moved from A to B. A is open again.", "sweepOk": True}))
+    env.route("DELETE", "/doctors/me/blackout-dates/8", FakeResp(200, {"message": "Blackout on B removed. You are open again that day."}))
+    r = env.client.post("/blackout/8/update", data={"blackoutDate": "2030-12-08", "reason": "Travel"})
+    assert r.headers["Location"].endswith("/?m=availability")
+    call = [c for c in env.calls if c[0] == "PATCH"][0]
+    assert call[1] == "/doctors/me/blackout-dates/8" and call[2]["json"] == {"blackoutDate": "2030-12-08", "reason": "Travel"}
+    env.client.post("/blackout/8/remove")
+    assert [c for c in env.calls if c[0] == "DELETE" and c[1] == "/doctors/me/blackout-dates/8"]
