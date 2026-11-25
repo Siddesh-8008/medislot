@@ -11,6 +11,38 @@ log=logging.getLogger()
 log.setLevel(logging.INFO)
 s3=boto3.client("s3", config=boto3.session.Config(signature_version="s3v4"))
 lambda_client=boto3.client("lambda",config=boto3.session.Config(connect_timeout=2,read_timeout=3,retries={"max_attempts":1}))
+# Synchronous call to the booking Lambda for the blackout sweep: it must finish inside the API Gateway limit (29 s).
+booking_client=boto3.client("lambda",config=boto3.session.Config(connect_timeout=2,read_timeout=15,retries={"max_attempts":1}))
+
+def cancel_blackout_day(uid,day,reason,cid):
+    """A blackout must also cancel what is ALREADY booked on that day. The booking Lambda owns appointments, refunds and
+    the slot counters, so it does the work (same code path as the doctor's 'Cancel slot' button: slot CANCELLED,
+    every patient refunded 100 %). Returns its summary dict, or None when it could not be reached."""
+    name=os.environ.get("BOOKING_FUNCTION")
+    if not name:
+        emit("warning","blackout_sweep_not_configured",cid,doctorId=uid); return None
+    try:
+        res=booking_client.invoke(FunctionName=name,InvocationType="RequestResponse",
+            Payload=json.dumps({"action":"cancelBlackoutDay","doctorId":uid,"date":day.isoformat(),"reason":reason or "",
+                                "headers":{"x-correlation-id":cid}}).encode())
+        if res.get("FunctionError"):
+            emit("error","blackout_sweep_failed",cid,doctorId=uid,date=day.isoformat(),error=res.get("FunctionError")); return None
+        out=json.loads(res["Payload"].read() or b"{}")
+        return out if isinstance(out,dict) else None
+    except Exception as e:
+        emit("error","blackout_sweep_failed",cid,doctorId=uid,date=day.isoformat(),error=type(e).__name__); return None
+
+def blackout_reply(status,day,sweep,cid,already=False):
+    base="This date was already blocked." if already else "Blackout date added."
+    if sweep is None:
+        text=base+" Existing appointments on this day could NOT be cancelled automatically right now - add the same date again to retry."
+    else:
+        n=int(sweep.get("cancelledAppointments") or 0)
+        text=base+(f" {n} booked appointment{'s' if n!=1 else ''} on this day {'were' if n!=1 else 'was'} cancelled and refunded in full." if n else " No booked appointments needed cancelling.")
+        if sweep.get("skippedSlots"): text+=" Some slots could not be cancelled - add the same date again to retry."
+    return out(status,{"message":text,"blackoutDate":day.isoformat(),"alreadyExisted":already,
+                       "cancelledAppointments":(sweep or {}).get("cancelledAppointments",0),"sweepOk":bool(sweep and sweep.get("ok")),
+                       "correlationId":cid})
 
 def refresh_slots(uid,cid):
     """Ask the slot materialiser to rebuild this doctor's bookable slots. Fire-and-forget:
@@ -310,17 +342,30 @@ def handler(event, context):
                     return out(200,{"items":cur.fetchall(),"correlationId":cid})
                 if path==prefix and method=="POST":
                     if data is None: return out(400,{"message":"Invalid JSON body","correlationId":cid})
-                    try: bd=date.fromisoformat(data["blackoutDate"])
+                    try: bd=date.fromisoformat(str(data["blackoutDate"]))
                     except Exception: return out(422,{"message":"blackoutDate must be YYYY-MM-DD","correlationId":cid})
-                    cur.execute("INSERT INTO blackout_dates(doctor_id,blackout_date,reason) VALUES(%s,%s,%s)",(uid,bd,data.get("reason")))
-                    conn.commit()
-                    emit("info","blackout_date_added",cid,doctorId=uid,blackoutDate=bd.isoformat())
+                    cur.execute("SELECT timezone FROM doctors WHERE doctor_id=%s",(uid,))
+                    try: today=datetime.now(ZoneInfo((cur.fetchone() or {}).get("timezone") or "Asia/Kolkata")).date()
+                    except (ZoneInfoNotFoundError,ValueError): today=datetime.now(ZoneInfo("Asia/Kolkata")).date()
+                    if bd<today: return out(422,{"message":"A blackout date cannot be in the past","correlationId":cid})
+                    reason=(str(data.get("reason") or "").strip()[:255]) or None
+                    already=False
+                    try:
+                        cur.execute("INSERT INTO blackout_dates(doctor_id,blackout_date,reason) VALUES(%s,%s,%s)",(uid,bd,reason))
+                        conn.commit()
+                        emit("info","blackout_date_added",cid,doctorId=uid,blackoutDate=bd.isoformat())
+                    except pymysql.err.IntegrityError as e:
+                        conn.rollback()
+                        if not (e.args and e.args[0]==1062): raise
+                        # Already blocked: still run the sweep, so re-adding a date fixes appointments booked before.
+                        already=True
+                    sweep=cancel_blackout_day(uid,bd,reason,cid)
                     refresh_slots(uid,cid)
-                    return out(201,{"blackoutDate":bd.isoformat(),"correlationId":cid})
+                    return blackout_reply(200 if already else 201,bd,sweep,cid,already)
                 m=re.fullmatch(re.escape(prefix)+r"/(\d+)",path)
                 if m and method=="DELETE":
                     cur.execute("DELETE FROM blackout_dates WHERE blackout_id=%s AND doctor_id=%s",(int(m.group(1)),uid)); conn.commit(); emit("info","blackout_date_removed",cid,doctorId=uid,blackoutId=int(m.group(1))); refresh_slots(uid,cid)
-                    return out(200,{"message":"Blackout date removed; slots for that day are reopened automatically","correlationId":cid})
+                    return out(200,{"message":"Blackout date removed; open slots for that day are reopened automatically. Appointments that were cancelled for the blackout stay cancelled.","correlationId":cid})
                 # The schedule day view moved to GET /doctors/{doctorId}/slots (doctor_discovery, owner view).
                 return out(404,{"message":"Doctor endpoint not found","path":path,"correlationId":cid})
     except Exception as e:

@@ -376,8 +376,15 @@ def hhmm_filter(v):
         return str(v)
 @app.post("/blackout")
 def blackout():
+    """Adding a blackout also cancels (with a full refund) every appointment already booked on that day.
+    Adding a date that is already blocked re-runs that cancellation, so it can be used to retry."""
     r=api("POST","/doctors/me/blackout-dates",json={"blackoutDate":request.form["blackoutDate"],"reason":request.form.get("reason","")})
-    report(r,"Blackout date added","Blackout date")
+    if r.ok:
+        try: data=r.json()
+        except ValueError: data={}
+        notify(data.get("message") or "Blackout date added","success" if data.get("sweepOk",True) else "error")
+    else:
+        report(r,"Blackout date added","Blackout date")
     return redirect("/?m=availability")
 @app.post("/consultation-types")
 def consultation():
@@ -443,6 +450,19 @@ def _utc(iso):
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 STATUS_LABELS={"CONFIRMED":("Confirmed","open"),"COMPLETED":("Completed","done"),"NO_SHOW":("No-show","closed"),
                "CANCELLED_BY_PATIENT":("Cancelled by patient","closed"),"CANCELLED_BY_DOCTOR":("Cancelled by you","closed")}
+# Choices for the doctor's "Update status" button (value sent to POST /appointments/{id}/status, label shown).
+STATUS_ACTIONS={"COMPLETED":"Mark as completed","NO_SHOW":"Mark as no-show","CANCELLED_BY_DOCTOR":"Cancel (refund patient in full)"}
+def status_actions(status,start_iso,allowed=None):
+    """The statuses the doctor may set next. The booking API sends them as allowedStatuses; the same rule is applied
+    here for records that come from other endpoints (the schedule day view). The API re-checks every change."""
+    if allowed is None:
+        status=str(status or "").upper()
+        try: started=_utc(start_iso)<=datetime.now(timezone.utc)
+        except (TypeError,ValueError): return []
+        if status=="CONFIRMED": allowed=["COMPLETED","NO_SHOW"] if started else ["CANCELLED_BY_DOCTOR"]
+        elif status in ("COMPLETED","NO_SHOW"): allowed=[s for s in ("COMPLETED","NO_SHOW") if s!=status]
+        else: allowed=[]
+    return [(s,STATUS_ACTIONS[s]) for s in allowed if s in STATUS_ACTIONS]
 def booking_card(a):
     """One appointment from GET /appointments (doctor view), shaped for the template. Times are already in the doctor's timezone."""
     label,state=STATUS_LABELS.get(str(a.get("status")),(str(a.get("status") or "").replace("_"," ").title(),"closed"))
@@ -462,7 +482,7 @@ def booking_card(a):
     return dict(id=a.get("appointmentId"),date=a.get("localDate"),pretty_date=pretty,start=t12(a.get("localStart")),end=t12(a.get("localEnd")),
                 patient=name,booked_by=booked_by,type=(a.get("consultationType") or {}).get("name") or "Consultation",
                 status=label,state=state,fee=_money(a.get("fee")),refund=_money(refund.get("refundAmount")) if refund else None,
-                note=a.get("cancellationNote"))
+                note=a.get("cancellationNote"),actions=status_actions(a.get("status"),a.get("startAt"),a.get("allowedStatuses")))
 def load_bookings(tab,page,size):
     """Doctor's appointments from the booking API. Returns dict(ok, items, groups, total, ...)."""
     out=dict(ok=False,tab=tab,page=page,items=[],groups=[],total=0,total_pages=1,has_prev=False,has_next=False)
@@ -519,7 +539,8 @@ def appointment_card(a,zone):
     start=_utc(a["startAt"]).astimezone(zone); end=_utc(a["endAt"]).astimezone(zone) if a.get("endAt") else None
     status=str(a.get("status") or "").replace("_"," ").title() or "Scheduled"
     details=[("Appointment ref",a.get("appointmentId")),("Patient ref",a.get("patientId")),("Slot ID",a.get("slotId"))]
-    return dict(start=_clock(start),end=_clock(end) if end else None,type=a.get("consultationTypeName") or "Consultation",status=status,fee=_money(a.get("fee")),details=[(k,v) for k,v in details if v not in (None,"")])
+    return dict(id=a.get("appointmentId"),start=_clock(start),end=_clock(end) if end else None,type=a.get("consultationTypeName") or "Consultation",status=status,fee=_money(a.get("fee")),
+                details=[(k,v) for k,v in details if v not in (None,"")],actions=status_actions(a.get("status"),a.get("startAt")) if a.get("appointmentId") else [])
 def own_doctor_id():
     """The signed-in doctor's id: remembered at login, otherwise read once from GET /doctors/me."""
     uid=session.get("user_id")
@@ -582,6 +603,28 @@ def schedule_cancel_slot():
     else:
         app.logger.warning("slot cancel failed: HTTP %s %s",r.status_code,r.text[:300])
         notify(f"Slot not cancelled: {api_message(r)}","error")
+    return redirect(back)
+SAFE_BACK_RE=re.compile(r"/(\?m=(overview|profile|appointments)(&tab=(upcoming|past|cancelled))?(&page=\d{1,4})?|schedule\?date=\d{4}-\d{2}-\d{2})")
+@app.post("/appointments/<int:aid>/status")
+def appointment_status(aid):
+    """The doctor's 'Update status' button: completed / no-show (after the start) or cancel with a full refund (before)."""
+    back=request.form.get("back","")
+    if not SAFE_BACK_RE.fullmatch(back): back="/?m=appointments"      # only ever redirect to our own pages
+    status=request.form.get("status","").strip().upper()
+    if status not in STATUS_ACTIONS:
+        notify("Choose a new status for the appointment.","error")
+        return redirect(back)
+    if status=="CANCELLED_BY_DOCTOR" and request.form.get("confirm")!="yes":
+        notify("Tick the confirmation box to cancel the appointment.","error")
+        return redirect(back)
+    note=" ".join(request.form.get("note","").split())[:255]
+    r=api("POST",f"/appointments/{aid}/status",json={"status":status,**({"note":note} if note else {})})
+    if r.ok:
+        try: notify(r.json().get("message") or "Appointment updated","success")
+        except ValueError: notify("Appointment updated","success")
+    else:
+        app.logger.warning("appointment status failed: HTTP %s %s",r.status_code,r.text[:300])
+        notify(f"Status not updated: {api_message(r)}","error")
     return redirect(back)
 patient_portal.init(app,api=api,notify=notify,api_message=api_message,read_json=read_json,photo_bucket=photo_bucket,HOSPITALS=HOSPITALS,SPECIALIZATIONS=SPECIALIZATIONS)
 if __name__=="__main__":

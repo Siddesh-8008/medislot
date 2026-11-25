@@ -76,6 +76,8 @@ CREATE TABLE refund_ledger (refund_id INTEGER PRIMARY KEY AUTOINCREMENT, appoint
     CHECK (refund_amount >= 0 AND deduction_amount >= 0 AND round(refund_amount + deduction_amount, 2) = round(fee_amount, 2)),
     CHECK (refund_percentage BETWEEN 0 AND 100),
     CHECK (cancellation_reason IN ('PATIENT_CANCEL','DOCTOR_CANCEL','NO_SHOW')));
+CREATE TABLE blackout_dates (blackout_id INTEGER PRIMARY KEY AUTOINCREMENT, doctor_id INTEGER NOT NULL, blackout_date TEXT NOT NULL,
+    reason TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP, UNIQUE (doctor_id, blackout_date));
 """
 
 
@@ -2230,20 +2232,21 @@ def test_every_booking_route_is_an_api_method_wired_to_the_booking_lambda_and_de
     methods = {(full_path(resources, v["Properties"]["ResourceId"]), v["Properties"]["HttpMethod"]): k
                for k, v in r.items() if v["Type"] == "AWS::ApiGateway::Method"}
     wanted = [("/appointments", "POST"), ("/appointments", "GET"), ("/appointments/{appointmentId}", "GET"),
-              ("/appointments/{appointmentId}/cancel", "POST"), ("/doctors/me/slots/{slotId}/cancel", "POST"),
+              ("/appointments/{appointmentId}/cancel", "POST"), ("/appointments/{appointmentId}/status", "POST"),
+              ("/doctors/me/slots/{slotId}/cancel", "POST"),
               ("/patients/me/refunds", "GET"), ("/patients/me/dependents", "GET"), ("/patients/me/dependents", "POST"),
               ("/patients/me/dependents/{dependentId}", "PATCH"), ("/patients/me/dependents/{dependentId}", "DELETE")]
     deployments = [k for k, v in r.items() if v["Type"] == "AWS::ApiGateway::Deployment"]
-    assert deployments == ["ApiDeploymentM6Family"]
-    assert r["ApiStage"]["Properties"]["DeploymentId"] == "ApiDeploymentM6Family"
+    assert deployments == ["ApiDeploymentM6Status"]
+    assert r["ApiStage"]["Properties"]["DeploymentId"] == "ApiDeploymentM6Status"
     for route in wanted:
         name = methods.get(route)
         assert name, route
         m = r[name]["Properties"]
         assert m["AuthorizationType"] == "CUSTOM" and "BookingFunction.Arn" in m["Integration"]["Uri"], route
-        assert name in r["ApiDeploymentM6Family"]["DependsOn"], route
+        assert name in r["ApiDeploymentM6Status"]["DependsOn"], route
     # every method that existed before is still deployed
-    assert all(k in r["ApiDeploymentM6Family"]["DependsOn"] for k, v in r.items() if v["Type"] == "AWS::ApiGateway::Method")
+    assert all(k in r["ApiDeploymentM6Status"]["DependsOn"] for k, v in r.items() if v["Type"] == "AWS::ApiGateway::Method")
 
 
 def test_booking_role_is_least_privilege():

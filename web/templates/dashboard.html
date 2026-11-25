@@ -150,6 +150,7 @@ details{margin-top:24px}summary{cursor:pointer;color:var(--muted);font-weight:60
 .slot.closed .chip{color:#62777d}
 .slot details{margin:0}.slot summary{font-size:13px;font-weight:600;color:var(--teal)}
 .slot-cancel summary{color:var(--err)!important}.slot-cancel form{display:grid;gap:8px;margin-top:8px}.slot-cancel input{padding:8px 10px;font-size:13.5px}.slot-cancel .check input{width:auto}.slot-cancel button{padding:8px 14px;font-size:13.5px;justify-self:start}
+.status-update summary{color:var(--blue-d)!important}.status-update select{padding:8px 10px;font-size:13.5px}
 .slot dl{margin:10px 0 0;display:grid;gap:6px;font-size:12.5px}.slot dt{color:var(--muted)}.slot dd{margin:0;word-break:break-all}
 .appt{--c:var(--blue)}
 .appt.done{--c:var(--ok)}
@@ -189,11 +190,19 @@ pre{background:#1e3a4c;color:#d6ece9;padding:20px;border-radius:12px;overflow:au
 {%- macro hospital_options(sel,blank='Keep current') -%}<option value="">{{ blank }}</option>{% for i,n in hospitals %}<option value="{{i}}" {{ 'selected' if sel==i }}>{{n}}</option>{% endfor %}{%- endmacro -%}
 {%- macro spec_options(sel,blank='Keep current') -%}<option value="">{{ blank }}</option>{% for i,n in specializations %}<option value="{{i}}" {{ 'selected' if sel==i }}>{{n}}</option>{% endfor %}{%- endmacro -%}
 {%- macro banners() -%}{% for m in messages %}<div class="banner {{m.kind}}" role="status"><span>{{m.text}}</span><button type="button" aria-label="Dismiss" onclick="this.parentNode.remove()">×</button></div>{% endfor %}{%- endmacro -%}
+{%- macro status_form(a) -%}{% if a.id and a.actions %}{% set back = request.full_path.rstrip('?') %}
+ <details class="slot-cancel status-update"><summary>Update status</summary><form method="post" action="/appointments/{{a.id}}/status" onsubmit="var s=this.status.value;return s!=='CANCELLED_BY_DOCTOR'||confirm('Cancel this appointment? The patient is refunded in full.')">
+  <input type="hidden" name="back" value="{{ back }}">
+  <label>New status<select name="status" required>{% for v,l in a.actions %}<option value="{{v}}">{{l}}</option>{% endfor %}</select></label>
+  <label>Note (optional)<input name="note" maxlength="255" placeholder="e.g. Follow-up in 2 weeks"></label>
+  {% if a.actions|selectattr(0,'equalto','CANCELLED_BY_DOCTOR')|list %}<label class="check"><input type="checkbox" name="confirm" value="yes"> I understand cancelling refunds the patient in full</label>{% endif %}
+  <button>Update status</button></form></details>{% endif %}{%- endmacro -%}
 {%- macro booking(a, show_date) -%}<article class="slot appt {{ a.state }}"><div class="top"><div class="time">{{a.start}}{% if a.end %}<small>until {{a.end}}{{ ' · '~a.pretty_date if show_date }}</small>{% endif %}</div><span class="chip">{{a.status}}</span></div>
  <div class="who-line">{{ a.patient }}</div>{% if a.booked_by %}<div class="by">{{ a.booked_by }}</div>{% endif %}
  <div class="what">{{a.type}}</div>
  <div class="facts">{% if a.fee %}<span>Fee <b>{{a.fee}}</b></span>{% endif %}{% if a.refund %}<span>Refunded <b>{{a.refund}}</b></span>{% endif %}{% if a.date %}<span><a href="/schedule?date={{a.date}}">Open day</a></span>{% endif %}</div>
- {% if a.note %}<div class="by">Note: {{ a.note }}</div>{% endif %}</article>{%- endmacro -%}
+ {% if a.note %}<div class="by">Note: {{ a.note }}</div>{% endif %}
+ {{ status_form(a) }}</article>{%- endmacro -%}
 {%- macro cell(v) -%}{% if v is none or v=='' %}—{% elif v is mapping or (v is iterable and v is not string) %}{{ v|tojson }}{% else %}{{v}}{% endif %}{%- endmacro -%}
 {%- macro table(rows, columns) -%}<div class="tbl-wrap"><table><thead><tr>{% for c in columns %}<th>{{c|replace('_',' ')}}</th>{% endfor %}</tr></thead><tbody>{% for r in rows %}<tr>{% for c in columns %}<td>{{ cell(r.get(c)) }}</td>{% endfor %}</tr>{% endfor %}</tbody></table></div>{%- endmacro -%}
 
@@ -349,7 +358,7 @@ pre{background:#1e3a4c;color:#d6ece9;padding:20px;border-radius:12px;overflow:au
     <label>Start time<input name="startTime" type="time" required></label>
     <label>End time<input name="endTime" type="time" required></label>
    </div><button>Add weekly pattern</button></form>{% endif %}</section>
-   <section class="panel"><h2>Blackout date</h2><p class="lead">Block a day you’re away — holiday, conference, leave.</p>
+   <section class="panel"><h2>Blackout date</h2><p class="lead">Block a day you’re away — holiday, conference, leave. Appointments already booked on that day are cancelled and the patients refunded in full.</p>
    <form method="post" action="/blackout"><div class="fgrid"><label class="span2">Date<input name="blackoutDate" type="date" required></label><label class="span2">Reason<span class="opt">optional</span><input name="reason" placeholder="e.g. Conference"></label></div><button>Add blackout</button></form></section></div>
    <h3 class="list-title">Current weekly patterns</h3>
    {% if patterns is none %}<div class="empty"><b>Couldn’t load your patterns</b>Refresh to try again.</div>
@@ -385,7 +394,8 @@ pre{background:#1e3a4c;color:#d6ece9;padding:20px;border-radius:12px;overflow:au
       <article class="slot appt"><div class="top"><div class="time">{{a.start}}{% if a.end %}<small>until {{a.end}}</small>{% endif %}</div><span class="chip">{{a.status}}</span></div>
        <div class="what">{{a.type}}</div>
        {% if a.fee %}<div class="facts"><span>Fee <b>{{a.fee}}</b></span></div>{% endif %}
-       {% if a.details %}<details><summary>More details</summary><dl>{% for k,v in a.details %}<div><dt>{{k}}</dt><dd>{{v}}</dd></div>{% endfor %}</dl></details>{% endif %}</article>{% endfor %}</div>
+       {% if a.details %}<details><summary>More details</summary><dl>{% for k,v in a.details %}<div><dt>{{k}}</dt><dd>{{v}}</dd></div>{% endfor %}</dl></details>{% endif %}
+       {{ status_form(a) }}</article>{% endfor %}</div>
      {% else %}<div class="empty"><b>No appointments</b>Nothing is booked for this day.</div>{% endif %}
 
      <h3 class="list-title">Slots</h3>

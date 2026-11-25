@@ -5,8 +5,15 @@ Routes (behind the JWT authorizer; the role is checked here, the user id always 
     GET  /appointments                         PATIENT  my appointments    | DOCTOR  appointments with me
     GET  /appointments/{appointmentId}         PATIENT  one of mine        | DOCTOR  one with me
     POST /appointments/{appointmentId}/cancel  PATIENT  cancel; refund tier from the SSM refund policy
+    POST /appointments/{appointmentId}/status  DOCTOR   set COMPLETED / NO_SHOW (after start) or CANCELLED_BY_DOCTOR
+                                                        (before start, 100 % refund) on one appointment with me
     POST /doctors/me/slots/{slotId}/cancel     DOCTOR   cancel a whole slot; every booked patient refunded 100 %
     GET  /patients/me/refunds                  PATIENT  my refund ledger
+
+Internal (direct Lambda invoke by doctor_domain, never reachable through API Gateway):
+    {"action": "cancelBlackoutDay", "doctorId": 42, "date": "2026-11-30", "reason": "..."}
+        The doctor blacked out a day: every future slot on that local day that still has CONFIRMED appointments is
+        cancelled exactly like POST /doctors/me/slots/{slotId}/cancel (slot CANCELLED, patients refunded 100 %).
     GET  /patients/me/dependents               PATIENT  my family members (people I book for)
     POST /patients/me/dependents               PATIENT  add a family member
     PATCH/DELETE /patients/me/dependents/{id}  PATIENT  edit / remove a family member
@@ -87,6 +94,12 @@ STATUS_FILTERS = {
     "CANCELLED_BY_PATIENT": ("CANCELLED_BY_PATIENT",), "CANCELLED_BY_DOCTOR": ("CANCELLED_BY_DOCTOR",),
 }
 DOCTOR_TIER = "DOCTOR_CANCELLED"
+# Statuses a doctor can set on one appointment (POST /appointments/{id}/status).
+#   COMPLETED / NO_SHOW: only once the appointment has started; the doctor may switch between the two to fix a mis-click.
+#   CANCELLED_BY_DOCTOR: only before the start; the patient is refunded 100 % and the seat goes back to the slot.
+DOCTOR_SETTABLE = ("COMPLETED", "NO_SHOW", "CANCELLED_BY_DOCTOR")
+ATTENDANCE = ("COMPLETED", "NO_SHOW")
+BLACKOUT_NOTE = "The doctor is unavailable on this day"
 RELATIONS = ("Mother", "Father", "Spouse", "Child", "Sibling", "Grandparent", "Grandchild", "Other")
 _RELATION_LOOKUP = {r.lower(): r for r in RELATIONS}
 MAX_DEPENDENTS = 10
@@ -684,11 +697,33 @@ def appointment_json(r, role, now=None, tiers=None):
             out["patient"].update(bookedBy=holder, relation=r.get("dependent_relation"))
         if r.get("cancellation_note"):
             out["cancellationNote"] = r["cancellation_note"]
+        if now is not None:
+            out["allowedStatuses"] = doctor_status_options(r["status"], start, now)
     if role == "PATIENT" and r["status"] == "CONFIRMED" and now is not None:
         out["cancellable"] = start > now
         if tiers and start > now:
             out["cancellationPreview"] = cancellation_preview(start, r["fee_snapshot"], now, tiers)
     return out
+
+
+def doctor_status_options(status, start, now):
+    """Which statuses the doctor may set next (drives the 'Update status' button on the dashboard)."""
+    if status == "CONFIRMED":
+        return ["CANCELLED_BY_DOCTOR"] if start > now else list(ATTENDANCE)
+    if status in ATTENDANCE:
+        return [s for s in ATTENDANCE if s != status]
+    return []          # cancelled appointments are final
+
+
+def blackout_on(cur, doctor_id, start, zone, lock=False):
+    """True when the doctor has blacked out the LOCAL day this appointment starts on.
+    lock=True (inside the booking transaction) takes a locking read on the unique (doctor_id, blackout_date) key:
+    on InnoDB that also locks the gap, so a blackout being added for that day waits until this booking commits and
+    its sweep then sees (and cancels) it - a booking can never slip in between the blackout and its sweep."""
+    day = start.astimezone(zone).date().isoformat()
+    cur.execute("SELECT blackout_id FROM blackout_dates WHERE doctor_id = %s AND blackout_date = %s"
+                + (" FOR UPDATE" if lock else ""), (doctor_id, day))
+    return cur.fetchone() is not None
 
 
 def fetch_appointment(cur, appointment_id, lock=False):
@@ -895,8 +930,11 @@ def do_book(uid, slot_id, dependent_id, key, attempt_id, resumed_seat, cid, outb
             who = f"{dependent['first_name']} {dependent['last_name']}" if dependent else None
             problem = None
             if me and me["is_active"] and me["patient_id"] is not None and offer and (dependent_id is None or dependent):
-                problem = check_limits(cur, uid, dependent_id, doctor_id, slot_id, start, end, zone_of(offer["timezone"]),
-                                       settings, now, who)
+                if blackout_on(cur, doctor_id, start, zone_of(offer["timezone"])):
+                    problem = ("DOCTOR_UNAVAILABLE", "The doctor is not available on this day. Please choose another date.")
+                else:
+                    problem = check_limits(cur, uid, dependent_id, doctor_id, slot_id, start, end, zone_of(offer["timezone"]),
+                                           settings, now, who)
         conn.rollback()
     if not me or not me["is_active"]:
         return reject(403, "ACCOUNT_INACTIVE", "This account cannot book appointments", final=False)
@@ -959,6 +997,10 @@ def do_book(uid, slot_id, dependent_id, key, attempt_id, resumed_seat, cid, outb
                         conn.rollback()
                         release_seat(slot_id, cid, "dependent_removed")
                         return reject(404, "DEPENDENT_NOT_FOUND", "That family member is not on your account")
+                    if blackout_on(cur, doctor_id, start, zone, lock=True):
+                        conn.rollback()
+                        release_seat(slot_id, cid, "doctor_blackout")
+                        return reject(409, "DOCTOR_UNAVAILABLE", "The doctor is not available on this day. Please choose another date.")
                     problem = check_limits(cur, uid, dependent_id, doctor_id, slot_id, start, end, zone, settings, now, who)
                     if problem:
                         conn.rollback()
@@ -1086,6 +1128,165 @@ def cancel_by_patient(appointment_id, uid, cid):
     return respond(200, {"message": "Appointment cancelled", "appointment": appt, "refund": ref, "correlationId": cid})
 
 
+def doctor_cancel_slot(slot_id, uid, now, note, cid, source="slot"):
+    """The doctor cancels ONE slot: mark it CANCELLED in DynamoDB (nobody can book it, the materialiser never reopens
+    it), then cancel every CONFIRMED appointment in it with a 100 % refund. Shared by the cancel-slot endpoint and the
+    blackout-day sweep. Safe to repeat: a second call finishes a sweep that failed half-way and changes nothing else.
+    -> (state, appointments) with state 'cancelled' | 'already' | 'started' | 'missing'."""
+    slot = get_slot(slot_id)
+    if not slot or int(slot.get("doctor_id", 0)) != uid:
+        if slot:
+            emit("warning", "slot_isolation_violation", cid, callerId=uid, slotId=slot_id)
+        return "missing", []
+    if parse_utc(slot["start_at"]) <= now and slot.get("status") != "CANCELLED":
+        return "started", []
+    state = "already" if slot.get("status") == "CANCELLED" else mark_slot_cancelled(slot_id, uid, now)
+    if state in ("missing", "started"):
+        return state, []
+
+    # Sweep (also on a repeated call, so a retry finishes a sweep that failed half-way).
+    with dbconn(db_config()) as conn:
+        with conn.cursor() as cur:
+            try:
+                done = cancel_confirmed_by_doctor(cur, slot_id, uid, now, note)
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            rows = load_appointments(cur, done)
+    appts = [appointment_json(r, "DOCTOR", now) for r in rows]
+    entries = [cancelled_event(a, a["refund"], "DOCTOR") for a in appts]
+    if state == "cancelled" or appts:   # a repeated call that changed nothing publishes nothing
+        entries.append(("SlotCancelled", {"slotId": slot_id, "doctorId": uid, "startAt": iso(slot["start_at"]),
+                                          "cancelledAppointments": len(appts), "reason": source}))
+    publish(entries, cid)
+    if appts:
+        metric("CancellationsByTier", len(appts), Tier=DOCTOR_TIER)
+    emit("info", "slot_cancelled_by_doctor", cid, doctorId=uid, slotId=slot_id, cancelledAppointments=len(appts),
+         alreadyCancelled=state == "already", source=source)
+    return state, appts
+
+
+def cancel_day_by_doctor(doctor_id, day_text, reason, cid):
+    """Internal action for a new blackout date: cancel every future slot of that LOCAL day that still has CONFIRMED
+    appointments (patients refunded 100 %). Unbooked slots are closed by the slot materialiser as before.
+    Idempotent - adding the same blackout again simply re-runs the sweep."""
+    try:
+        doctor_id = int(doctor_id)
+        day = datetime.strptime(str(day_text), "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return {"ok": False, "message": "doctorId and date (YYYY-MM-DD) are required"}
+    reason = " ".join(str(reason or "").split())[:200]
+    note = f"{BLACKOUT_NOTE} ({reason})"[:255] if reason else BLACKOUT_NOTE
+    now = utcnow()
+    with dbconn(db_config()) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT timezone FROM doctors WHERE doctor_id = %s", (doctor_id,))
+            doc = cur.fetchone()
+            if not doc:
+                conn.rollback()
+                return {"ok": False, "message": "Doctor not found"}
+            zone = zone_of(doc["timezone"])
+            lo = datetime.combine(day, datetime.min.time(), tzinfo=zone).astimezone(UTC)
+            hi = datetime.combine(day + timedelta(days=1), datetime.min.time(), tzinfo=zone).astimezone(UTC)
+            cur.execute("""SELECT DISTINCT slot_id FROM appointments
+                           WHERE doctor_id = %s AND status = 'CONFIRMED' AND start_at >= %s AND start_at < %s AND start_at > %s
+                           ORDER BY slot_id""", (doctor_id, db_time(lo), db_time(hi), db_time(now)))
+            slot_ids = [r["slot_id"] for r in cur.fetchall()]
+        conn.rollback()
+    cancelled, refunded, skipped = 0, Decimal("0.00"), []
+    for slot_id in slot_ids:
+        try:
+            state, appts = doctor_cancel_slot(slot_id, doctor_id, now, note, cid, source="blackout")
+        except Exception as exc:  # noqa: BLE001 - one bad slot must not stop the rest; a re-run finishes it
+            emit("error", "blackout_slot_cancel_failed", cid, doctorId=doctor_id, slotId=slot_id, error=type(exc).__name__)
+            skipped.append(slot_id)
+            continue
+        if state in ("missing", "started"):
+            skipped.append(slot_id)
+        cancelled += len(appts)
+        refunded += sum((money(a["refund"]["refundAmount"]) for a in appts), Decimal("0.00"))
+    emit("info", "blackout_day_swept", cid, doctorId=doctor_id, date=day.isoformat(), slots=len(slot_ids),
+         cancelledAppointments=cancelled, skippedSlots=len(skipped))
+    return {"ok": not skipped, "date": day.isoformat(), "slots": len(slot_ids), "cancelledAppointments": cancelled,
+            "totalRefunded": num(refunded), "skippedSlots": skipped}
+
+
+def update_status_by_doctor(event, appointment_id, uid, cid):
+    """The doctor sets the outcome of one appointment: COMPLETED / NO_SHOW once it has started, or
+    CANCELLED_BY_DOCTOR before it starts (100 % refund, seat released)."""
+    data = body(event)
+    if not isinstance(data, dict):
+        return respond(400, msg(cid, "Invalid JSON body", "INVALID_BODY"))
+    new = str(data.get("status") or "").strip().upper()
+    if new not in DOCTOR_SETTABLE:
+        return respond(422, msg(cid, "status must be one of: " + ", ".join(DOCTOR_SETTABLE), "STATUS_INVALID"))
+    note = " ".join(str(data.get("note") or data.get("reason") or "").split())[:255] or None
+    now = utcnow()
+    with dbconn(db_config()) as conn:
+        with conn.cursor() as cur:
+            row = fetch_appointment(cur, appointment_id, lock=True)
+            if not row or int(row["doctor_id"]) != uid:
+                conn.rollback()
+                if row:
+                    emit("warning", "appointment_isolation_violation", cid, callerId=uid, role="DOCTOR", appointmentId=appointment_id)
+                return respond(404, msg(cid, "Appointment not found", "APPOINTMENT_NOT_FOUND"))
+            old, start = row["status"], parse_utc(row["start_at"])
+            if old == new:
+                conn.rollback()
+                return respond(200, {"message": "The appointment already has this status", "unchanged": True,
+                                     "appointment": appointment_json(row, "DOCTOR", now), "correlationId": cid})
+            if old in CANCELLED:
+                conn.rollback()
+                return respond(409, msg(cid, "A cancelled appointment cannot be changed", "NOT_CHANGEABLE"))
+            if new in ATTENDANCE:
+                if start > now:
+                    conn.rollback()
+                    return respond(409, msg(cid, "You can mark an appointment completed or no-show only once it has started",
+                                            "NOT_STARTED"))
+                cur.execute("""UPDATE appointments SET status = %s, cancellation_note = COALESCE(%s, cancellation_note),
+                                      updated_at = %s WHERE appointment_id = %s AND status = %s""",
+                            (new, note, db_time(now), appointment_id, old))
+                if cur.rowcount != 1:
+                    conn.rollback()
+                    return respond(409, msg(cid, "The appointment changed meanwhile. Refresh and try again.", "CONFLICT"))
+                conn.commit()
+                row = fetch_appointment(cur, appointment_id)
+                done = None
+            else:   # CANCELLED_BY_DOCTOR
+                if old != "CONFIRMED":
+                    conn.rollback()
+                    return respond(409, msg(cid, f"A {old.lower().replace('_', ' ')} appointment cannot be cancelled", "NOT_CANCELLABLE"))
+                if start <= now:
+                    conn.rollback()
+                    return respond(409, msg(cid, "This appointment has already started. Mark it completed or no-show instead.",
+                                            "ALREADY_STARTED"))
+                done = cancel_confirmed_by_doctor(cur, row["slot_id"], uid, now, note or "Cancelled by the doctor", appointment_id)
+                conn.commit()
+                row = fetch_appointment(cur, appointment_id)
+    appt = appointment_json(row, "DOCTOR", now)
+    entries = []
+    if new == "CANCELLED_BY_DOCTOR":
+        if done:
+            metric("CancellationsByTier", 1, Tier=DOCTOR_TIER)
+            entries.append(cancelled_event(appt, appt["refund"], "DOCTOR"))
+            after = release_seat(row["slot_id"], cid, "doctor_cancel_appointment")
+            if after and after.get("status") == "OPEN" and start > utcnow():
+                entries.append(("SlotSeatFreed", {"slotId": row["slot_id"], "doctorId": uid,
+                                                  "consultationTypeId": int(row["consultation_type_id"]), "startAt": iso(start),
+                                                  "localDate": after.get("local_date") or appt["localDate"],
+                                                  "freeSeats": free_seats(after), "capacity": int(after.get("capacity", 1))}))
+    else:
+        entries.append(("AppointmentStatusChanged", {"appointmentId": appt["appointmentId"], "doctorId": uid,
+                                                     "patientId": appt["patientId"], "slotId": appt["slotId"],
+                                                     "previousStatus": old, "status": new}))
+    publish(entries, cid)
+    emit("info", "appointment_status_set_by_doctor", cid, doctorId=uid, appointmentId=appointment_id, previous=old, status=new)
+    text = {"COMPLETED": "Appointment marked as completed", "NO_SHOW": "Appointment marked as no-show",
+            "CANCELLED_BY_DOCTOR": "Appointment cancelled; the patient is refunded in full"}[new]
+    return respond(200, {"message": text, "appointment": appt, "refund": appt.get("refund"), "correlationId": cid})
+
+
 def cancel_slot_by_doctor(event, raw_slot, uid, cid):
     slot_id = unquote(raw_slot or "")
     if SLOT_REF_RE.fullmatch(slot_id):
@@ -1103,40 +1304,12 @@ def cancel_slot_by_doctor(event, raw_slot, uid, cid):
             if not cur.fetchone():
                 return respond(404, msg(cid, "Doctor profile not found; create it first", "DOCTOR_PROFILE_REQUIRED"))
         conn.rollback()
-    slot = get_slot(slot_id)
-    if not slot or int(slot.get("doctor_id", 0)) != uid:
-        if slot:
-            emit("warning", "slot_isolation_violation", cid, callerId=uid, slotId=slot_id)
-        return respond(404, msg(cid, "Slot not found", "SLOT_NOT_FOUND"))
-    if parse_utc(slot["start_at"]) <= now and slot.get("status") != "CANCELLED":
-        return respond(409, msg(cid, "This slot has already started and cannot be cancelled", "SLOT_STARTED"))
-    state = "already" if slot.get("status") == "CANCELLED" else mark_slot_cancelled(slot_id, uid, now)
+    state, appts = doctor_cancel_slot(slot_id, uid, now, note, cid)
     if state == "missing":
         return respond(404, msg(cid, "Slot not found", "SLOT_NOT_FOUND"))
     if state == "started":
         return respond(409, msg(cid, "This slot has already started and cannot be cancelled", "SLOT_STARTED"))
-
-    # Sweep (also on a repeated call, so a retry finishes a sweep that failed half-way).
-    with dbconn(db_config()) as conn:
-        with conn.cursor() as cur:
-            try:
-                done = cancel_confirmed_by_doctor(cur, slot_id, uid, now, note)
-                conn.commit()
-            except Exception:
-                conn.rollback()
-                raise
-            rows = load_appointments(cur, done)
-    appts = [appointment_json(r, "DOCTOR", now) for r in rows]
-    entries = [cancelled_event(a, a["refund"], "DOCTOR") for a in appts]
-    if state == "cancelled" or appts:   # a repeated call that changed nothing publishes nothing
-        entries.append(("SlotCancelled", {"slotId": slot_id, "doctorId": uid, "startAt": iso(slot["start_at"]),
-                                          "cancelledAppointments": len(appts)}))
-    publish(entries, cid)
-    if appts:
-        metric("CancellationsByTier", len(appts), Tier=DOCTOR_TIER)
     total = sum((money(a["refund"]["refundAmount"]) for a in appts), Decimal("0.00"))
-    emit("info", "slot_cancelled_by_doctor", cid, doctorId=uid, slotId=slot_id, cancelledAppointments=len(appts),
-         alreadyCancelled=state == "already")
     return respond(200, {
         "message": "Slot cancelled" + (f"; {len(appts)} patient{'s' if len(appts) != 1 else ''} refunded in full" if appts else ""),
         "slotId": slot_id, "status": "CANCELLED", "alreadyCancelled": state == "already",
@@ -1446,7 +1619,19 @@ def appointment_id_of(raw, cid):
 
 @instrument("booking")
 def handler(event, context):
+    event = event if isinstance(event, dict) else {}
     cid = correlation(event)
+    # Internal action from doctor_domain (direct, IAM-authorised Lambda invoke). API Gateway events always carry
+    # httpMethod + requestContext, so this branch can never be reached from the public API.
+    if event.get("action") and "httpMethod" not in event and "requestContext" not in event:
+        if event.get("action") != "cancelBlackoutDay":
+            return {"ok": False, "message": "Unknown action"}
+        try:
+            return cancel_day_by_doctor(event.get("doctorId"), event.get("date"), event.get("reason"), cid)
+        except Exception as exc:  # noqa: BLE001
+            emit("error", "blackout_day_sweep_failed", cid, error=type(exc).__name__, detail=str(exc)[:300],
+                 traceback=traceback.format_exc()[-1500:])
+            return {"ok": False, "message": "Blackout sweep failed"}
     ctx = (event.get("requestContext") or {}).get("authorizer") or {}
     role = ctx.get("role")
     try:
@@ -1464,11 +1649,17 @@ def handler(event, context):
             if method == "GET":
                 return list_appointments(event, uid, role, cid)
             return respond(405, msg(cid, "Method not allowed"))
-        m = re.fullmatch(r"/appointments/([^/]+)(/cancel)?", path)
+        m = re.fullmatch(r"/appointments/([^/]+)(/cancel|/status)?", path)
         if m:
             appointment_id, bad = appointment_id_of(m.group(1), cid)
             if bad:
                 return bad
+            if m.group(2) == "/status":
+                if method != "POST":
+                    return respond(405, msg(cid, "Method not allowed"))
+                if role != "DOCTOR":
+                    return respond(403, msg(cid, "Only the doctor can update an appointment's status"))
+                return update_status_by_doctor(event, appointment_id, uid, cid)
             if m.group(2):
                 if method != "POST":
                     return respond(405, msg(cid, "Method not allowed"))

@@ -273,7 +273,10 @@ Resources:
                 Resource: !Sub 'arn:${AWS::Partition}:s3:::medislot-${Environment}-doctor-photos-${AWS::AccountId}-${AWS::Region}/doctors/*'
               - Effect: Allow
                 Action: [lambda:InvokeFunction]
-                Resource: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:medislot-${Environment}-slot-materialiser'
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:medislot-${Environment}-slot-materialiser'
+                  # Blackout date added -> booking Lambda cancels the appointments already booked on that day.
+                  - !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:medislot-${Environment}-booking'
   DoctorDomainFunction:
     Type: AWS::Lambda::Function
     Properties:
@@ -293,6 +296,7 @@ Resources:
           ENVIRONMENT: !Ref Environment
           DOCTOR_PHOTOS_BUCKET: !Sub 'medislot-${Environment}-doctor-photos-${AWS::AccountId}-${AWS::Region}'
           SLOT_MATERIALISER_FUNCTION: !Sub 'medislot-${Environment}-slot-materialiser'
+          BOOKING_FUNCTION: !Sub 'medislot-${Environment}-booking'
       VpcConfig:
         SecurityGroupIds: [!ImportValue {Fn::Sub: 'MediSlot-${Environment}-LambdaSecurityGroupId'}]
         SubnetIds:
@@ -1103,6 +1107,12 @@ Resources:
       RestApiId: !Ref RestApi
       ParentId: !Ref AppointmentIdResource
       PathPart: 'cancel'
+  AppointmentStatusResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref AppointmentIdResource
+      PathPart: 'status'
   DoctorsMeSlotsResource:
     Type: AWS::ApiGateway::Resource
     Properties:
@@ -1168,6 +1178,18 @@ Resources:
     Properties:
       RestApiId: !Ref RestApi
       ResourceId: !Ref AppointmentCancelResource
+      HttpMethod: POST
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BookingFunction.Arn}/invocations'
+  AppointmentStatusPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref AppointmentStatusResource
       HttpMethod: POST
       AuthorizationType: CUSTOM
       AuthorizerId: !Ref ApiAuthorizer
@@ -1349,7 +1371,7 @@ Resources:
     Properties: {FunctionName: !Ref ProtectedFunction, Action: lambda:InvokeFunction, Principal: apigateway.amazonaws.com, SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*/GET/*'}
   # NOTE: API Gateway only publishes a NEW snapshot when this resource is REPLACED. Changing its Description does not.
   # So the logical ID carries the milestone: rename it (ApiDeploymentM5, ...) whenever routes are added or changed.
-  ApiDeploymentM6Family:
+  ApiDeploymentM6Status:
     Type: AWS::ApiGateway::Deployment
     DependsOn:
       - PatientsMeDependentsGetMethod
@@ -1360,6 +1382,7 @@ Resources:
       - AppointmentsGetMethod
       - AppointmentIdGetMethod
       - AppointmentCancelPostMethod
+      - AppointmentStatusPostMethod
       - DoctorsMeSlotCancelPostMethod
       - PatientsMeRefundsGetMethod
       - PatientProtectedMethod
@@ -1405,7 +1428,7 @@ Resources:
     Type: AWS::ApiGateway::Stage
     Properties:
       RestApiId: !Ref RestApi
-      DeploymentId: !Ref ApiDeploymentM6Family
+      DeploymentId: !Ref ApiDeploymentM6Status
       StageName: !Ref Environment
       TracingEnabled: true
       AccessLogSetting:
