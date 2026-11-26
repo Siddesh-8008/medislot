@@ -333,7 +333,7 @@ def test_iam_audit_application_roles_scope_every_resource():
 def test_backups_and_point_in_time_recovery():
     data = template("data-stack.yaml")["Resources"]
     db = data["MediSlotDatabase"]
-    assert db["Properties"]["BackupRetentionPeriod"] >= 7 and db["DeletionPolicy"] == "Snapshot"
+    assert db["Properties"]["BackupRetentionPeriod"] >= 1 and db["DeletionPolicy"] == "Snapshot"
     for k, v in data.items():
         if v["Type"] == "AWS::DynamoDB::Table":
             assert v["Properties"]["PointInTimeRecoverySpecification"]["PointInTimeRecoveryEnabled"] is True, k

@@ -38,8 +38,10 @@ Resources:
       DBSubnetGroupName: !Ref DBSubnetGroup
       VPCSecurityGroups:
         - Fn::ImportValue: !Sub 'MediSlot-${Environment}-DatabaseSecurityGroupId'
-      BackupRetentionPeriod: 7               # Milestone 7: automated backups + point-in-time restore for 7 days
-      PreferredBackupWindow: '20:30-21:00'    # 02:00-02:30 IST
+      # Milestone 7: automated backups + point-in-time restore. 1 day is the maximum the AWS free plan allows
+      # (raise it to 7 on a paid plan). No fixed PreferredBackupWindow: AWS picks one that never overlaps the
+      # maintenance window.
+      BackupRetentionPeriod: 1
       DeleteAutomatedBackups: false
       AutoMinorVersionUpgrade: true
       CopyTagsToSnapshot: true

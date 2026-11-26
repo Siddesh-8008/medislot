@@ -10,7 +10,23 @@ for pair in parameter_pairs:
     parameters.append({"ParameterKey": key, "ParameterValue": value})
 def aws(*args, check=True):
     return subprocess.run(["aws", *args, "--region", region], check=check, text=True, capture_output=True)
-exists = aws("cloudformation", "describe-stacks", "--stack-name", stack_name, check=False).returncode == 0
+# CREATE or UPDATE? Only "does not exist" means CREATE; any other error (e.g. AccessDenied) stops the deploy instead
+# of guessing. An empty stack left in REVIEW_IN_PROGRESS by an earlier failed CREATE is deleted first.
+probe = aws("cloudformation", "describe-stacks", "--stack-name", stack_name, check=False)
+if probe.returncode == 0:
+    status = json.loads(probe.stdout)["Stacks"][0]["StackStatus"]
+    if status in ("REVIEW_IN_PROGRESS", "ROLLBACK_COMPLETE"):
+        print(f"{stack_name} is {status} (it was never created); deleting the empty stack first")
+        aws("cloudformation", "delete-stack", "--stack-name", stack_name)
+        aws("cloudformation", "wait", "stack-delete-complete", "--stack-name", stack_name)
+        exists = False
+    else:
+        exists = True
+elif "does not exist" in probe.stderr:
+    exists = False
+else:
+    print(probe.stderr)
+    raise SystemExit(f"Could not read stack {stack_name} (see the error above); refusing to guess CREATE vs UPDATE.")
 kind = "UPDATE" if exists else "CREATE"
 name = f"m2-{uuid.uuid4().hex[:12]}"
 cmd = ["cloudformation", "create-change-set", "--stack-name", stack_name,
@@ -47,5 +63,13 @@ if data["Status"] != "CREATE_COMPLETE":
     raise SystemExit("Change Set failed; see reason above.")
 aws("cloudformation", "execute-change-set", "--stack-name", stack_name, "--change-set-name", name)
 waiter = "stack-create-complete" if kind == "CREATE" else "stack-update-complete"
-aws("cloudformation", "wait", waiter, "--stack-name", stack_name)
+done = aws("cloudformation", "wait", waiter, "--stack-name", stack_name, check=False)
+if done.returncode != 0:
+    # Show WHY it failed (the first FAILED events, oldest first) instead of a bare "exit status 255".
+    ev = aws("cloudformation", "describe-stack-events", "--stack-name", stack_name, "--output", "json", check=False)
+    if ev.returncode == 0:
+        failed = [e for e in json.loads(ev.stdout)["StackEvents"] if "FAILED" in e["ResourceStatus"]]
+        for e in reversed(failed[:15]):
+            print(f'{e["Timestamp"]}  {e["LogicalResourceId"]}  {e["ResourceStatus"]}  {e.get("ResourceStatusReason", "")}')
+    raise SystemExit(f"Stack {stack_name} did not reach {waiter}; the failed resources are listed above.")
 print(f"Stack {stack_name} deployed successfully.")
