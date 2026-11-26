@@ -245,6 +245,9 @@ def test_operations_dashboard_has_every_business_metric():
     assert {"metric", "text", "alarm"} <= kinds and len(data["widgets"]) >= 20
     for w in data["widgets"]:
         assert 0 <= w["x"] and w["x"] + w["width"] <= 24
+        # CloudWatch rule: "metrics" is an array of ARRAYS - a math / SEARCH expression object must sit inside its own array
+        for m in w.get("properties", {}).get("metrics", []):
+            assert isinstance(m, list) and all(isinstance(x, str) for x in m[:-1]) and isinstance(m[-1], (str, dict)), (w["properties"]["title"], m)
     alarm_refs = set(re.findall(r"\$\{(\w+)\.Arn\}", raw))
     assert alarm_refs == {k for k, v in OBS.items() if v["Type"] == "AWS::CloudWatch::Alarm"}
 
