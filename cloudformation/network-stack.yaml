@@ -132,6 +132,16 @@ Resources:
       PrivateDnsEnabled: true
       SubnetIds: [!Ref PrivateSubnet1, !Ref PrivateSubnet2]
       SecurityGroupIds: [!GetAtt EndpointSecurityGroup.GroupId]
+  # Milestone 6: the booking Lambda starts the reschedule saga and waits for its result (Step Functions API).
+  StepFunctionsInterfaceEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref MediSlotVPC
+      VpcEndpointType: Interface
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.states'
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PrivateSubnet1, !Ref PrivateSubnet2]
+      SecurityGroupIds: [!GetAtt EndpointSecurityGroup.GroupId]
   S3GatewayEndpoint:
     Type: AWS::EC2::VPCEndpoint
     Properties:

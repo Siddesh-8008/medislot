@@ -1,0 +1,58 @@
+name: MediSlot operations
+
+# Manual operations for Milestone 7, plus a weekly drift check.
+#   drift     - CloudFormation drift detection on every stack (fails if anything is not IN_SYNC)
+#   dr-drill  - restore RDS (PITR) and the DynamoDB Slots table into throw-away copies, measure, report, delete
+#   teardown  - delete the environment (type DELETE-<env> to confirm); then run "MediSlot CI and Deployment" to rebuild
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: drift | dr-drill | teardown
+        required: true
+        default: drift
+        type: choice
+        options: [drift, dr-drill, teardown]
+      confirm:
+        description: For teardown only - type DELETE-<environment>
+        required: false
+        default: ''
+  schedule:
+    - cron: '30 3 * * 1'        # Mondays 09:00 IST: drift check
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'ap-south-1' }}
+  AWS_DEFAULT_REGION: ${{ vars.AWS_REGION || 'ap-south-1' }}
+  ENVIRONMENT: ${{ vars.ENVIRONMENT || 'dev' }}
+
+jobs:
+  ops:
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN || secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Drift detection
+        if: github.event_name == 'schedule' || inputs.action == 'drift'
+        run: bash scripts/ops/drift_check.sh
+      - name: DR restore drill
+        if: inputs.action == 'dr-drill'
+        run: bash scripts/ops/dr_drill.sh
+      - name: Upload the DR drill report
+        if: inputs.action == 'dr-drill'
+        uses: actions/upload-artifact@v4
+        with:
+          name: dr-drill-report
+          path: docs/dr-drill-*.md
+      - name: Teardown
+        if: inputs.action == 'teardown'
+        env:
+          CONFIRM: ${{ inputs.confirm }}
+        run: bash scripts/ops/teardown.sh

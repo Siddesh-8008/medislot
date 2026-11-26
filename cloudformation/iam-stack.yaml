@@ -41,13 +41,117 @@ Resources:
               - !Sub arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/medislot-${Environment}-data/*
               - !Sub arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/medislot-${Environment}-auth/*
               - !Sub arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/medislot-${Environment}-dashboard/*
+              - !Sub arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/medislot-${Environment}-observability/*
 
           - Sid: InspectCloudFormation
             Effect: Allow
             Action:
               - cloudformation:ValidateTemplate
               - cloudformation:DescribeStackResources
+              - cloudformation:DescribeStackDriftDetectionStatus
             Resource: "*"
+
+          # Milestone 7: drift detection (ops workflow) on every MediSlot stack.
+          - Sid: DetectMediSlotDrift
+            Effect: Allow
+            Action:
+              - cloudformation:DetectStackDrift
+              - cloudformation:DetectStackResourceDrift
+              - cloudformation:DescribeStackResourceDrifts
+            Resource:
+              - !Sub arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/medislot-${Environment}-*/*
+
+          # Milestone 7: teardown + redeploy from scratch. The IAM stack (this policy) is never deleted by the pipeline.
+          - Sid: TeardownApplicationStacks
+            Effect: Allow
+            Action: cloudformation:DeleteStack
+            Resource:
+              - !Sub arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/medislot-${Environment}-network/*
+              - !Sub arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/medislot-${Environment}-data/*
+              - !Sub arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/medislot-${Environment}-auth/*
+              - !Sub arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/medislot-${Environment}-dashboard/*
+              - !Sub arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/medislot-${Environment}-observability/*
+
+          - Sid: EmptyMediSlotBucketsForTeardown
+            Effect: Allow
+            Action: [s3:ListBucket, s3:ListBucketVersions, s3:DeleteObject, s3:DeleteObjectVersion]
+            Resource:
+              - !Sub arn:${AWS::Partition}:s3:::medislot-${Environment}-artifacts-${AWS::AccountId}
+              - !Sub arn:${AWS::Partition}:s3:::medislot-${Environment}-artifacts-${AWS::AccountId}/*
+              - !Sub arn:${AWS::Partition}:s3:::medislot-${Environment}-doctor-photos-${AWS::AccountId}-${AWS::Region}
+              - !Sub arn:${AWS::Partition}:s3:::medislot-${Environment}-doctor-photos-${AWS::AccountId}-${AWS::Region}/*
+
+          # ---- Milestone 6 resource types (auth stack) and Milestone 7 observability, all scoped to MediSlot names.
+          - Sid: ManageMediSlotQueues
+            Effect: Allow
+            Action: [sqs:CreateQueue, sqs:DeleteQueue, sqs:GetQueueAttributes, sqs:SetQueueAttributes, sqs:GetQueueUrl,
+                     sqs:TagQueue, sqs:UntagQueue, sqs:ListQueueTags]
+            Resource: !Sub arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:medislot-${Environment}-*
+
+          - Sid: ManageMediSlotTopics
+            Effect: Allow
+            Action: [sns:CreateTopic, sns:DeleteTopic, sns:GetTopicAttributes, sns:SetTopicAttributes, sns:Subscribe,
+                     sns:Unsubscribe, sns:GetSubscriptionAttributes, sns:TagResource, sns:UntagResource, sns:ListTagsForResource]
+            Resource:
+              - !Sub arn:${AWS::Partition}:sns:${AWS::Region}:${AWS::AccountId}:medislot-${Environment}-*
+              - !Sub arn:${AWS::Partition}:sns:${AWS::Region}:${AWS::AccountId}:medislot-${Environment}-*:*
+
+          - Sid: ManageRescheduleStateMachine
+            Effect: Allow
+            Action: [states:CreateStateMachine, states:UpdateStateMachine, states:DeleteStateMachine, states:DescribeStateMachine,
+                     states:TagResource, states:UntagResource, states:ListTagsForResource]
+            Resource: !Sub arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:medislot-${Environment}-*
+
+          - Sid: ManageMediSlotSchedules
+            Effect: Allow
+            Action: [scheduler:CreateSchedule, scheduler:UpdateSchedule, scheduler:DeleteSchedule, scheduler:GetSchedule]
+            Resource: !Sub arn:${AWS::Partition}:scheduler:${AWS::Region}:${AWS::AccountId}:schedule/default/medislot-${Environment}-*
+
+          # Event source mappings have generated ids; the condition limits them to MediSlot functions.
+          - Sid: ManageQueueEventSourceMappings
+            Effect: Allow
+            Action: [lambda:CreateEventSourceMapping, lambda:UpdateEventSourceMapping, lambda:DeleteEventSourceMapping,
+                     lambda:GetEventSourceMapping]
+            Resource: "*"
+            Condition:
+              StringLike:
+                lambda:FunctionArn: !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:medislot-${Environment}-*
+
+          - Sid: ManageMediSlotAlarms
+            Effect: Allow
+            Action: [cloudwatch:PutMetricAlarm, cloudwatch:DeleteAlarms, cloudwatch:DescribeAlarms, cloudwatch:TagResource,
+                     cloudwatch:UntagResource, cloudwatch:ListTagsForResource]
+            Resource: !Sub arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:medislot-${Environment}-*
+
+          - Sid: ManageMediSlotBudgets
+            Effect: Allow
+            Action: [budgets:ModifyBudget, budgets:ViewBudget]
+            Resource: !Sub arn:${AWS::Partition}:budgets::${AWS::AccountId}:budget/medislot-${Environment}-*
+
+          # Milestone 7: the DR drill restores into NEW, throw-away copies named medislot-<env>-drill-* / ...-drill-*.
+          - Sid: DisasterRecoveryDrillRds
+            Effect: Allow
+            Action: [rds:DescribeDBInstances, rds:RestoreDBInstanceToPointInTime, rds:DeleteDBInstance, rds:AddTagsToResource]
+            Resource:
+              - !Sub arn:${AWS::Partition}:rds:${AWS::Region}:${AWS::AccountId}:db:medislot-${Environment}-*
+              - !Sub arn:${AWS::Partition}:rds:${AWS::Region}:${AWS::AccountId}:subgrp:*
+          - Sid: DisasterRecoveryDrillDynamoSource
+            Effect: Allow
+            Action: [dynamodb:RestoreTableToPointInTime, dynamodb:DescribeTable, dynamodb:Scan]
+            Resource: !Sub arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/MediSlot-${Environment}-*
+          - Sid: DisasterRecoveryDrillDynamoCopy
+            Effect: Allow
+            Action: [dynamodb:PutItem, dynamodb:GetItem, dynamodb:Query, dynamodb:UpdateItem, dynamodb:DeleteItem,
+                     dynamodb:BatchWriteItem, dynamodb:DeleteTable]
+            Resource: !Sub arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/MediSlot-${Environment}-*-drill-*
+
+          - Sid: PassMediSlotServiceRoles
+            Effect: Allow
+            Action: iam:PassRole
+            Resource: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/MediSlot-${Environment}-*
+            Condition:
+              StringEquals:
+                iam:PassedToService: [lambda.amazonaws.com, states.amazonaws.com, scheduler.amazonaws.com]
 
           - Sid: ManageMediSlotLogGroups
             Effect: Allow

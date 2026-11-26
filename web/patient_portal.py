@@ -13,6 +13,8 @@ methods - the dashboard holds no data of its own:
     /patient/appointments/<id>    one appointment + cancel with refund preview (GET, POST .../cancel)   [Milestone 5]
     /patient/refunds              my refund ledger (GET /patients/me/refunds)                           [Milestone 5]
     /patient/family               family members I book for (GET/POST/DELETE /patients/me/dependents)   [Milestone 5]
+    /patient/waitlists            my waitlists + pending hold offers: join / leave / accept / decline    [Milestone 6]
+    /patient/appointments/<id>/reschedule   move to another free time of the same doctor and type (saga)   [Milestone 6]
 
 Double-click / refresh safety: every Book button carries its own Idempotency-Key, generated when the page is drawn.
 Submitting the same form twice (double click, browser resubmit, a retry after a timeout) sends the same key, so the
@@ -42,6 +44,9 @@ PHOTO_NAME = re.compile(r"^[0-9a-f]{32}\.(jpg|png|webp)$")
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 SLOT_RE = re.compile(r"^SLOT#[1-9][0-9]{0,17}_[0-9]{8}T[0-9]{6}Z_[1-9][0-9]{0,8}$")   # format: lambdas/common.py
 KEY_RE = re.compile(r"^[A-Za-z0-9._:\-]{8,128}$")
+WAITLIST_ID_RE = re.compile(r"^[1-9][0-9]{0,17}_\d{4}-\d{2}-\d{2}_(0|[1-9][0-9]{0,17})$")
+OFFER_ID_RE = re.compile(r"^OFR-[0-9a-f]{32}$")
+RESCHEDULE_CUTOFF_HOURS = 6          # mirrors /medislot/<env>/booking/reschedule-cutoff-hours; the API decides
 FILTERS_TTL = 300
 _filters = {"at": 0.0, "data": None}
 NAV = [
@@ -49,6 +54,7 @@ NAV = [
     ("doctors", "Find a doctor", "search", "#3a8dd6", "/patient/doctors", "Search by name, hospital, specialization or city."),
     ("appointments", "My appointments", "calendar", "#2a9d8f", "/patient/appointments", "Your bookings, and cancelling with a refund."),
     ("refunds", "Refunds", "list", "#4fa86a", "/patient/refunds", "Every refund calculated for a cancelled appointment."),
+    ("waitlists", "Waitlists & offers", "clock", "#c98a12", "/patient/waitlists", "Days you are waiting for, and seats held for you."),
     ("family", "Family members", "user", "#46b3a5", "/patient/family", "People you book appointments for, like a parent or child."),
     ("profile", "My profile", "user", "#4a7fd4", "/patient/profile", "Your details, kept private to you."),
 ]
@@ -307,7 +313,8 @@ def slot_days(data):
             empty.append(pretty_day(day["date"]).split(",")[0][:3] + " " + day["date"][8:10].lstrip("0"))
             continue
         days.append({
-            "id": "day-" + day["date"], "title": pretty_day(day["date"]), "free": day.get("freeSlots", 0), "total": len(cards),
+            "id": "day-" + day["date"], "date": day["date"], "title": pretty_day(day["date"]), "free": day.get("freeSlots", 0), "total": len(cards),
+            "waitlist": not any(c["bookable"] for c in cards),       # Milestone 6: a full day offers "Join the waitlist"
             "groups": [{"label": lbl, "cards": [c for c in cards if lo <= c["hour"] < hi]} for lbl, lo, hi in PARTS
                        if any(lo <= c["hour"] < hi for c in cards)],
         })
@@ -411,7 +418,7 @@ def doctor_page(doctor_id):
             next_url = doctor_url(doctor_id, **{"from": (last + timedelta(days=1)).isoformat(), "to": (last + timedelta(days=span)).isoformat()}, **common)
 
     family = []
-    if types and any(c["bookable"] for day in days for g in day["groups"] for c in g["cards"]):
+    if types and days:
         family = [{"id": f.get("dependentId"), "name": f.get("displayName"), "relation": f.get("relation")}
                   for f in ((d("read_json")("/patients/me/dependents") or {}).get("items") or [])]
     languages = doc.get("languages") or []
@@ -484,6 +491,8 @@ def appt_view(a):
         "type": (a.get("consultationType") or {}).get("name"), "minutes": (a.get("consultationType") or {}).get("durationMinutes"),
         "for": for_label(a),
         "fee": rupees(a.get("fee")), "cancellable": bool(a.get("cancellable")),
+        "slot_id": a.get("slotId"), "type_id": (a.get("consultationType") or {}).get("id"), "start": a.get("startAt"),
+        "reschedules": int(a.get("rescheduleCount") or 0), "confirmed": a.get("status") == "CONFIRMED",
         "preview": dict(preview, amount=rupees(preview.get("refundAmount")), until=pretty_instant(preview.get("validUntil"), a.get("timezone"))) if preview else None,
         "refund": dict(refund, amount=rupees(refund.get("refundAmount")), deducted=rupees(refund.get("deductionAmount"))) if refund else None,
     }
@@ -566,7 +575,156 @@ def appointment(appointment_id):
         d("app").logger.warning("appointment detail failed: HTTP %s %s", r.status_code, r.text[:300])
         d("notify")("The appointment could not be loaded. Please try again.", "error")
         return redirect("/patient/appointments")
-    return render("appointment", active="appointments", a=appt_view(r.json()["appointment"]))
+    a = appt_view(r.json()["appointment"])
+    return render("appointment", active="appointments", a=a, reschedule=reschedule_options(a))
+
+
+def reschedule_options(a):
+    """Free times of the same doctor and consultation type in the next 14 days (Milestone 6 reschedule)."""
+    out = {"allowed": False, "reason": None, "days": [], "error": None}
+    if not a.get("confirmed") or not a.get("cancellable"):
+        return out
+    try:
+        start = datetime.fromisoformat(str(a.get("start")).replace("Z", "+00:00"))
+        if start - datetime.now(start.tzinfo) < timedelta(hours=RESCHEDULE_CUTOFF_HOURS):
+            out["reason"] = f"Appointments can be rescheduled up to {RESCHEDULE_CUTOFF_HOURS} hours before they start."
+            return out
+    except (TypeError, ValueError):
+        return out
+    if a.get("reschedules", 0) >= 2:
+        out["reason"] = "This appointment has already been rescheduled twice."
+        return out
+    out["allowed"] = True
+    today = date.today()
+    params = {"from": today.isoformat(), "to": (today + timedelta(days=13)).isoformat(), "availableOnly": "true"}
+    if a.get("type_id"):
+        params["consultationTypeId"] = a["type_id"]
+    try:
+        r = d("api")("GET", f"/doctors/{a['doctor_id']}/slots", params=params)
+        data = r.json() if r.ok else None
+    except (requests.RequestException, ValueError):
+        data = None
+    if not isinstance(data, dict):
+        out["error"] = "Other times could not be loaded right now."
+        return out
+    for day in data.get("days") or []:
+        slots = [{"id": s["slotId"], "start": s.get("localStart"), "end": s.get("localEnd"), "key": uuid.uuid4().hex}
+                 for s in day.get("slots") or [] if s.get("slotId") != a.get("slot_id") and int(s.get("freeSeats") or 0) > 0
+                 and isinstance(s.get("slotId"), str) and SLOT_RE.match(s["slotId"])]
+        if slots:
+            out["days"].append({"title": pretty_day(day["date"]), "slots": slots[:12]})
+    return out
+
+
+@bp.post("/appointments/<int:appointment_id>/reschedule")
+def reschedule_appointment(appointment_id):
+    target, key = request.form.get("targetSlotId", ""), request.form.get("key", "")
+    back = f"/patient/appointments/{appointment_id}"
+    if not SLOT_RE.match(target) or not KEY_RE.match(key):
+        d("notify")("Pick the new time again.", "error")
+        return redirect(back)
+    try:
+        r = d("api")("POST", f"/appointments/{appointment_id}/reschedule", json={"targetSlotId": target},
+                     headers={"Idempotency-Key": key})
+    except requests.RequestException as exc:
+        d("app").logger.error("reschedule upstream error: %s", exc)
+        d("notify")("The reschedule could not be completed. Check the appointment before trying again.", "error")
+        return redirect(back)
+    if r.status_code == 200:
+        d("notify")(f"Rescheduled to {when_label(r.json().get('appointment') or {})}.", "success")
+    elif r.status_code == 202:
+        d("notify")("Your reschedule is still being processed. Refresh this page in a few seconds.", "info")
+    else:
+        d("app").logger.warning("reschedule failed: HTTP %s %s", r.status_code, r.text[:300])
+        d("notify")(d("api_message")(r) if r.status_code < 500 else "The reschedule could not be completed. Please try again.", "error")
+    return redirect(back)
+
+
+# --------------------------------------------------------------------------- Milestone 6: waitlists and hold offers
+def countdown(seconds):
+    seconds = max(int(seconds or 0), 0)
+    return f"{seconds // 60} min {seconds % 60:02d} s" if seconds >= 60 else f"{seconds} s"
+
+
+@bp.get("/waitlists")
+def waitlists():
+    data, error = None, None
+    try:
+        r = d("api")("GET", "/waitlists")
+        if r.ok:
+            data = r.json()
+        else:
+            d("app").logger.warning("waitlists failed: HTTP %s %s", r.status_code, r.text[:300])
+            error = "Your waitlists could not be loaded right now. Please try again in a moment."
+    except (requests.RequestException, ValueError) as exc:
+        d("app").logger.error("waitlists upstream error: %s", exc)
+        error = "Your waitlists could not be loaded right now. Please try again in a moment."
+    family = {f.get("dependentId"): f.get("displayName") for f in ((d("read_json")("/patients/me/dependents") or {}).get("items") or [])}
+    labels = {"ACTIVE": ("Waiting", "ok"), "OFFERED": ("Seat held for you", "warn"), "BOOKED": ("Booked", "ok"),
+              "EXPIRED": ("Offer expired", "off"), "DECLINED": ("Declined", "off"), "LEFT": ("Left", "off"), "CLOSED": ("Doctor unavailable", "off")}
+
+    def view(e):
+        label, tone = labels.get(e.get("status"), (str(e.get("status") or "").title(), "off"))
+        offer = e.get("offer")
+        return {**e, "label": label, "tone": tone, "day": pretty_day(e.get("date", "")), "for": family.get(e.get("dependentId")) or "You",
+                "offer": dict(offer, left=countdown(offer.get("secondsLeft")), until=pretty_instant(offer.get("expiresAt"), offer.get("timezone")))
+                if offer else None}
+    items = [view(e) for e in (data or {}).get("items", [])]
+    return render("waitlists", active="waitlists", items=items, recent=[view(e) for e in (data or {}).get("recent", [])],
+                  error=error, max_active=(data or {}).get("maxActive", 5), hold_minutes=(data or {}).get("holdMinutes", 15))
+
+
+@bp.post("/waitlists")
+def waitlist_join():
+    doctor, day, who = request.form.get("doctorId", ""), request.form.get("date", ""), request.form.get("dependentId", "").strip()
+    back = safe_back(request.form.get("back"), "/patient/waitlists")
+    if not re.fullmatch(r"[1-9][0-9]{0,17}", doctor) or not DATE_RE.match(day) or not (who == "" or re.fullmatch(r"[1-9][0-9]{0,17}", who)):
+        d("notify")("That waitlist could not be joined. Please try again.", "error")
+        return redirect(back)
+    payload = {"doctorId": int(doctor), "date": day, **({"dependentId": int(who)} if who else {})}
+    try:
+        r = d("api")("POST", "/waitlists", json=payload)
+    except requests.RequestException as exc:
+        d("app").logger.error("waitlist join upstream error: %s", exc)
+        d("notify")("The waitlist could not be joined. Please try again.", "error")
+        return redirect(back)
+    if r.status_code == 201:
+        w = r.json().get("waitlist") or {}
+        d("notify")(f"You are number {w.get('position', 1)} on the waitlist for {pretty_day(day)}. If a seat frees up we hold it for you.", "success")
+        return redirect("/patient/waitlists")
+    d("notify")(d("api_message")(r) if r.status_code < 500 else "The waitlist could not be joined. Please try again.", "error")
+    return redirect(back)
+
+
+@bp.post("/waitlists/<wid>/leave")
+def waitlist_leave(wid):
+    if not WAITLIST_ID_RE.match(wid):
+        return redirect("/patient/waitlists")
+    try:
+        r = d("api")("DELETE", f"/waitlists/{wid}")
+        d("notify")(d("api_message")(r) if r.ok else (d("api_message")(r) if r.status_code < 500 else "Please try again."),
+                    "success" if r.ok else "error")
+    except requests.RequestException:
+        d("notify")("Please try again.", "error")
+    return redirect("/patient/waitlists")
+
+
+@bp.post("/offers/<oid>/<choice>")
+def offer_answer(oid, choice):
+    if not OFFER_ID_RE.match(oid) or choice not in ("accept", "decline"):
+        return redirect("/patient/waitlists")
+    try:
+        r = d("api")("POST", f"/offers/{oid}/{choice}", json={})
+    except requests.RequestException as exc:
+        d("app").logger.error("offer %s upstream error: %s", choice, exc)
+        d("notify")("That did not go through. Check My appointments before trying again.", "error")
+        return redirect("/patient/waitlists")
+    if choice == "accept" and r.status_code in (200, 201):
+        a = r.json().get("appointment") or {}
+        d("notify")(f"Booked from the waitlist: {when_label(a)} with {(a.get('doctor') or {}).get('displayName', 'your doctor')}.", "success")
+        return redirect(f"/patient/appointments/{a['appointmentId']}") if a.get("appointmentId") else redirect("/patient/appointments")
+    d("notify")(d("api_message")(r) if r.status_code < 500 else "That did not go through. Please try again.", "success" if r.ok else "error")
+    return redirect("/patient/waitlists")
 
 
 @bp.post("/appointments/<int:appointment_id>/cancel")

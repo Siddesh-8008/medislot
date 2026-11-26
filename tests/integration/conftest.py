@@ -46,9 +46,9 @@ def pytest_collection_modifyitems(config, items):
 class Api:
     """Tiny client: JSON in/out, retries a GET once or twice when API Gateway or a cold Lambda hiccups."""
 
-    def call(self, method, path, token=None, json=None, params=None, retries=2):
+    def call(self, method, path, token=None, json=None, params=None, retries=2, headers=None):
         assert requests is not None, "pip install requests to run the integration tests"
-        headers = {"x-correlation-id": "it-" + uuid.uuid4().hex[:12]}
+        headers = {"x-correlation-id": "it-" + uuid.uuid4().hex[:12], **(headers or {})}
         if token:
             headers["Authorization"] = "Bearer " + token
         for attempt in range(retries + 1):

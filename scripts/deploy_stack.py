@@ -5,6 +5,8 @@ region = os.environ.get("AWS_REGION", "ap-south-1")
 parameters = []
 for pair in parameter_pairs:
     key, value = pair.split("=", 1)
+    if value == "":          # optional parameter left empty (e.g. no alarm e-mail): the template default applies
+        continue
     parameters.append({"ParameterKey": key, "ParameterValue": value})
 def aws(*args, check=True):
     return subprocess.run(["aws", *args, "--region", region], check=check, text=True, capture_output=True)
@@ -14,6 +16,8 @@ name = f"m2-{uuid.uuid4().hex[:12]}"
 cmd = ["cloudformation", "create-change-set", "--stack-name", stack_name,
        "--template-body", f"file://{template}", "--change-set-name", name,
        "--change-set-type", kind, "--capabilities", "CAPABILITY_NAMED_IAM",
+       # Milestone 7: cost allocation tags. CloudFormation copies stack tags onto every resource that supports tags.
+       "--tags", "Key=Project,Value=MediSlot", f"Key=Environment,Value={os.environ.get('ENVIRONMENT', 'dev')}",
        "--parameters"] + [f"ParameterKey={p['ParameterKey']},ParameterValue={p['ParameterValue']}" for p in parameters]
 result = aws(*cmd, check=False)
 if result.returncode:

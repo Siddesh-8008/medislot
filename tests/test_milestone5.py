@@ -2237,16 +2237,16 @@ def test_every_booking_route_is_an_api_method_wired_to_the_booking_lambda_and_de
               ("/patients/me/refunds", "GET"), ("/patients/me/dependents", "GET"), ("/patients/me/dependents", "POST"),
               ("/patients/me/dependents/{dependentId}", "PATCH"), ("/patients/me/dependents/{dependentId}", "DELETE")]
     deployments = [k for k, v in r.items() if v["Type"] == "AWS::ApiGateway::Deployment"]
-    assert deployments == ["ApiDeploymentM6Blackout"]
-    assert r["ApiStage"]["Properties"]["DeploymentId"] == "ApiDeploymentM6Blackout"
+    assert deployments == ["ApiDeploymentM7"]
+    assert r["ApiStage"]["Properties"]["DeploymentId"] == "ApiDeploymentM7"
     for route in wanted:
         name = methods.get(route)
         assert name, route
         m = r[name]["Properties"]
         assert m["AuthorizationType"] == "CUSTOM" and "BookingFunction.Arn" in m["Integration"]["Uri"], route
-        assert name in r["ApiDeploymentM6Blackout"]["DependsOn"], route
+        assert name in r["ApiDeploymentM7"]["DependsOn"], route
     # every method that existed before is still deployed
-    assert all(k in r["ApiDeploymentM6Blackout"]["DependsOn"] for k, v in r.items() if v["Type"] == "AWS::ApiGateway::Method")
+    assert all(k in r["ApiDeploymentM7"]["DependsOn"] for k, v in r.items() if v["Type"] == "AWS::ApiGateway::Method")
 
 
 def test_booking_role_is_least_privilege():

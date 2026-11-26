@@ -18,6 +18,9 @@ on:
       - "MILESTONE3.md"
       - "MILESTONE4.md"
       - "MILESTONE5.md"
+      - "MILESTONE6.md"
+      - "MILESTONE7.md"
+      - "docs/**"
   workflow_dispatch:
 
 permissions:
@@ -35,6 +38,9 @@ env:
   ENVIRONMENT: ${{ vars.ENVIRONMENT || 'dev' }}
   AWS_DEPLOY_ROLE_ARN: ${{ vars.AWS_DEPLOY_ROLE_ARN || secrets.AWS_DEPLOY_ROLE_ARN }}
   DASHBOARD_ALLOWED_CLIENT_CIDR: ${{ vars.DASHBOARD_ALLOWED_CLIENT_CIDR }}
+  # Optional e-mail addresses (GitHub Actions variables). Empty = no subscription is created.
+  ALARM_EMAIL: ${{ vars.ALARM_EMAIL }}
+  NOTIFICATION_EMAIL: ${{ vars.NOTIFICATION_EMAIL }}
 
 jobs:
   ci:
@@ -58,6 +64,12 @@ jobs:
           AWS_REGION: ap-south-1
           AWS_DEFAULT_REGION: ap-south-1
         run: pytest -v tests/test_milestone5.py -k "mandatory1 or mandatory2"
+
+      - name: "Milestone 6 mandatory tests: reschedule saga compensation (3) and waitlist exclusivity (4)"
+        env:
+          AWS_REGION: ap-south-1
+          AWS_DEFAULT_REGION: ap-south-1
+        run: pytest -v tests/test_milestone6.py -k "mandatory3 or mandatory4"
 
       - name: Unit tests
         env:
@@ -184,7 +196,7 @@ jobs:
           set -euo pipefail
           AWS_ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
           BUCKET="medislot-${ENVIRONMENT}-artifacts-${AWS_ACCOUNT_ID}"
-          for fn in authentication authorizer rds_check doctor_domain slot_materialiser patient_domain doctor_discovery booking; do
+          for fn in authentication authorizer rds_check doctor_domain slot_materialiser patient_domain doctor_discovery booking waitlist notifications reminders; do
             tmp="$(mktemp -d)"
             cp -R "lambdas/${fn}/." "$tmp/"
             cp "lambdas/common.py" "$tmp/common.py"
@@ -203,6 +215,8 @@ jobs:
           set -euo pipefail
           ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
           BUCKET="medislot-${ENVIRONMENT}-artifacts-${ACCOUNT}"
+          EXTRA=()
+          if [[ -n "${NOTIFICATION_EMAIL}" ]]; then EXTRA+=("NotificationEmail=${NOTIFICATION_EMAIL}"); fi
           aws cloudformation deploy \
             --template-file cloudformation/auth-stack.yaml \
             --stack-name "medislot-${ENVIRONMENT}-auth" \
@@ -211,10 +225,23 @@ jobs:
             --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND \
             --no-fail-on-empty-changeset \
             --region "$AWS_REGION" \
+            --tags "Project=MediSlot" "Environment=${ENVIRONMENT}" \
             --parameter-overrides \
               "Environment=${ENVIRONMENT}" \
               "ArtifactBucket=${BUCKET}" \
-              "ArtifactPrefix=lambda/${GITHUB_SHA}"
+              "ArtifactPrefix=lambda/${GITHUB_SHA}" \
+              "${EXTRA[@]}"
+
+      # Milestone 7: medislot-<env>-operations dashboard, the alarms (six categories) and AWS Budgets.
+      - name: Deploy observability stack
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/deploy_stack.py \
+            cloudformation/observability-stack.yaml \
+            "medislot-${ENVIRONMENT}-observability" \
+            "Environment=${ENVIRONMENT}" \
+            "AlarmEmail=${ALARM_EMAIL}"
 
       - name: Package and upload doctor dashboard
         shell: bash
@@ -326,7 +353,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for stack in "medislot-${ENVIRONMENT}-auth" "medislot-${ENVIRONMENT}-dashboard"; do
+          for stack in "medislot-${ENVIRONMENT}-auth" "medislot-${ENVIRONMENT}-observability" "medislot-${ENVIRONMENT}-dashboard"; do
             echo "Outputs for $stack"
             aws cloudformation describe-stacks --stack-name "$stack" --region "$AWS_REGION" \
               --query 'Stacks[0].Outputs[*].[OutputKey,OutputValue]' --output table
@@ -399,3 +426,22 @@ jobs:
           # Includes the Milestone 5 mandatory tests against the live stack (tests/integration/test_booking_live_api.py):
           # 20+ parallel bookings on a capacity-3 slot and an idempotency-key replay.
           MEDISLOT_API_BASE="${API_URL%/}" python -m pytest tests/integration -v
+
+      # Milestone 6/7 smoke checks on the live stack: the saga exists, the schedules are enabled, nothing is stuck in a DLQ.
+      - name: Smoke-check Milestone 6 resources
+        shell: bash
+        run: |
+          set -euo pipefail
+          out() { aws cloudformation describe-stacks --stack-name "medislot-${ENVIRONMENT}-auth" --region "$AWS_REGION" \
+                    --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue | [0]" --output text; }
+          SM="$(out RescheduleStateMachineArn)"
+          aws stepfunctions describe-state-machine --state-machine-arn "$SM" --region "$AWS_REGION" --query '{name:name,type:type,status:status}'
+          for s in offer-expiry reminders no-show-sweep; do
+            aws scheduler get-schedule --name "medislot-${ENVIRONMENT}-$s" --region "$AWS_REGION" --query '{name:Name,state:State,rate:ScheduleExpression}'
+          done
+          for q in NotificationsDLQName WaitlistEventsDLQName; do
+            URL="$(aws sqs get-queue-url --queue-name "$(out $q)" --region "$AWS_REGION" --query QueueUrl --output text)"
+            N="$(aws sqs get-queue-attributes --queue-url "$URL" --attribute-names ApproximateNumberOfMessages --region "$AWS_REGION" --query 'Attributes.ApproximateNumberOfMessages' --output text)"
+            echo "$q: $N message(s)"
+            [[ "$N" == "0" ]] || echo "::warning::$q is not empty - inspect it (alarm medislot-${ENVIRONMENT}-*-dlq)."
+          done

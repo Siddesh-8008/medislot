@@ -329,6 +329,9 @@ def _role_guard():
             return redirect("/?mode=signin&role=patient")
         return redirect("/")
     if role=="PATIENT": return redirect("/patient")
+    if role is None:      # Milestone 7: doctor pages need a signed-in DOCTOR too (guards enforced in both directions)
+        notify("Please sign in to continue.","info")
+        return redirect("/")
     return None
 
 @app.get("/logout")
@@ -501,7 +504,7 @@ def booking_card(a):
         try: return datetime.strptime(hm,"%H:%M").strftime("%I:%M %p").lstrip("0")
         except (TypeError,ValueError): return hm
     refund=a.get("refund") or {}
-    return dict(id=a.get("appointmentId"),date=a.get("localDate"),pretty_date=pretty,start=t12(a.get("localStart")),end=t12(a.get("localEnd")),
+    return dict(id=a.get("appointmentId"),slot=a.get("slotId"),date=a.get("localDate"),pretty_date=pretty,start=t12(a.get("localStart")),end=t12(a.get("localEnd")),
                 patient=name,booked_by=booked_by,type=(a.get("consultationType") or {}).get("name") or "Consultation",
                 status=label,state=state,fee=_money(a.get("fee")),refund=_money(refund.get("refundAmount")) if refund else None,
                 note=a.get("cancellationNote"),actions=status_actions(a.get("status"),a.get("startAt"),a.get("allowedStatuses")))
@@ -557,7 +560,7 @@ def slot_card(s,zone):
     if raw=="CANCELLED": state,label="closed","Cancelled"
     return dict(start=_clock(start),end=_clock(end),hour=start.hour,sort=start,state=state,label=label,minutes=mins,type=s.get("consultationTypeName") or "Consultation",
                 fee=_money(s.get("fee")),capacity=cap,booked=booked,free=max(cap-booked-held,0),details=[(k,v) for k,v in details if v not in (None,"")],
-                slot_ref=sid[5:] if cancellable else None,cancellable=cancellable)
+                slot_ref=sid[5:] if cancellable else None,cancellable=cancellable,slot_id=sid,held=held)
 def appointment_card(a,zone):
     start=_utc(a["startAt"]).astimezone(zone); end=_utc(a["endAt"]).astimezone(zone) if a.get("endAt") else None
     status=str(a.get("status") or "").replace("_"," ").title() or "Scheduled"
@@ -572,12 +575,64 @@ def own_doctor_id():
         if str(prof.get("doctor_id") or "").isdigit(): uid=session["user_id"]=int(prof["doctor_id"])
     return uid
 PARTS=[("Morning",0,12),("Afternoon",12,17),("Evening",17,24)]
+def load_patients(first,last):
+    """Milestone 7: the doctor's patients between two local dates (names, who booked, status buttons), from the booking
+    API (GET /appointments?from=&to=). Returns (list of booking cards, ok)."""
+    cards,page=[],1
+    while page<=5:
+        try:
+            r=api("GET","/appointments",params={"from":first,"to":last,"page":page,"pageSize":50})
+            data=r.json() if r.ok else None
+        except SessionExpired: raise
+        except (requests.RequestException,ValueError): data=None
+        if not isinstance(data,dict): return cards,False
+        for raw in data.get("items") or []:
+            try: cards.append(booking_card(raw))
+            except (KeyError,TypeError,AttributeError): app.logger.warning("skipped unreadable appointment: %s",str(raw)[:200])
+        if not data.get("hasNext"): break
+        page+=1
+    return cards,True
+def schedule_week(day):
+    """Milestone 7: seven days from `day` - slots, free seats and who is coming, one column per day."""
+    sched=dict(date=day,view="week",ok=False,error="Could not load the week.",week=[],pretty_date=day)
+    uid=own_doctor_id()
+    if not uid:
+        sched["error"]="Could not load the schedule: create your doctor profile first."
+        return render_dashboard("schedule",sched=sched)
+    first=datetime.strptime(day,"%Y-%m-%d").date(); last=first+timedelta(days=6)
+    r=api("GET",f"/doctors/{uid}/slots",params={"from":first.isoformat(),"to":last.isoformat()})
+    if not r.ok:
+        app.logger.warning("week schedule failed: HTTP %s %s",r.status_code,r.text[:300])
+        sched["error"]=f"Could not load the week: {api_message(r)}"
+        return render_dashboard("schedule",sched=sched)
+    try: data=r.json()
+    except ValueError: return render_dashboard("schedule",sched=sched)
+    try: zone=ZoneInfo(data.get("timezone") or "Asia/Kolkata")
+    except Exception: zone=ZoneInfo("Asia/Kolkata")
+    patients,patients_ok=load_patients(first.isoformat(),last.isoformat())
+    by_day={}
+    for c in patients: by_day.setdefault(c["date"],[]).append(c)
+    week=[]
+    for d in data.get("days") or []:
+        cards=[]
+        for raw in d.get("slots") or []:
+            try: cards.append(slot_card(raw,zone))
+            except (KeyError,ValueError,TypeError): pass
+        dd=datetime.strptime(d["date"],"%Y-%m-%d")
+        week.append(dict(date=d["date"],title=f"{dd:%a} {dd.day} {dd:%b}",slots=len(cards),open=sum(1 for c in cards if c["state"]=="open"),
+                         free=sum(c["free"] for c in cards if c["state"] not in ("closed",)),booked=sum(c["booked"] for c in cards),
+                         held=sum(1 for c in cards if c["state"]=="hold"),patients=[p for p in by_day.get(d["date"],[]) if p["state"]!="closed"]))
+    sched.update(ok=True,week=week,patients_ok=patients_ok,timezone=str(zone),prev=(first-timedelta(days=7)).isoformat(),next=(first+timedelta(days=7)).isoformat(),
+                 pretty_date=f"{first:%d %b} - {last:%d %b %Y}")
+    return render_dashboard("schedule",sched=sched)
 @app.get("/schedule")
 def schedule():
     day=request.args.get("date","")
     sched=dict(date=day,ok=False,data=None,error="Could not load the schedule: choose a date (YYYY-MM-DD).",groups=[],appointments=[],counts={},pretty_date=day)
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}",day):
         return render_dashboard("schedule",sched=sched)
+    if request.args.get("view")=="week":
+        return schedule_week(day)
     uid=own_doctor_id()
     if not uid:
         sched["error"]="Could not load the schedule: create your doctor profile first."
@@ -600,6 +655,12 @@ def schedule():
                 try: cards.append(slot_card(raw,zone))
                 except (KeyError,ValueError,TypeError): app.logger.warning("skipped unreadable slot record: %s",str(raw)[:200])
             cards.sort(key=lambda c:c["sort"])
+            # Milestone 7: the patients booked in each slot (names + status buttons) from the booking API.
+            patients,patients_ok=load_patients(day,day)
+            per_slot={}
+            for pc in patients: per_slot.setdefault(pc.get("slot"),[]).append(pc)
+            for c in cards: c["patients"]=[pc for pc in per_slot.get(c.get("slot_id"),[]) if pc["state"]!="closed"]
+            sched.update(patients=patients,patients_ok=patients_ok)
             sched["groups"]=[dict(label=lbl,slots=[c for c in cards if lo<=c["hour"]<hi]) for lbl,lo,hi in PARTS if any(lo<=c["hour"]<hi for c in cards)]
             sched["counts"]=dict(total=len(cards),**{k:sum(1 for c in cards if c["state"]==k) for k in ("open","booked","partial","hold","closed")})
             appts=[]
@@ -627,7 +688,7 @@ def schedule_cancel_slot():
         app.logger.warning("slot cancel failed: HTTP %s %s",r.status_code,r.text[:300])
         notify(f"Slot not cancelled: {api_message(r)}","error")
     return redirect(back)
-SAFE_BACK_RE=re.compile(r"/(\?m=(overview|profile|appointments)(&tab=(upcoming|past|cancelled))?(&page=\d{1,4})?|schedule\?date=\d{4}-\d{2}-\d{2})")
+SAFE_BACK_RE=re.compile(r"/(\?m=(overview|profile|appointments)(&tab=(upcoming|past|cancelled))?(&page=\d{1,4})?|schedule\?date=\d{4}-\d{2}-\d{2}(&view=(day|week))?)")
 @app.post("/appointments/<int:aid>/status")
 def appointment_status(aid):
     """The doctor's 'Update status' button: completed / no-show (after the start) or cancel with a full refund (before)."""

@@ -387,9 +387,16 @@ pre{background:#1e3a4c;color:#d6ece9;padding:20px;border-radius:12px;overflow:au
 
   {% elif cur=='schedule' %}
    <section class="panel"><h2>Pick a day</h2><p class="lead">See every slot and appointment for that date, in your timezone.</p>
-   <form method="get" action="/schedule" style="grid-template-columns:minmax(0,320px) auto;align-items:end;display:grid;gap:20px"><label>Date<input name="date" type="date" value="{{ sched.date if sched else '' }}" required></label><button style="margin-bottom:0">View schedule</button></form></section>
+   <form method="get" action="/schedule" style="grid-template-columns:minmax(0,320px) minmax(0,200px) auto;align-items:end;display:grid;gap:20px"><label>Date<input name="date" type="date" value="{{ sched.date if sched else '' }}" required></label>
+    <label>View<select name="view"><option value="day">One day</option><option value="week" {{ 'selected' if sched and sched.get('view')=='week' }}>Week from this date</option></select></label><button style="margin-bottom:0">View schedule</button></form></section>
    {% if sched %}
-    {% if sched.data and sched.ok %}
+    {% if sched.get('view')=='week' and sched.ok %}
+     <h2 class="day-title">{{ sched.pretty_date }}</h2><p class="day-sub">Times in your timezone ({{ sched.timezone }}). <a href="/schedule?date={{ sched.prev }}&view=week">← Previous week</a> · <a href="/schedule?date={{ sched.next }}&view=week">Next week →</a></p>
+     {% if not sched.patients_ok %}<div class="banner error"><span>Patient names could not be loaded right now; slot counts are shown.</span></div>{% endif %}
+     <div class="weekgrid">{% for d in sched.week %}<div class="wd"><h4><a href="/schedule?date={{ d.date }}">{{ d.title }}</a></h4>
+      <small>{{ d.slots }} slot{{ '' if d.slots==1 else 's' }} · {{ d.booked }} booked · {{ d.free }} free{% if d.held %} · {{ d.held }} on hold{% endif %}</small>
+      {% if d.patients %}<ul>{% for p in d.patients %}<li><b>{{ p.start }}</b> {{ p.patient }}<br><small>{{ p.type }} · {{ p.status }}</small></li>{% endfor %}</ul>{% else %}<small style="margin-top:8px">No patients</small>{% endif %}</div>{% endfor %}</div>
+    {% elif sched.data and sched.ok %}
      {% set c=sched.counts %}
      <h2 class="day-title">{{ sched.pretty_date }}</h2><p class="day-sub">All times are in your timezone ({{ sched.data.get('timezone') }}).</p>
      <div class="tiles" style="margin-top:0"><div class="tile"><small>Open slots</small><strong>{{ c.get('open',0) }}</strong></div><div class="tile"><small>Booked</small><strong>{{ c.get('booked',0)+c.get('partial',0) }}</strong></div><div class="tile"><small>Closed</small><strong>{{ c.get('closed',0) }}</strong></div><div class="tile"><small>Appointments</small><strong>{{ sched.appointments|length }}</strong></div></div>
@@ -411,7 +418,8 @@ pre{background:#1e3a4c;color:#d6ece9;padding:20px;border-radius:12px;overflow:au
        <div class="cards">{% for s in g.slots %}
         <article class="slot {{s.state}}"><div class="top"><div class="time">{{s.start}}<small>to {{s.end}} · {{s.minutes}} min</small></div><span class="chip">{{s.label}}</span></div>
          <div class="what">{{s.type}}</div>
-         <div class="facts">{% if s.fee %}<span>Fee <b>{{s.fee}}</b></span>{% endif %}<span>{% if s.capacity>1 %}Seats <b>{{s.free}} of {{s.capacity}}</b> free{% else %}{{ 'Booked' if s.booked else 'Not booked' }}{% endif %}</span></div>
+         <div class="facts">{% if s.fee %}<span>Fee <b>{{s.fee}}</b></span>{% endif %}<span>{% if s.capacity>1 %}Seats <b>{{s.free}} of {{s.capacity}}</b> free{% else %}{{ 'Booked' if s.booked else 'Not booked' }}{% endif %}</span>{% if s.held %}<span>On hold for a waitlisted patient: <b>{{ s.held }}</b></span>{% endif %}</div>
+         {% if s.patients %}<ul class="patients">{% for p in s.patients %}<li><b>{{ p.patient }}</b>{% if p.booked_by %} <small>({{ p.booked_by }})</small>{% endif %} · {{ p.status }}{{ status_form(p) }}</li>{% endfor %}</ul>{% endif %}
          {% if s.details %}<details><summary>More details</summary><dl>{% for k,v in s.details %}<div><dt>{{k}}</dt><dd>{{v}}</dd></div>{% endfor %}</dl></details>{% endif %}
          {% if s.cancellable %}<details class="slot-cancel"><summary>Cancel this slot</summary><form method="post" action="/schedule/slots/cancel" onsubmit="return confirm('Cancel this slot? Booked patients get a full refund.')">
           <input type="hidden" name="slot" value="{{s.slot_ref}}"><input type="hidden" name="date" value="{{ sched.date }}">

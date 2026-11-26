@@ -9,8 +9,13 @@ Routes (behind the JWT authorizer; the role is checked here, the user id always 
                                                         (before start, 100 % refund) on one appointment with me
     POST /doctors/me/slots/{slotId}/cancel     DOCTOR   cancel a whole slot; every booked patient refunded 100 %
     GET  /patients/me/refunds                  PATIENT  my refund ledger
+    POST /appointments/{appointmentId}/reschedule  PATIENT  move to another slot (same doctor + type) via the Step
+                                                        Functions saga. Header Idempotency-Key is REQUIRED.  [M6]
+    POST /offers/{offerId}/accept              PATIENT  turn a waitlist hold offer into a confirmed appointment [M6]
+    GET  /appointments?from=&to=               DOCTOR   my appointments between two local dates (schedule view) [M7]
 
-Internal (direct Lambda invoke by doctor_domain, never reachable through API Gateway):
+Internal (direct Lambda invoke, never reachable through API Gateway):
+    {"action": "reschedule<Step>", "input": {...}}   one step of the reschedule saga, called by Step Functions [M6]
     {"action": "cancelBlackoutDay", "doctorId": 42, "date": "2026-11-30", "reason": "..."}
         The doctor blacked out a day: every future slot on that local day that still has CONFIRMED appointments is
         cancelled exactly like POST /doctors/me/slots/{slotId}/cancel (slot CANCELLED, patients refunded 100 %).
@@ -117,6 +122,10 @@ DEFAULT_REFUND_POLICY = {"tiers": [
     {"name": "NONE", "minHoursBefore": 0, "refundPercent": 0},
 ]}
 DEFAULT_SETTINGS = {"max_active": 3, "max_per_doctor_day": 1, "max_retries": 10}
+# Milestone 6: reschedule rules (SSM, same 60 s cache). The schema caps reschedule_count at 2 (chk_appointments_reschedules).
+RESCHEDULE_DEFAULTS = {"max_reschedules": 2, "reschedule_cutoff_hours": 6}
+RESCHEDULE_RANGES = {"max_reschedules": (0, 2), "reschedule_cutoff_hours": (0, 168)}
+FAULTS = ("release-original", "move")          # fault injection for the saga checkpoint; never honoured in prod
 
 
 # =========================================================================== small helpers
@@ -234,7 +243,12 @@ _settings_lock = threading.Lock()
 def _param_names():
     p = f"/medislot/{env_name()}/booking"
     return {"refund_policy": f"{p}/refund-policy", "max_active": f"{p}/max-active-appointments",
-            "max_per_doctor_day": f"{p}/max-per-doctor-per-day", "max_retries": f"{p}/max-conflict-retries"}
+            "max_per_doctor_day": f"{p}/max-per-doctor-per-day", "max_retries": f"{p}/max-conflict-retries",
+            "max_reschedules": f"{p}/max-reschedules", "reschedule_cutoff_hours": f"{p}/reschedule-cutoff-hours",
+            "fault_injection": f"{p}/fault-injection"}
+
+
+OPTIONAL_PARAMETERS = ("fault_injection",)     # absent on purpose most of the time: never logged as missing
 
 
 def load_settings(cid=None):
@@ -250,8 +264,9 @@ def load_settings(cid=None):
         res = ssm.get_parameters(Names=list(names.values()))
         by_name = {p["Name"]: p["Value"] for p in res.get("Parameters", [])}
         values = {key: by_name.get(name) for key, name in names.items()}
-        if res.get("InvalidParameters"):
-            emit("warning", "booking_settings_missing", cid, parameters=res["InvalidParameters"])
+        missing = [n for n in res.get("InvalidParameters") or [] if n not in {names[k] for k in OPTIONAL_PARAMETERS}]
+        if missing:
+            emit("warning", "booking_settings_missing", cid, parameters=missing)
     except Exception as exc:  # noqa: BLE001 - SSM hiccup: use defaults for limits, policy fails closed later
         emit("warning", "booking_settings_unavailable", cid, error=type(exc).__name__)
         values = {key: None for key in names}
@@ -266,6 +281,19 @@ def load_settings(cid=None):
         if raw is not None and not ok:
             emit("warning", "booking_setting_invalid", cid, setting=key, value=str(raw)[:40])
         out[key] = n if ok else default
+    for key, default in RESCHEDULE_DEFAULTS.items():
+        raw = values.get(key)
+        lo, hi = RESCHEDULE_RANGES[key]
+        try:
+            n = int(str(raw).strip())
+            ok = lo <= n <= hi
+        except (TypeError, ValueError):
+            ok = False
+        if raw is not None and not ok:
+            emit("warning", "booking_setting_invalid", cid, setting=key, value=str(raw)[:40])
+        out[key] = n if ok else default
+    fault = str(values.get("fault_injection") or "").strip().lower()
+    out["fault_injection"] = fault if fault in FAULTS and env_name() != "prod" else ""
     with _settings_lock:
         _settings_cache.update(at=time.time(), value=out)
     return out
@@ -622,17 +650,26 @@ def publish(entries, cid):
     return ok
 
 
-def booked_event(a):
+def notify_fields(a):
+    """What a patient notification needs to read well (Milestone 6). Doctor and appointment facts only - never the
+    patient's or family member's name, phone or email: the event bus and its log group are not a place for PII."""
+    return {"doctorName": (a.get("doctor") or {}).get("displayName"), "hospital": (a.get("doctor") or {}).get("hospital"),
+            "consultationType": (a.get("consultationType") or {}).get("name"), "localDate": a.get("localDate"),
+            "localStart": a.get("localStart"), "localEnd": a.get("localEnd"), "timezone": a.get("timezone")}
+
+
+def booked_event(a, **extra):
     return ("AppointmentBooked", {**{k: a[k] for k in ("appointmentId", "patientId", "doctorId", "slotId", "consultationTypeId",
                                                         "startAt", "endAt", "fee", "status")},
-                                  "dependentId": a["bookedFor"].get("dependentId")})
+                                  "dependentId": a["bookedFor"].get("dependentId"), "notify": notify_fields(a), **extra})
 
 
 def cancelled_event(a, refund, cancelled_by):
     return ("AppointmentCancelled", {**{k: a[k] for k in ("appointmentId", "patientId", "doctorId", "slotId", "startAt", "endAt")},
                                      "dependentId": a["bookedFor"].get("dependentId"),
                                      "status": a["status"], "cancelledBy": cancelled_by, "refundTier": refund["tier"],
-                                     "refundPercent": refund["refundPercent"], "refundAmount": refund["refundAmount"]})
+                                     "refundPercent": refund["refundPercent"], "refundAmount": refund["refundAmount"],
+                                     "notify": notify_fields(a)})
 
 
 # =========================================================================== SQL
@@ -741,20 +778,23 @@ def fetch_appointment(cur, appointment_id, lock=False):
     return cur.fetchone()
 
 
-def check_limits(cur, uid, dependent_id, doctor_id, slot_id, start, end, zone, settings, now, who=None):
+def check_limits(cur, uid, dependent_id, doctor_id, slot_id, start, end, zone, settings, now, who=None, exclude_id=None):
     """Patient booking rules. -> None, or (code, message). Uses only CONFIRMED appointments.
     PER PERSON (account holder = dependent 0): same slot twice, overlapping times, per doctor per day.
-    PER ACCOUNT: the cap on upcoming appointments."""
+    PER ACCOUNT: the cap on upcoming appointments.
+    exclude_id (Milestone 6 reschedule): the appointment being MOVED is ignored by the per-person rules, and the
+    account cap is skipped because moving an appointment never changes how many the account holds."""
     person = int(dependent_id or 0)
     subject = "You" if not who else who
+    skip, skip_args = ("", ()) if exclude_id is None else (" AND appointment_id <> %s", (int(exclude_id),))
     cur.execute("""SELECT appointment_id FROM appointments WHERE patient_id = %s AND COALESCE(dependent_id, 0) = %s
-                   AND slot_id = %s AND status = 'CONFIRMED' LIMIT 1""", (uid, person, slot_id))
+                   AND slot_id = %s AND status = 'CONFIRMED'""" + skip + " LIMIT 1", (uid, person, slot_id) + skip_args)
     if cur.fetchone():
         return "DUPLICATE_BOOKING", "You have already booked this slot" if not who else f"{who} is already booked in this slot"
     cur.execute("""SELECT appointment_id FROM appointments
                    WHERE patient_id = %s AND COALESCE(dependent_id, 0) = %s AND status = 'CONFIRMED'
-                   AND start_at < %s AND end_at > %s LIMIT 1""",
-                (uid, person, db_time(end), db_time(start)))
+                   AND start_at < %s AND end_at > %s""" + skip + " LIMIT 1",
+                (uid, person, db_time(end), db_time(start)) + skip_args)
     if cur.fetchone():
         return "OVERLAPPING_APPOINTMENT", f"{subject} already {'have' if not who else 'has'} another appointment at that time"
     local_day = start.astimezone(zone).date()
@@ -762,12 +802,14 @@ def check_limits(cur, uid, dependent_id, doctor_id, slot_id, start, end, zone, s
     day_end = datetime.combine(local_day + timedelta(days=1), datetime.min.time(), tzinfo=zone).astimezone(UTC)
     cur.execute("""SELECT COUNT(*) AS n FROM appointments
                    WHERE patient_id = %s AND doctor_id = %s AND status = 'CONFIRMED' AND COALESCE(dependent_id, 0) = %s
-                   AND start_at >= %s AND start_at < %s""",
-                (uid, doctor_id, person, db_time(day_start), db_time(day_end)))
+                   AND start_at >= %s AND start_at < %s""" + skip,
+                (uid, doctor_id, person, db_time(day_start), db_time(day_end)) + skip_args)
     if int(cur.fetchone()["n"]) >= settings["max_per_doctor_day"]:
         n = settings["max_per_doctor_day"]
         return "DOCTOR_DAILY_LIMIT_REACHED", (f"{'You' if not who else who} can have at most {n} appointment{'s' if n != 1 else ''} "
                                               "with the same doctor on one day")
+    if exclude_id is not None:
+        return None
     cur.execute("SELECT COUNT(*) AS n FROM appointments WHERE patient_id = %s AND status = 'CONFIRMED' AND start_at > %s",
                 (uid, db_time(now)))
     if int(cur.fetchone()["n"]) >= settings["max_active"]:
@@ -1092,6 +1134,10 @@ def cancel_by_patient(appointment_id, uid, cid):
             if row["status"] != "CONFIRMED":
                 conn.rollback()
                 return respond(409, msg(cid, f"A {row['status'].lower().replace('_', ' ')} appointment cannot be cancelled", "NOT_CANCELLABLE"))
+            if reschedule_lock_owner(appointment_id):   # Milestone 6: a reschedule is moving it right now
+                conn.rollback()
+                return respond(409, msg(cid, "This appointment is being rescheduled. Try again in a moment.",
+                                        "RESCHEDULE_IN_PROGRESS"), {"Retry-After": "5"})
             start = parse_utc(row["start_at"])
             try:
                 tier = refund_tier(start, now, tiers)
@@ -1284,7 +1330,8 @@ def update_status_by_doctor(event, appointment_id, uid, cid):
     else:
         entries.append(("AppointmentStatusChanged", {"appointmentId": appt["appointmentId"], "doctorId": uid,
                                                      "patientId": appt["patientId"], "slotId": appt["slotId"],
-                                                     "previousStatus": old, "status": new}))
+                                                     "startAt": appt["startAt"], "previousStatus": old, "status": new,
+                                                     "markedBy": "DOCTOR", "notify": notify_fields(appt)}))
     publish(entries, cid)
     emit("info", "appointment_status_set_by_doctor", cid, doctorId=uid, appointmentId=appointment_id, previous=old, status=new)
     text = {"COMPLETED": "Appointment marked as completed", "NO_SHOW": "Appointment marked as no-show",
@@ -1361,9 +1408,30 @@ def list_appointments(event, uid, role, cid):
     booked_for_q = q.get("bookedFor", "").strip().lower()
     if booked_for_q and (role != "PATIENT" or not (booked_for_q == "self" or re.fullmatch(r"[1-9][0-9]{0,17}", booked_for_q))):
         return respond(422, msg(cid, "bookedFor must be 'self' or one of your family member ids"))
+    day_from, day_to = q.get("from", "").strip(), q.get("to", "").strip()
+    if (day_from or day_to) and role != "DOCTOR":
+        return respond(422, msg(cid, "from / to can only be used by doctors"))
+    try:
+        first = datetime.strptime(day_from, "%Y-%m-%d").date() if day_from else None
+        last = datetime.strptime(day_to, "%Y-%m-%d").date() if day_to else first
+    except ValueError:
+        return respond(422, msg(cid, "from and to must be dates (YYYY-MM-DD)"))
+    if first and last and (last < first or (last - first).days > 31):
+        return respond(422, msg(cid, "to must be on or after from, at most 31 days later"))
     now = utcnow()
     owner = "a.patient_id" if role == "PATIENT" else "a.doctor_id"
     where, args = [f"{owner} = %s"], [uid]
+    if first:   # Milestone 7: the doctor's day / week schedule asks for "my patients between these LOCAL dates"
+        with dbconn(db_config()) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT timezone FROM doctors WHERE doctor_id = %s", (uid,))
+                doc = cur.fetchone()
+            conn.rollback()
+        zone = zone_of((doc or {}).get("timezone"))
+        lo = datetime.combine(first, datetime.min.time(), tzinfo=zone).astimezone(UTC)
+        hi = datetime.combine(last + timedelta(days=1), datetime.min.time(), tzinfo=zone).astimezone(UTC)
+        where.append("a.start_at >= %s AND a.start_at < %s")
+        args += [db_time(lo), db_time(hi)]
     if booked_for_q:
         where.append("COALESCE(a.dependent_id, 0) = %s")
         args.append(0 if booked_for_q == "self" else int(booked_for_q))
@@ -1376,7 +1444,8 @@ def list_appointments(event, uid, role, cid):
     elif when == "past":
         where.append("a.start_at <= %s")
         args.append(db_time(now))
-    order = "a.start_at ASC, a.appointment_id ASC" if when == "upcoming" else "a.start_at DESC, a.appointment_id DESC"
+    order = ("a.start_at ASC, a.appointment_id ASC" if when == "upcoming" or first else
+             "a.start_at DESC, a.appointment_id DESC")
     clause = " WHERE " + " AND ".join(where)
     with dbconn(db_config()) as conn:
         with conn.cursor() as cur:
@@ -1601,9 +1670,834 @@ def change_dependent(event, uid, dependent_id, method, cid):
     return respond(200, {"message": "Family member updated", "dependent": dependent_json(row, upcoming), "correlationId": cid})
 
 
+# =========================================================================== Milestone 6: reschedule saga
+# POST /appointments/{id}/reschedule starts a STANDARD Step Functions execution (medislot-<env>-reschedule-saga) whose
+# Task states call this Lambda with {"action": "reschedule<Step>", "input": <state>}. Every step is idempotent, so a
+# Step Functions retry (or a crash half-way) can never claim or release a seat twice:
+#
+#   Validate -> ClaimTarget -> MoveAppointment -> ReleaseOriginal -> Finalize
+#                   |               |                  |
+#                   +---------------+------------------+--> CompensateRevertMove -> CompensateReleaseTarget
+#                                                                               -> RecordCompensated (FAIL)
+#
+#   * ClaimTarget   +1 seat on the new slot (optimistic concurrency, same as booking) and mark target_claimed on the
+#                   reschedule record IN THE SAME DynamoDB transaction.
+#   * MoveAppointment  RDS: the one appointment row is updated in place (slot, times, reschedule_count + 1). The
+#                   patient therefore always holds exactly ONE appointment - there is never a second row.
+#   * ReleaseOriginal  -1 seat on the old slot, again together with original_released on the record.
+#   * Compensation: move the row back (only if the old seat was NOT released) and give the new seat back.
+# A DynamoDB lock item (LOCK#APPT#<id>, 10 minute lease) stops a patient cancellation or a second reschedule from
+# changing the appointment while the saga runs.
+sfn = boto3.client("stepfunctions", config=_cfg)
+RESCHEDULE_LOCK_SECONDS = 600
+RESCHEDULE_RECORD_TTL = 24 * 3600
+SAGA_WAIT_SECONDS = 18              # the API answers synchronously when the saga finishes in time (it normally takes < 2 s)
+TRANSIENT_DDB = ("TransactionConflictException", "ProvisionedThroughputExceededException", "ThrottlingException",
+                 "RequestLimitExceeded", "TransactionInProgressException", "InternalServerError")
+
+
+class SeatReleaseError(Exception):
+    """A seat could not be given back. Step Functions retries the step, then runs the compensation branch."""
+
+
+def state_machine_arn():
+    return os.environ.get("RESCHEDULE_STATE_MACHINE_ARN", "")
+
+
+def offers_table():
+    return os.environ.get("OFFERS_TABLE") or f"MediSlot-{env_name()}-Offers"
+
+
+def waitlist_table():
+    return os.environ.get("WAITLIST_TABLE") or f"MediSlot-{env_name()}-WaitlistEntries"
+
+
+def lock_key(appointment_id):
+    return f"LOCK#APPT#{int(appointment_id)}"
+
+
+def reschedule_lock_owner(appointment_id):
+    """The saga execution that is moving this appointment right now, or None. An expired lease does not count."""
+    try:
+        res = ddb.get_item(TableName=idempotency_table(), Key={"idempotency_key": {"S": lock_key(appointment_id)}},
+                           ConsistentRead=True)
+    except Exception as exc:  # noqa: BLE001 - never block a cancellation because the lock could not be read
+        emit("warning", "reschedule_lock_read_failed", None, appointmentId=appointment_id, error=type(exc).__name__)
+        return None
+    rec = _item(res.get("Item"))
+    return rec.get("owner") if rec and int(rec.get("lease_expires_at", 0)) > time.time() else None
+
+
+def acquire_reschedule_lock(appointment_id, owner):
+    now = int(time.time())
+    try:
+        ddb.put_item(TableName=idempotency_table(),
+                     Item={k: _av(v) for k, v in {"idempotency_key": lock_key(appointment_id), "owner": owner,
+                                                   "lease_expires_at": now + RESCHEDULE_LOCK_SECONDS,
+                                                   "expires_at": now + 2 * RESCHEDULE_LOCK_SECONDS}.items()},
+                     ConditionExpression="attribute_not_exists(idempotency_key) OR lease_expires_at < :now OR #o = :me",
+                     ExpressionAttributeNames={"#o": "owner"}, ExpressionAttributeValues=_vals(now=now, me=owner))
+        return True
+    except Exception as exc:  # noqa: BLE001
+        if _code(exc) == "ConditionalCheckFailedException":
+            return False
+        raise
+
+
+def release_reschedule_lock(appointment_id, owner):
+    try:
+        ddb.delete_item(TableName=idempotency_table(), Key={"idempotency_key": {"S": lock_key(appointment_id)}},
+                        ConditionExpression="#o = :me", ExpressionAttributeNames={"#o": "owner"},
+                        ExpressionAttributeValues=_vals(me=owner))
+    except Exception as exc:  # noqa: BLE001 - not ours any more, or already gone: the lease expires anyway
+        if _code(exc) != "ConditionalCheckFailedException":
+            emit("warning", "reschedule_lock_release_failed", None, appointmentId=appointment_id, error=type(exc).__name__)
+
+
+def resched_record(key):
+    res = ddb.get_item(TableName=idempotency_table(), Key={"idempotency_key": {"S": key}}, ConsistentRead=True)
+    return _item(res.get("Item"))
+
+
+def resched_begin(key, req_hash, request):
+    """-> (state, record). state: new | replay | mismatch | in_progress. The record stores the exact execution input,
+    so a retry with the same key re-sends the SAME input (Step Functions treats same name + same input as idempotent)."""
+    now = int(time.time())
+    name = f"r-{hashlib.sha256(key.encode()).hexdigest()[:40]}-{now}"
+    item = {"idempotency_key": key, "status": "IN_PROGRESS", "kind": "RESCHEDULE", "request_hash": req_hash,
+            "patient_id": str(request["patientId"]), "appointment_id": int(request["appointmentId"]),
+            "slot_id": request["targetSlotId"], "execution_name": name, "created_at": iso(utcnow()),
+            "expires_at": now + RESCHEDULE_RECORD_TTL}
+    item["request_json"] = json.dumps({**request, "executionName": name, "idempotencyKey": key}, sort_keys=True)
+    for _ in range(3):
+        try:
+            ddb.put_item(TableName=idempotency_table(), Item={k: _av(v) for k, v in item.items()},
+                         ConditionExpression="attribute_not_exists(idempotency_key) OR expires_at < :now",
+                         ExpressionAttributeValues=_vals(now=now))
+            return "new", item
+        except Exception as exc:  # noqa: BLE001
+            if _code(exc) != "ConditionalCheckFailedException":
+                raise
+        rec = resched_record(key)
+        if not rec:
+            continue
+        if rec.get("request_hash") != req_hash:
+            return "mismatch", rec
+        return ("replay" if rec.get("status") == "COMPLETED" else "in_progress"), rec
+    return "in_progress", item
+
+
+def resched_complete(key, status, payload):
+    ddb.update_item(TableName=idempotency_table(), Key={"idempotency_key": {"S": key}},
+                    UpdateExpression="SET #st = :done, response_status = :code, response_body = :body, completed_at = :at",
+                    ExpressionAttributeNames={"#st": "status"},
+                    ExpressionAttributeValues=_vals(done="COMPLETED", code=int(status), body=json.dumps(payload, default=str),
+                                                    at=iso(utcnow())))
+
+
+def replay_stored(rec, cid, replayed=False):
+    stored = json.loads(rec.get("response_body") or "{}")
+    stored["correlationId"] = cid
+    return respond(int(rec.get("response_status", 200)), stored, {"Idempotent-Replayed": "true"} if replayed else None)
+
+
+def execution_arn(name):
+    return state_machine_arn().replace(":stateMachine:", ":execution:") + ":" + name
+
+
+def wait_execution(arn):
+    deadline, delay = time.time() + SAGA_WAIT_SECONDS, 0.15
+    while True:
+        try:
+            status = sfn.describe_execution(executionArn=arn).get("status", "RUNNING")
+        except Exception as exc:  # noqa: BLE001 - a brand-new execution can briefly be invisible
+            if _code(exc) not in ("ExecutionDoesNotExist", "ThrottlingException"):
+                raise
+            status = "RUNNING"
+        if status != "RUNNING" or time.time() >= deadline:
+            return status
+        sleep(delay)
+        delay = min(delay * 1.6, 1.5)
+
+
+def reschedule(event, appointment_id, uid, cid):
+    client_key = (header(event, "Idempotency-Key") or "").strip()
+    if not client_key:
+        return respond(400, msg(cid, "The Idempotency-Key header is required to reschedule", "IDEMPOTENCY_KEY_REQUIRED"))
+    if not IDEMPOTENCY_KEY_RE.fullmatch(client_key):
+        return respond(400, msg(cid, "Idempotency-Key must be 8-128 characters: letters, digits, . _ : -", "IDEMPOTENCY_KEY_INVALID"))
+    data = body(event)
+    if not isinstance(data, dict):
+        return respond(400, msg(cid, "Invalid JSON body", "INVALID_BODY"))
+    extra = sorted(k for k in data if k != "targetSlotId")
+    if extra:
+        return respond(422, msg(cid, "Only targetSlotId can be sent (not: " + ", ".join(extra)[:120] + ")", "UNKNOWN_FIELDS"))
+    target = data.get("targetSlotId")
+    if not isinstance(target, str) or not SLOT_ID_RE.fullmatch(target):
+        return respond(422, msg(cid, "targetSlotId is required (as returned by GET /doctors/{doctorId}/slots)", "SLOT_ID_INVALID"))
+    if not state_machine_arn():
+        return respond(503, msg(cid, "Rescheduling is temporarily unavailable", "RESCHEDULE_UNAVAILABLE"))
+    fault = (header(event, "X-Fault-Injection") or "").strip().lower()
+    fault = fault if fault in FAULTS and env_name() != "prod" else (load_settings(cid).get("fault_injection") or "")
+    key = f"RESCHED#{uid}#{client_key}"
+    req_hash = hashlib.sha256(json.dumps({"appointmentId": appointment_id, "targetSlotId": target}, sort_keys=True).encode()).hexdigest()
+    request = {"appointmentId": appointment_id, "patientId": uid, "targetSlotId": target, "faultInjection": fault,
+               "correlationId": cid}
+    state, rec = resched_begin(key, req_hash, request)
+    if state == "mismatch":
+        return respond(422, msg(cid, "This Idempotency-Key was already used for a different reschedule", "IDEMPOTENCY_KEY_REUSED"))
+    if state == "replay":
+        metric("IdempotentReplays", 1)
+        return replay_stored(rec, cid, replayed=True)
+    name = rec["execution_name"]
+    try:
+        sfn.start_execution(stateMachineArn=state_machine_arn(), name=name,
+                            input=json.dumps({"request": json.loads(rec["request_json"])}, sort_keys=True))
+    except Exception as exc:  # noqa: BLE001
+        if _code(exc) != "ExecutionAlreadyExists":
+            emit("error", "reschedule_start_failed", cid, appointmentId=appointment_id, error=type(exc).__name__)
+            if state == "new":
+                try:
+                    ddb.delete_item(TableName=idempotency_table(), Key={"idempotency_key": {"S": key}},
+                                    ConditionExpression="#st = :p", ExpressionAttributeNames={"#st": "status"},
+                                    ExpressionAttributeValues=_vals(p="IN_PROGRESS"))
+                except Exception:  # noqa: BLE001
+                    pass
+            return respond(503, msg(cid, "Rescheduling is temporarily unavailable. Your appointment was not changed.",
+                                    "RESCHEDULE_UNAVAILABLE"))
+    emit("info", "reschedule_started", cid, appointmentId=appointment_id, execution=name, fault=fault or None)
+    status = wait_execution(execution_arn(name))
+    rec = resched_record(key)
+    if rec.get("status") == "COMPLETED":
+        return replay_stored(rec, cid)
+    if status == "RUNNING":
+        return respond(202, {"message": "Your reschedule is still being processed. Send the same request again (same "
+                                        "Idempotency-Key) in a few seconds to get the result.", "status": "IN_PROGRESS",
+                             "execution": name, "correlationId": cid}, {"Retry-After": "3"})
+    emit("error", "reschedule_ended_without_result", cid, appointmentId=appointment_id, execution=name, status=status)
+    return respond(503, msg(cid, "The reschedule could not be completed. Please check your appointment before trying again.",
+                            "RESCHEDULE_FAILED"))
+
+
+# --------------------------------------------------------------------------- saga steps (called by Step Functions)
+def _no(status, code, text):
+    return {"ok": False, "status": status, "code": code, "message": text}
+
+
+def _seat_update(slot_id, delta_booked, cond, values, delta_held=0):
+    """Update spec for one seat counter change on a slot (used inside transactions)."""
+    sets = ["booked_count = booked_count " + ("+" if delta_booked > 0 else "-") + " :one"] if delta_booked else []
+    if delta_held:
+        sets.append("held_count = held_count " + ("+" if delta_held > 0 else "-") + " :one")
+    sets += ["version = version + :one", "updated_at = :now"]
+    return {"TableName": slots_table(), "Key": slot_table_key(slot_id), "UpdateExpression": "SET " + ", ".join(sets),
+            "ConditionExpression": cond, "ExpressionAttributeValues": _vals(one=1, now=iso(utcnow()), **values)}
+
+
+def _flag_update(key, flag, cond, values=None):
+    return {"TableName": idempotency_table(), "Key": {"idempotency_key": {"S": key}},
+            "UpdateExpression": f"SET {flag} = :t, {flag}_at = :at", "ConditionExpression": cond,
+            "ExpressionAttributeValues": _vals(**{"t": True, "at": iso(utcnow()), **(values or {})})}
+
+
+def saga_validate(state, cid):
+    req = state["request"]
+    uid, aid, target, owner = int(req["patientId"]), int(req["appointmentId"]), req["targetSlotId"], req["executionName"]
+    now, settings = utcnow(), load_settings(cid)
+
+    def no(status, code, text):
+        emit("info", "reschedule_rejected", cid, appointmentId=aid, code=code)
+        return _no(status, code, text)
+
+    with dbconn(db_config()) as conn:
+        with conn.cursor() as cur:
+            row = fetch_appointment(cur, aid)
+        conn.rollback()
+    if not row or int(row["patient_id"]) != uid:
+        if row:
+            emit("warning", "appointment_isolation_violation", cid, callerId=uid, appointmentId=aid)
+        return no(404, "APPOINTMENT_NOT_FOUND", "Appointment not found")
+    if row["status"] != "CONFIRMED":
+        return no(409, "NOT_RESCHEDULABLE", f"A {row['status'].lower().replace('_', ' ')} appointment cannot be rescheduled")
+    count, limit = int(row.get("reschedule_count") or 0), int(settings.get("max_reschedules", 2))
+    if count >= limit:
+        return no(409, "RESCHEDULE_LIMIT_REACHED",
+                  f"An appointment can be rescheduled at most {limit} time{'s' if limit != 1 else ''}" if limit else
+                  "Rescheduling is switched off")
+    start, hours = parse_utc(row["start_at"]), int(settings.get("reschedule_cutoff_hours", 6))
+    if start - now < timedelta(hours=hours):
+        return no(409, "RESCHEDULE_CUTOFF", f"Appointments can be rescheduled up to {hours} hours before they start")
+    if target == row["slot_id"]:
+        return no(422, "SAME_SLOT", "Pick a different time than the one you already have")
+    slot = get_slot(target)
+    if not slot:
+        return no(404, "SLOT_NOT_FOUND", "That slot does not exist")
+    if int(slot["doctor_id"]) != int(row["doctor_id"]):
+        return no(422, "DIFFERENT_DOCTOR", "An appointment can only be moved to another time with the same doctor")
+    if int(slot["consultation_type_id"]) != int(row["consultation_type_id"]):
+        return no(422, "DIFFERENT_TYPE", "An appointment can only be moved to a slot of the same consultation type")
+    tstart, tend = parse_utc(slot["start_at"]), parse_utc(slot["end_at"])
+    if tstart <= now:
+        return no(422, "SLOT_IN_PAST", "That slot has already started or is in the past")
+    if slot.get("status") != "OPEN":
+        return no(409, "SLOT_CLOSED", "That slot is no longer open for booking")
+    if free_seats(slot) <= 0:
+        return no(409, "SLOT_FULL", "Sorry, that time is fully booked")
+    zone, dep = zone_of(row.get("doctor_timezone")), row.get("dependent_id")
+    who = booked_for(row).get("name") if dep is not None else None
+    with dbconn(db_config()) as conn:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT dct.fee FROM doctor_consultation_types dct
+                           JOIN consultation_types ct ON ct.consultation_type_id = dct.consultation_type_id AND ct.is_active = 1
+                           JOIN users du ON du.user_id = dct.doctor_id AND du.is_active = 1
+                           WHERE dct.doctor_id = %s AND dct.consultation_type_id = %s AND dct.is_active = 1""",
+                        (int(row["doctor_id"]), int(row["consultation_type_id"])))
+            if not cur.fetchone():
+                problem = ("SLOT_UNAVAILABLE", "This doctor is not taking bookings for that consultation type")
+            elif blackout_on(cur, int(row["doctor_id"]), tstart, zone):
+                problem = ("DOCTOR_UNAVAILABLE", "The doctor is not available on that day. Please choose another date.")
+            else:
+                problem = check_limits(cur, uid, dep, int(row["doctor_id"]), target, tstart, tend, zone, settings, now, who,
+                                       exclude_id=aid)
+        conn.rollback()
+    if problem:
+        return no(409, *problem)
+    if not acquire_reschedule_lock(aid, owner):
+        return no(409, "RESCHEDULE_IN_PROGRESS", "This appointment is already being rescheduled. Try again in a moment.")
+    return {"ok": True, "originalSlotId": row["slot_id"], "doctorId": int(row["doctor_id"]),
+            "consultationTypeId": int(row["consultation_type_id"]), "dependentId": dep, "expectedCount": count,
+            "originalStartAt": iso(start), "originalEndAt": iso(row["end_at"]), "targetStartAt": iso(tstart),
+            "targetEndAt": iso(tend), "timezone": str(zone)}
+
+
+def saga_claim_target(state, cid):
+    req = state["request"]
+    key, target = req["idempotencyKey"], req["targetSlotId"]
+    if resched_record(key).get("target_claimed"):
+        return {"ok": True, "already": True}
+    settings, retries = load_settings(cid), 0
+    for _ in range(settings["max_retries"] + 1):
+        slot = get_slot(target)
+        if not slot or slot.get("status") != "OPEN":
+            return _no(409, "SLOT_CLOSED", "That slot is no longer open for booking")
+        if parse_utc(slot["start_at"]) <= utcnow():
+            return _no(422, "SLOT_IN_PAST", "That slot has already started or is in the past")
+        if free_seats(slot) <= 0:
+            return _no(409, "SLOT_FULL", "Sorry, that time is fully booked")
+        version = slot.get("version")
+        slot_update = {
+            "TableName": slots_table(), "Key": slot_table_key(target),
+            "UpdateExpression": "SET booked_count = :nb, version = :nv, updated_at = :now",
+            "ConditionExpression": ("version = :v" if version is not None else "attribute_not_exists(version)") + " AND #st = :open",
+            "ExpressionAttributeNames": {"#st": "status"},
+            "ExpressionAttributeValues": _vals(nb=int(slot.get("booked_count", 0) or 0) + 1, nv=int(version or 0) + 1,
+                                               now=iso(utcnow()), open="OPEN", **({"v": int(version)} if version is not None else {}))}
+        try:
+            ddb.transact_write_items(TransactItems=[
+                {"Update": slot_update},
+                {"Update": _flag_update(key, "target_claimed", "attribute_exists(idempotency_key) AND attribute_not_exists(target_claimed)")}])
+            emit("info", "reschedule_target_claimed", cid, slotId=target, retries=retries)
+            return {"ok": True}
+        except Exception as exc:  # noqa: BLE001
+            code = _code(exc)
+            if code == "TransactionCanceledException":
+                reasons = [r.get("Code") for r in (exc.response.get("CancellationReasons") or [])]
+                if len(reasons) > 1 and reasons[1] == "ConditionalCheckFailed":
+                    if resched_record(key).get("target_claimed"):
+                        return {"ok": True, "already": True}
+                    raise RuntimeError("reschedule record is missing")
+            elif code not in TRANSIENT_DDB:
+                raise
+        retries += 1
+        sleep(backoff(retries))
+    return _no(409, "SLOT_BUSY", "That time is in high demand right now. Please try again.")
+
+
+def saga_move(state, cid):
+    req, v = state["request"], state["validate"]
+    uid, aid, target, original = int(req["patientId"]), int(req["appointmentId"]), req["targetSlotId"], v["originalSlotId"]
+    if req.get("faultInjection") == "move":
+        emit("warning", "fault_injected", cid, step="MOVE_APPOINTMENT", appointmentId=aid)
+        return _no(503, "FAULT_INJECTED", "Injected failure while moving the appointment")
+    now, settings = utcnow(), load_settings(cid)
+    slot = get_slot(target)
+    if not slot or slot.get("status") != "OPEN":
+        return _no(409, "SLOT_CLOSED", "That slot is no longer open for booking")
+    tstart, tend, zone, expected = parse_utc(v["targetStartAt"]), parse_utc(v["targetEndAt"]), zone_of(v["timezone"]), int(v["expectedCount"])
+    with dbconn(db_config()) as conn:
+        with conn.cursor() as cur:
+            try:
+                cur.execute("SELECT user_id FROM users WHERE user_id = %s FOR UPDATE", (uid,))
+                row = fetch_appointment(cur, aid, lock=True)
+                if row and row["status"] == "CONFIRMED" and row["slot_id"] == target and int(row["reschedule_count"]) == expected + 1:
+                    conn.rollback()
+                    return {"ok": True, "already": True}            # a retried step: the move is already committed
+                if (not row or row["status"] != "CONFIRMED" or row["slot_id"] != original
+                        or int(row["reschedule_count"] or 0) != expected):
+                    conn.rollback()
+                    return _no(409, "APPOINTMENT_CHANGED", "The appointment changed while it was being moved")
+                if blackout_on(cur, int(v["doctorId"]), tstart, zone, lock=True):
+                    conn.rollback()
+                    return _no(409, "DOCTOR_UNAVAILABLE", "The doctor is not available on that day. Please choose another date.")
+                who = booked_for(row).get("name") if v.get("dependentId") is not None else None
+                problem = check_limits(cur, uid, v.get("dependentId"), int(v["doctorId"]), target, tstart, tend, zone, settings,
+                                       now, who, exclude_id=aid)
+                if problem:
+                    conn.rollback()
+                    return _no(409, *problem)
+                cur.execute("""UPDATE appointments SET slot_id = %s, start_at = %s, end_at = %s,
+                                      reschedule_count = reschedule_count + 1, updated_at = %s
+                               WHERE appointment_id = %s AND status = 'CONFIRMED' AND slot_id = %s AND reschedule_count = %s""",
+                            (target, db_time(tstart), db_time(tend), db_time(now), aid, original, expected))
+                if cur.rowcount != 1:
+                    conn.rollback()
+                    return _no(409, "APPOINTMENT_CHANGED", "The appointment changed while it was being moved")
+                conn.commit()
+            except pymysql.err.IntegrityError as exc:
+                conn.rollback()
+                if is_dup(exc, "active_patient_slot"):
+                    return _no(409, "DUPLICATE_BOOKING", "That person is already booked in that slot")
+                raise
+    emit("info", "reschedule_moved", cid, appointmentId=aid, fromSlot=original, toSlot=target)
+    return {"ok": True}
+
+
+def _release_with_flag(slot_id, key, flag, flag_cond, cid, attempts):
+    """-1 booked seat on slot_id together with `flag` on the reschedule record (one transaction, so a retried step
+    never releases twice). -> 'released' | 'already' | 'inconsistent'. Raises SeatReleaseError when it keeps failing."""
+    for attempt in range(1, attempts + 1):
+        try:
+            ddb.transact_write_items(TransactItems=[
+                {"Update": _seat_update(slot_id, -1, "booked_count > :zero", {"zero": 0})},
+                {"Update": _flag_update(key, flag, flag_cond, {"t": True})}])
+            return "released"
+        except Exception as exc:  # noqa: BLE001
+            code = _code(exc)
+            if code == "TransactionCanceledException":
+                reasons = [r.get("Code") for r in (exc.response.get("CancellationReasons") or [])]
+                if len(reasons) > 1 and reasons[1] == "ConditionalCheckFailed":
+                    return "already"
+                if reasons and reasons[0] == "ConditionalCheckFailed":
+                    emit("error", "seat_release_inconsistent", cid, slotId=slot_id, detail="booked_count was already 0", step=flag)
+                    metric("SeatReleaseFailures", 1)
+                    return "inconsistent"
+            elif code not in TRANSIENT_DDB:
+                raise SeatReleaseError(f"{type(exc).__name__} while releasing {slot_id}")
+            if attempt < attempts:
+                sleep(backoff(attempt))
+    raise SeatReleaseError(f"could not release a seat on {slot_id}")
+
+
+def saga_release_original(state, cid):
+    req, v = state["request"], state["validate"]
+    if req.get("faultInjection") == "release-original":
+        emit("warning", "fault_injected", cid, step="RELEASE_ORIGINAL", appointmentId=req["appointmentId"])
+        raise SeatReleaseError("Injected failure while releasing the original seat")
+    key = req["idempotencyKey"]
+    if resched_record(key).get("original_released"):
+        return {"ok": True, "already": True}
+    outcome = _release_with_flag(v["originalSlotId"], key, "original_released",
+                                 "attribute_exists(idempotency_key) AND attribute_not_exists(original_released)", cid, 3)
+    if outcome == "inconsistent":
+        raise SeatReleaseError("the original slot had no booked seat to release")
+    emit("info", "reschedule_original_released", cid, slotId=v["originalSlotId"], outcome=outcome)
+    return {"ok": True}
+
+
+def saga_revert_move(state, cid):
+    """Compensation 1/2: put the appointment back on its original slot. Idempotent; decides whether the new seat must
+    be given back. If the OLD seat was already released the move is really finished - going back would leave the
+    appointment without a seat - so the saga goes forward to Finalize instead."""
+    req, v = state["request"], state.get("validate") or {}
+    key, aid, target = req["idempotencyKey"], int(req["appointmentId"]), req["targetSlotId"]
+    rec = resched_record(key)
+    if not v.get("ok"):
+        return {"outcome": "not_moved", "releaseTarget": bool(rec.get("target_claimed"))}
+    if rec.get("original_released"):
+        emit("warning", "reschedule_completed_forward", cid, appointmentId=aid)
+        return {"outcome": "completed_forward", "releaseTarget": False}
+    original, expected = v["originalSlotId"], int(v["expectedCount"])
+    with dbconn(db_config()) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT user_id FROM users WHERE user_id = %s FOR UPDATE", (int(req["patientId"]),))
+            row = fetch_appointment(cur, aid, lock=True)
+            if not row:
+                conn.rollback()
+                out = {"outcome": "missing", "releaseTarget": True}
+            elif row["status"] != "CONFIRMED":
+                conn.rollback()
+                # Cancelled meanwhile (only the doctor can - patients are locked out). On the NEW slot its seat was
+                # already given back by that cancellation (or the slot itself is cancelled): never release it twice.
+                out = {"outcome": "cancelled", "releaseTarget": row["slot_id"] != target}
+            elif row["slot_id"] == original and int(row["reschedule_count"] or 0) == expected:
+                conn.rollback()
+                out = {"outcome": "not_moved", "releaseTarget": True}
+            elif row["slot_id"] == target and int(row["reschedule_count"] or 0) == expected + 1:
+                cur.execute("""UPDATE appointments SET slot_id = %s, start_at = %s, end_at = %s, reschedule_count = %s, updated_at = %s
+                               WHERE appointment_id = %s AND slot_id = %s AND status = 'CONFIRMED'""",
+                            (original, db_time(parse_utc(v["originalStartAt"])), db_time(parse_utc(v["originalEndAt"])),
+                             expected, db_time(utcnow()), aid, target))
+                if cur.rowcount != 1:
+                    conn.rollback()
+                    raise RuntimeError("appointment changed during compensation")       # retried by Step Functions
+                conn.commit()
+                out = {"outcome": "reverted", "releaseTarget": True}
+            else:
+                conn.rollback()
+                emit("error", "reschedule_revert_unexpected_state", cid, appointmentId=aid, slotId=row["slot_id"])
+                out = {"outcome": "unexpected", "releaseTarget": row["slot_id"] != target}
+    emit("warning", "reschedule_compensation_revert", cid, appointmentId=aid, **out)
+    return out
+
+
+def saga_release_target(state, cid):
+    """Compensation 2/2: give the claimed seat on the new slot back (exactly once)."""
+    req = state["request"]
+    key = req["idempotencyKey"]
+    rec = resched_record(key)
+    if not rec.get("target_claimed") or rec.get("target_released"):
+        return {"ok": True, "already": True}
+    outcome = _release_with_flag(req["targetSlotId"], key, "target_released",
+                                 "target_claimed = :t AND attribute_not_exists(target_released)", cid, 5)
+    emit("warning", "reschedule_compensation_release_target", cid, slotId=req["targetSlotId"], outcome=outcome)
+    return {"ok": True, "outcome": outcome}
+
+
+def saga_finalize(state, cid):
+    req, v = state["request"], state["validate"]
+    key, aid, uid, target, original = req["idempotencyKey"], int(req["appointmentId"]), int(req["patientId"]), req["targetSlotId"], v["originalSlotId"]
+    now, tiers, rcid = utcnow(), safe_tiers(cid), req.get("correlationId") or cid
+    with dbconn(db_config()) as conn:
+        with conn.cursor() as cur:
+            row = fetch_appointment(cur, aid)
+        conn.rollback()
+    entries = []
+    try:
+        target_slot = get_slot(target)
+    except Exception as exc:  # noqa: BLE001
+        target_slot = None
+        emit("warning", "post_move_slot_check_failed", cid, slotId=target, error=type(exc).__name__)
+    if row["status"] == "CONFIRMED" and target_slot and target_slot.get("status") == "CANCELLED":
+        # The doctor cancelled the new slot while we were moving into it: the sweep may have missed this row.
+        with dbconn(db_config()) as conn:
+            with conn.cursor() as cur:
+                done = cancel_confirmed_by_doctor(cur, target, int(v["doctorId"]), utcnow(), "Slot cancelled by the doctor", aid)
+                conn.commit()
+                row = fetch_appointment(cur, aid)
+        appt = appointment_json(row, "PATIENT", utcnow())
+        if done:
+            entries.append(cancelled_event(appt, appt["refund"], "DOCTOR"))
+            metric("CancellationsByTier", 1, Tier=DOCTOR_TIER)
+        status, payload = 409, msg(rcid, "The doctor cancelled the new time while your appointment was being moved. "
+                                         "You have been refunded in full.", "SLOT_CANCELLED", appointment=appt)
+    elif row["status"] == "CONFIRMED":
+        appt = appointment_json(row, "PATIENT", now, tiers)
+        prev_local = parse_utc(v["originalStartAt"]).astimezone(zone_of(v["timezone"]))
+        previous = {"slotId": original, "startAt": v["originalStartAt"], "localDate": prev_local.date().isoformat(),
+                    "localStart": prev_local.strftime("%H:%M")}
+        entries.append(("AppointmentRescheduled", {
+            **{k: appt[k] for k in ("appointmentId", "patientId", "doctorId", "slotId", "consultationTypeId", "startAt", "endAt",
+                                    "rescheduleCount", "status")},
+            "dependentId": appt["bookedFor"].get("dependentId"), "previousSlotId": original,
+            "previousStartAt": v["originalStartAt"], "notify": {**notify_fields(appt), "previousLocalDate": previous["localDate"],
+                                                                "previousLocalStart": previous["localStart"]}}))
+        metric("ReschedulesSucceeded", 1)
+        status, payload = 200, {"message": "Appointment rescheduled", "appointment": appt, "previous": previous, "correlationId": rcid}
+    else:
+        appt = appointment_json(row, "PATIENT", now)
+        text = "This appointment was cancelled while it was being moved."
+        if row["status"] == "CANCELLED_BY_DOCTOR":
+            text = "The doctor cancelled this appointment while it was being moved. You have been refunded in full."
+        status, payload = 409, msg(rcid, text, "APPOINTMENT_CANCELLED", appointment=appt)
+    try:
+        after = get_slot(original)
+    except Exception:  # noqa: BLE001
+        after = None
+    if after and after.get("status") == "OPEN" and parse_utc(after["start_at"]) > utcnow() and free_seats(after) > 0:
+        entries.append(("SlotSeatFreed", {"slotId": original, "doctorId": int(v["doctorId"]),
+                                          "consultationTypeId": int(v["consultationTypeId"]), "startAt": after["start_at"],
+                                          "localDate": after.get("local_date"), "freeSeats": free_seats(after),
+                                          "capacity": int(after.get("capacity", 1)), "reason": "RESCHEDULE"}))
+    resched_complete(key, status, payload)            # stored before publishing, exactly like a booking
+    release_reschedule_lock(aid, req["executionName"])
+    publish(entries, cid)
+    emit("info", "reschedule_finished", cid, appointmentId=aid, status=status, fromSlot=original, toSlot=target)
+    return {"ok": status == 200, "status": status}
+
+
+def saga_record_failure(state, cid):
+    """Terminal step for a rejected request or a compensated failure: store the answer, free the lock, count it."""
+    req, v = state["request"], state.get("validate") or {}
+    key, aid, rcid = req["idempotencyKey"], int(req["appointmentId"]), req.get("correlationId") or cid
+    if state.get("failedStep"):
+        revert = (state.get("revert") or {}).get("outcome")
+        metric("ReschedulesCompensated", 1)
+        emit("warning", "reschedule_compensated", cid, appointmentId=aid, step=state["failedStep"], revert=revert,
+             error=(state.get("error") or {}).get("Error"), detail=str((state.get("error") or {}).get("Cause", ""))[:300])
+        appt = None
+        try:
+            with dbconn(db_config()) as conn:
+                with conn.cursor() as cur:
+                    row = fetch_appointment(cur, aid)
+                conn.rollback()
+            appt = appointment_json(row, "PATIENT", utcnow(), safe_tiers(cid)) if row else None
+        except Exception as exc:  # noqa: BLE001
+            emit("warning", "reschedule_failure_lookup_failed", cid, error=type(exc).__name__)
+        text = ("This appointment was cancelled while it was being moved." if revert == "cancelled" else
+                "Your appointment could not be moved, so it stays at its original time. Nothing else changed.")
+        status, payload = 409, msg(rcid, text, "RESCHEDULE_COMPENSATED", appointment=appt, failedStep=state["failedStep"])
+    else:
+        failure = next((state[k] for k in ("validate", "claim") if isinstance(state.get(k), dict) and state[k].get("ok") is False), None)
+        if failure:
+            status, code, text = int(failure["status"]), failure["code"], failure["message"]
+        else:
+            status, code, text = 503, "RESCHEDULE_FAILED", "The reschedule could not be completed. Your appointment was not changed."
+        metric("ReschedulesRejected", 1, Reason=code)
+        payload = msg(rcid, text, code)
+    resched_complete(key, status, payload)
+    release_reschedule_lock(aid, req["executionName"])     # only removes the lock if THIS execution holds it
+    return {"recorded": True, "status": status}
+
+
+def saga_compensation_failed(state, cid):
+    req = state["request"]
+    metric("SagaCompensationFailures", 1)
+    emit("error", "reschedule_compensation_failed", cid, appointmentId=req["appointmentId"], targetSlot=req["targetSlotId"],
+         failedStep=state.get("failedStep"), error=(state.get("error") or {}).get("Error"),
+         compensationError=(state.get("compensationError") or {}).get("Error"))
+    try:
+        resched_complete(req["idempotencyKey"], 500, msg(req.get("correlationId") or cid,
+                         "Something went wrong while moving your appointment and our team has been alerted. "
+                         "Please check your appointments before trying again.", "RESCHEDULE_NEEDS_ATTENTION"))
+    except Exception as exc:  # noqa: BLE001
+        emit("error", "reschedule_record_failed", cid, error=type(exc).__name__)
+    # The lock is deliberately KEPT until its lease runs out: nobody should act on a half-moved appointment meanwhile.
+    return {"recorded": True}
+
+
+SAGA_STEPS = {"rescheduleValidate": saga_validate, "rescheduleClaimTarget": saga_claim_target, "rescheduleMove": saga_move,
+              "rescheduleReleaseOriginal": saga_release_original, "rescheduleRevertMove": saga_revert_move,
+              "rescheduleReleaseTarget": saga_release_target, "rescheduleFinalize": saga_finalize,
+              "rescheduleRecordFailure": saga_record_failure, "rescheduleCompensationFailed": saga_compensation_failed}
+
+
+# =========================================================================== Milestone 6: accept a waitlist offer
+# The waitlist Lambda HOLDS a seat for the first patient in line (held_count + 1 on the slot, an Offers item LIVE until
+# expires_at). Accepting turns that hold into a confirmed appointment:
+#   1. one DynamoDB transaction: offer LIVE -> ACCEPTING (only if still unexpired and the caller's) AND the slot's
+#      held seat becomes a booked seat (held - 1, booked + 1). The seat never becomes visible to anyone else.
+#   2. RDS: the normal booking rules + INSERT, with idempotency_key OFFER#<offerId> as the duplicate backstop.
+#   3. offer -> ACCEPTED, waitlist entry -> BOOKED, AppointmentBooked published.
+# Anything that fails before the INSERT commits puts the seat back on hold and the offer back to LIVE.
+OFFER_ID_RE = re.compile(r"OFR-[0-9a-f]{32}")
+ACCEPT_LEASE_SECONDS = 60
+
+
+def get_offer(offer_id):
+    res = ddb.get_item(TableName=offers_table(), Key={"offer_id": {"S": offer_id}}, ConsistentRead=True)
+    return _item(res.get("Item"))
+
+
+def revert_accept(offer, attempt_id, cid):
+    """Seat back on hold, offer back to LIVE (the patient may still accept before it expires)."""
+    try:
+        ddb.transact_write_items(TransactItems=[
+            {"Update": _seat_update(offer["slot_id"], -1, "booked_count > :zero", {"zero": 0}, delta_held=+1)},
+            {"Update": {"TableName": offers_table(), "Key": {"offer_id": {"S": offer["offer_id"]}},
+                        "UpdateExpression": "SET #st = :live REMOVE attempt_id, accepting_lease",
+                        "ConditionExpression": "#st = :acc AND attempt_id = :a", "ExpressionAttributeNames": {"#st": "status"},
+                        "ExpressionAttributeValues": _vals(live="LIVE", acc="ACCEPTING", a=attempt_id)}}])
+        emit("info", "offer_accept_reverted", cid, offerId=offer["offer_id"])
+    except Exception as exc:  # noqa: BLE001 - the expiry sweeper resolves an ACCEPTING offer once its lease ends
+        emit("error", "offer_accept_revert_failed", cid, offerId=offer["offer_id"], error=type(exc).__name__)
+
+
+def appointment_by_key(cur, key):
+    cur.execute("SELECT appointment_id FROM appointments WHERE idempotency_key = %s", (key,))
+    row = cur.fetchone()
+    return int(row["appointment_id"]) if row else None
+
+
+def accept_offer(offer_id, uid, cid):
+    now = utcnow()
+    now_s = int(now.timestamp())
+    offer = get_offer(offer_id)
+    if not offer or str(offer.get("patient_id")) != str(uid):
+        if offer:
+            emit("warning", "offer_isolation_violation", cid, callerId=uid, offerId=offer_id)
+        return respond(404, msg(cid, "Offer not found", "OFFER_NOT_FOUND"))
+    key, status = f"OFFER#{offer_id}", offer.get("status")
+    if status == "ACCEPTED":
+        with dbconn(db_config()) as conn:
+            with conn.cursor() as cur:
+                aid = appointment_by_key(cur, key)
+                row = fetch_appointment(cur, aid) if aid else None
+        if row:
+            return respond(200, {"message": "You already accepted this offer", "alreadyAccepted": True,
+                                 "appointment": appointment_json(row, "PATIENT", now, safe_tiers(cid)), "correlationId": cid})
+    if status in ("EXPIRED", "DECLINED", "VOID", "CLOSED", "ACCEPTED"):
+        return respond(410, msg(cid, {"EXPIRED": "This offer has expired", "DECLINED": "You declined this offer",
+                                      "VOID": "The doctor cancelled that slot, so the offer was withdrawn. You are back on the waitlist.",
+                                      "CLOSED": "The doctor is no longer available that day"}.get(status, "This offer has ended"),
+                                "OFFER_" + ("ENDED" if status == "ACCEPTED" else status)))
+    if status == "ACCEPTING" and int(offer.get("accepting_lease", 0)) > now_s:
+        return respond(409, msg(cid, "This offer is being accepted right now. Refresh in a moment.", "REQUEST_IN_PROGRESS"),
+                       {"Retry-After": "2"})
+    if status == "LIVE" and int(offer.get("expires_at", 0)) <= now_s:
+        return respond(410, msg(cid, "This offer has expired", "OFFER_EXPIRED"))
+    attempt_id = uuid.uuid4().hex
+    if status == "LIVE":
+        for _ in range(10):
+            slot = get_slot(offer["slot_id"])
+            if not slot or slot.get("status") != "OPEN" or parse_utc(slot["start_at"]) <= now:
+                return respond(409, msg(cid, "This seat is no longer available", "SLOT_CLOSED"))
+            if int(slot.get("held_count", 0) or 0) <= 0:
+                emit("error", "offer_without_held_seat", cid, offerId=offer_id, slotId=offer["slot_id"])
+                return respond(409, msg(cid, "This seat is no longer available", "SLOT_CLOSED"))
+            try:
+                ddb.transact_write_items(TransactItems=[
+                    {"Update": {"TableName": offers_table(), "Key": {"offer_id": {"S": offer_id}},
+                                "UpdateExpression": "SET #st = :acc, attempt_id = :a, accepting_lease = :l",
+                                "ConditionExpression": "#st = :live AND expires_at > :now AND patient_id = :me",
+                                "ExpressionAttributeNames": {"#st": "status"},
+                                "ExpressionAttributeValues": _vals(acc="ACCEPTING", a=attempt_id, l=now_s + ACCEPT_LEASE_SECONDS,
+                                                                   live="LIVE", now=now_s, me=str(uid))}},
+                    {"Update": {"TableName": slots_table(), "Key": slot_table_key(offer["slot_id"]),
+                                "UpdateExpression": "SET held_count = :h, booked_count = :b, version = :nv, updated_at = :t",
+                                "ConditionExpression": "version = :v AND #st = :open",
+                                "ExpressionAttributeNames": {"#st": "status"},
+                                "ExpressionAttributeValues": _vals(h=int(slot["held_count"]) - 1, b=int(slot.get("booked_count", 0) or 0) + 1,
+                                                                   nv=int(slot["version"]) + 1, v=int(slot["version"]),
+                                                                   open="OPEN", t=iso(now))}}])
+                break
+            except Exception as exc:  # noqa: BLE001
+                if _code(exc) == "TransactionCanceledException":
+                    reasons = [r.get("Code") for r in (exc.response.get("CancellationReasons") or [])]
+                    if reasons and reasons[0] == "ConditionalCheckFailed":     # expired / taken meanwhile: answer from the item
+                        latest = get_offer(offer_id)
+                        if latest and latest.get("status") != "LIVE":
+                            return accept_offer(offer_id, uid, cid)
+                        return respond(410, msg(cid, "This offer has expired", "OFFER_EXPIRED"))
+                elif _code(exc) not in TRANSIENT_DDB:
+                    raise
+                sleep(backoff(1))
+        else:
+            return respond(409, msg(cid, "This seat is in high demand right now. Please try again.", "SLOT_BUSY"), {"Retry-After": "1"})
+    else:   # ACCEPTING with an expired lease: an earlier attempt died after moving the seat. Take it over (no seat change).
+        try:
+            ddb.update_item(TableName=offers_table(), Key={"offer_id": {"S": offer_id}},
+                            UpdateExpression="SET attempt_id = :a, accepting_lease = :l",
+                            ConditionExpression="#st = :acc AND accepting_lease < :now", ExpressionAttributeNames={"#st": "status"},
+                            ExpressionAttributeValues=_vals(a=attempt_id, l=now_s + ACCEPT_LEASE_SECONDS, acc="ACCEPTING", now=now_s))
+        except Exception as exc:  # noqa: BLE001
+            if _code(exc) == "ConditionalCheckFailedException":
+                return respond(409, msg(cid, "This offer is being accepted right now. Refresh in a moment.", "REQUEST_IN_PROGRESS"))
+            raise
+
+    settings, tiers = load_settings(cid), safe_tiers(cid)
+    doctor_id, type_id = int(offer["doctor_id"]), int(offer["consultation_type_id"])
+    dep = offer.get("dependent_id")
+    dep = int(dep) if dep not in (None, "", 0, "0") else None
+    start, end = parse_utc(offer["start_at"]), parse_utc(offer["end_at"])
+    problem, appointment_id, commit_attempted = None, None, False
+    try:
+        with dbconn(db_config()) as conn:
+            with conn.cursor() as cur:
+                try:
+                    appointment_id = appointment_by_key(cur, key)
+                    if appointment_id is None:
+                        if not patient_ready(cur, uid):
+                            problem = ("ACCOUNT_INACTIVE", "This account cannot book appointments")
+                        cur.execute("""SELECT dct.fee, d.timezone FROM doctor_consultation_types dct
+                                       JOIN consultation_types ct ON ct.consultation_type_id = dct.consultation_type_id AND ct.is_active = 1
+                                       JOIN doctors d ON d.doctor_id = dct.doctor_id
+                                       JOIN users du ON du.user_id = d.doctor_id AND du.is_active = 1
+                                       WHERE dct.doctor_id = %s AND dct.consultation_type_id = %s AND dct.is_active = 1""",
+                                    (doctor_id, type_id))
+                        offered = cur.fetchone()
+                        dependent = active_dependent(cur, uid, dep) if dep is not None else None
+                        who = f"{dependent['first_name']} {dependent['last_name']}" if dependent else None
+                        if problem:
+                            pass
+                        elif not offered:
+                            problem = ("SLOT_UNAVAILABLE", "This doctor is not taking bookings for that consultation type")
+                        elif dep is not None and not dependent:
+                            problem = ("DEPENDENT_NOT_FOUND", "That family member is not on your account")
+                        elif blackout_on(cur, doctor_id, start, zone_of(offered["timezone"]), lock=True):
+                            problem = ("DOCTOR_UNAVAILABLE", "The doctor is not available on this day")
+                        else:
+                            problem = check_limits(cur, uid, dep, doctor_id, offer["slot_id"], start, end,
+                                                   zone_of(offered["timezone"]), settings, now, who)
+                        if problem:
+                            conn.rollback()
+                        else:
+                            cur.execute(
+                                """INSERT INTO appointments (patient_id, doctor_id, consultation_type_id, slot_id, start_at, end_at,
+                                                             fee_snapshot, status, dependent_id, idempotency_key, created_at, updated_at)
+                                   VALUES (%s, %s, %s, %s, %s, %s, %s, 'CONFIRMED', %s, %s, %s, %s)""",
+                                (uid, doctor_id, type_id, offer["slot_id"], db_time(start), db_time(end), money(offered["fee"]),
+                                 dep, key, db_time(now), db_time(now)))
+                            appointment_id = int(cur.lastrowid)
+                            commit_attempted = True
+                            conn.commit()
+                except pymysql.err.IntegrityError as exc:
+                    conn.rollback()
+                    if is_dup(exc, "idempotency_key"):
+                        appointment_id = appointment_by_key(cur, key)
+                    elif is_dup(exc, "active_patient_slot"):
+                        problem = ("DUPLICATE_BOOKING", "You are already booked in this slot" if dep is None else "That person is already booked in this slot")
+                    else:
+                        raise
+    except Exception:
+        if not commit_attempted:
+            revert_accept(offer, attempt_id, cid)
+        raise
+    if problem:
+        revert_accept(offer, attempt_id, cid)
+        emit("info", "offer_accept_rejected", cid, offerId=offer_id, code=problem[0])
+        return respond(409, msg(cid, problem[1] + ". The seat stays held for you until the offer expires.", problem[0]))
+
+    for upd in ({"TableName": offers_table(), "Key": {"offer_id": {"S": offer_id}},
+                 "UpdateExpression": "SET #st = :ok, appointment_id = :aid, accepted_at = :t, purge_at = :p",
+                 "ConditionExpression": "attempt_id = :a", "ExpressionAttributeNames": {"#st": "status"},
+                 "ExpressionAttributeValues": _vals(ok="ACCEPTED", aid=appointment_id, t=iso(utcnow()), a=attempt_id,
+                                                    p=now_s + 30 * 86400)},
+                {"TableName": waitlist_table(), "Key": {"waitlist_key": {"S": offer["waitlist_key"]}, "entry_key": {"S": offer["entry_key"]}},
+                 "UpdateExpression": "SET #st = :booked, appointment_id = :aid, ended_at = :t",
+                 "ConditionExpression": "offer_id = :oid", "ExpressionAttributeNames": {"#st": "status"},
+                 "ExpressionAttributeValues": _vals(booked="BOOKED", aid=appointment_id, t=iso(utcnow()), oid=offer_id)}):
+        try:
+            ddb.update_item(**upd)
+        except Exception as exc:  # noqa: BLE001 - the booking is committed; the sweeper reconciles ACCEPTING offers
+            emit("warning", "offer_finalise_failed", cid, offerId=offer_id, table=upd["TableName"], error=type(exc).__name__)
+    metric("OffersAccepted", 1)
+    with dbconn(db_config()) as conn:
+        with conn.cursor() as cur:
+            row = fetch_appointment(cur, appointment_id)
+    appt = appointment_json(row, "PATIENT", now, tiers)
+    try:
+        after = get_slot(offer["slot_id"])
+    except Exception:  # noqa: BLE001
+        after = None
+    if after and after.get("status") == "CANCELLED":
+        with dbconn(db_config()) as conn:
+            with conn.cursor() as cur:
+                done = cancel_confirmed_by_doctor(cur, offer["slot_id"], doctor_id, utcnow(), "Slot cancelled by the doctor", appointment_id)
+                conn.commit()
+                row = fetch_appointment(cur, appointment_id)
+        appt = appointment_json(row, "PATIENT", utcnow())
+        if done:
+            publish([cancelled_event(appt, appt["refund"], "DOCTOR")], cid)
+        return respond(409, msg(cid, "The doctor cancelled this slot while you were accepting. You have been refunded in full.",
+                                "SLOT_CANCELLED", appointment=appt))
+    publish([booked_event(appt, source="WAITLIST", offerId=offer_id)], cid)
+    emit("info", "offer_accepted", cid, offerId=offer_id, appointmentId=appointment_id, patientId=uid, slotId=offer["slot_id"])
+    return respond(201, {"message": "Offer accepted. Your appointment is confirmed.", "appointment": appt, "correlationId": cid})
+
+
 # =========================================================================== routing
 ROUTE_RE = re.compile(r"(/appointments(?:/[^/]+){0,2}|/doctors/me/slots/[^/]+/cancel|/patients/me/refunds"
-                      r"|/patients/me/dependents(?:/[^/]+)?)/?$")
+                      r"|/patients/me/dependents(?:/[^/]+)?|/offers/[^/]+/accept)/?$")
 
 
 def route(event):
@@ -1629,6 +2523,9 @@ def handler(event, context):
     # Internal action from doctor_domain (direct, IAM-authorised Lambda invoke). API Gateway events always carry
     # httpMethod + requestContext, so this branch can never be reached from the public API.
     if event.get("action") and "httpMethod" not in event and "requestContext" not in event:
+        step = SAGA_STEPS.get(event.get("action"))
+        if step:   # Milestone 6: a reschedule saga step from Step Functions. Errors propagate so the state machine
+            return step(event.get("input") or {}, (event.get("input") or {}).get("request", {}).get("correlationId") or cid)
         if event.get("action") != "cancelBlackoutDay":
             return {"ok": False, "message": "Unknown action"}
         try:
@@ -1654,11 +2551,17 @@ def handler(event, context):
             if method == "GET":
                 return list_appointments(event, uid, role, cid)
             return respond(405, msg(cid, "Method not allowed"))
-        m = re.fullmatch(r"/appointments/([^/]+)(/cancel|/status)?", path)
+        m = re.fullmatch(r"/appointments/([^/]+)(/cancel|/status|/reschedule)?", path)
         if m:
             appointment_id, bad = appointment_id_of(m.group(1), cid)
             if bad:
                 return bad
+            if m.group(2) == "/reschedule":
+                if method != "POST":
+                    return respond(405, msg(cid, "Method not allowed"))
+                if role != "PATIENT":
+                    return respond(403, msg(cid, "Only the patient can reschedule an appointment"))
+                return reschedule(event, appointment_id, uid, cid)
             if m.group(2) == "/status":
                 if method != "POST":
                     return respond(405, msg(cid, "Method not allowed"))
@@ -1697,6 +2600,16 @@ def handler(event, context):
             if method not in ("PATCH", "PUT", "DELETE"):
                 return respond(405, msg(cid, "Method not allowed"))
             return change_dependent(event, uid, int(m.group(1)), "DELETE" if method == "DELETE" else "PATCH", cid)
+        m = re.fullmatch(r"/offers/([^/]+)/accept", path)
+        if m:
+            if method != "POST":
+                return respond(405, msg(cid, "Method not allowed"))
+            if role != "PATIENT":
+                return respond(403, msg(cid, "Patient role required"))
+            offer_id = unquote((event.get("pathParameters") or {}).get("offerId") or m.group(1))
+            if not OFFER_ID_RE.fullmatch(offer_id):
+                return respond(422, msg(cid, "offerId is not valid", "OFFER_ID_INVALID"))
+            return accept_offer(offer_id, uid, cid)
         if path == "/patients/me/refunds":
             if method != "GET":
                 return respond(405, msg(cid, "Method not allowed"))

@@ -38,7 +38,9 @@ Resources:
       DBSubnetGroupName: !Ref DBSubnetGroup
       VPCSecurityGroups:
         - Fn::ImportValue: !Sub 'MediSlot-${Environment}-DatabaseSecurityGroupId'
-      BackupRetentionPeriod: 1
+      BackupRetentionPeriod: 7               # Milestone 7: automated backups + point-in-time restore for 7 days
+      PreferredBackupWindow: '20:30-21:00'    # 02:00-02:30 IST
+      DeleteAutomatedBackups: false
       AutoMinorVersionUpgrade: true
       CopyTagsToSnapshot: true
       Tags:
@@ -84,6 +86,8 @@ Resources:
       TimeToLiveSpecification:
         AttributeName: expires_at
         Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
       SSESpecification:
         SSEEnabled: true
 
@@ -105,73 +109,61 @@ Resources:
       TimeToLiveSpecification:
         AttributeName: expires_at
         Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
       SSESpecification:
         SSEEnabled: true
 
-  WaitlistTable:
+  # ---- Milestone 6: waitlists, hold offers and the notification dispatch log.
+  # (They replace the unused Milestone 2 placeholders "Waitlist" and "HoldOffers": a waitlist is per doctor-DAY, and
+  # a hold must never be deleted by TTL while it still holds a seat, so the TTL attribute is purge_at, set only when
+  # the offer can no longer matter.)
+  # One partition per doctor-day: waitlist_key = DOC#<doctorId>#DAY#<YYYY-MM-DD>, entry_key = P#<patientId>#D#<dependentId|0>.
+  # Each patient also has one summary item (waitlist_key = PATIENT#<id>, entry_key = SUMMARY) that enforces the cap.
+  WaitlistEntriesTable:
     Type: AWS::DynamoDB::Table
     Properties:
-      TableName: !Sub 'MediSlot-${Environment}-Waitlist'
+      TableName: !Sub 'MediSlot-${Environment}-WaitlistEntries'
       BillingMode: PAY_PER_REQUEST
       AttributeDefinitions:
-        - AttributeName: slot_id
-          AttributeType: S
-        - AttributeName: waitlist_entry
-          AttributeType: S
-        - AttributeName: patient_id
-          AttributeType: S
-        - AttributeName: joined_at
-          AttributeType: S
+        - {AttributeName: waitlist_key, AttributeType: S}
+        - {AttributeName: entry_key, AttributeType: S}
+        - {AttributeName: patient_id, AttributeType: S}
+        - {AttributeName: joined_at, AttributeType: S}
       KeySchema:
-        - AttributeName: slot_id
-          KeyType: HASH
-        - AttributeName: waitlist_entry
-          KeyType: RANGE
+        - {AttributeName: waitlist_key, KeyType: HASH}
+        - {AttributeName: entry_key, KeyType: RANGE}
       GlobalSecondaryIndexes:
-        - IndexName: GSI_PatientWaitlists
+        - IndexName: GSI_Patient
           KeySchema:
-            - AttributeName: patient_id
-              KeyType: HASH
-            - AttributeName: joined_at
-              KeyType: RANGE
-          Projection:
-            ProjectionType: ALL
-      SSESpecification:
-        SSEEnabled: true
+            - {AttributeName: patient_id, KeyType: HASH}
+            - {AttributeName: joined_at, KeyType: RANGE}
+          Projection: {ProjectionType: ALL}
+      TimeToLiveSpecification: {AttributeName: purge_at, Enabled: true}
+      PointInTimeRecoverySpecification: {PointInTimeRecoveryEnabled: true}
+      SSESpecification: {SSEEnabled: true}
 
-  HoldOffersTable:
+  OffersTable:
     Type: AWS::DynamoDB::Table
     Properties:
-      TableName: !Sub 'MediSlot-${Environment}-HoldOffers'
+      TableName: !Sub 'MediSlot-${Environment}-Offers'
       BillingMode: PAY_PER_REQUEST
       AttributeDefinitions:
-        - AttributeName: slot_id
-          AttributeType: S
-        - AttributeName: offer_id
-          AttributeType: S
-        - AttributeName: status
-          AttributeType: S
-        - AttributeName: expires_at
-          AttributeType: N
+        - {AttributeName: offer_id, AttributeType: S}
+        - {AttributeName: status, AttributeType: S}
+        - {AttributeName: expires_at, AttributeType: N}
       KeySchema:
-        - AttributeName: slot_id
-          KeyType: HASH
-        - AttributeName: offer_id
-          KeyType: RANGE
+        - {AttributeName: offer_id, KeyType: HASH}
       GlobalSecondaryIndexes:
-        - IndexName: GSI_OfferExpiry
+        # The expiry sweeper: status = LIVE AND expires_at <= now (also used for ACCEPTING offers that got stuck).
+        - IndexName: GSI_Status
           KeySchema:
-            - AttributeName: status
-              KeyType: HASH
-            - AttributeName: expires_at
-              KeyType: RANGE
-          Projection:
-            ProjectionType: ALL
-      TimeToLiveSpecification:
-        AttributeName: expires_at
-        Enabled: true
-      SSESpecification:
-        SSEEnabled: true
+            - {AttributeName: status, KeyType: HASH}
+            - {AttributeName: expires_at, KeyType: RANGE}
+          Projection: {ProjectionType: ALL}
+      TimeToLiveSpecification: {AttributeName: purge_at, Enabled: true}
+      PointInTimeRecoverySpecification: {PointInTimeRecoveryEnabled: true}
+      SSESpecification: {SSEEnabled: true}
 
   NotificationLogTable:
     Type: AWS::DynamoDB::Table
@@ -187,6 +179,8 @@ Resources:
       TimeToLiveSpecification:
         AttributeName: expires_at
         Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
       SSESpecification:
         SSEEnabled: true
 
@@ -307,6 +301,47 @@ Resources:
       Description: Bounded retries when the optimistic-concurrency write on a slot loses a race (then 409 SLOT_BUSY).
       Value: '10'
 
+  # ---- Milestone 6: reschedule, waitlist and no-show rules (read at runtime, cached 60 s - no redeploy needed).
+  BookingMaxReschedulesParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/medislot/${Environment}/booking/max-reschedules'
+      Type: String
+      Description: How many times one appointment may be rescheduled (0-2; the schema caps reschedule_count at 2).
+      Value: '2'
+
+  BookingRescheduleCutoffParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/medislot/${Environment}/booking/reschedule-cutoff-hours'
+      Type: String
+      Description: An appointment can no longer be rescheduled this many hours (or less) before it starts.
+      Value: '6'
+
+  BookingNoShowGraceParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/medislot/${Environment}/booking/no-show-grace-hours'
+      Type: String
+      Description: A CONFIRMED appointment that ended this many hours ago without an outcome is marked NO_SHOW.
+      Value: '12'
+
+  WaitlistHoldMinutesParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/medislot/${Environment}/waitlist/hold-minutes'
+      Type: String
+      Description: How long a freed seat is held for the waitlisted patient it is offered to.
+      Value: '15'
+
+  WaitlistMaxActiveParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/medislot/${Environment}/waitlist/max-active'
+      Type: String
+      Description: Most waitlists one patient account can be on at the same time.
+      Value: '5'
+
 Outputs:
   DBEndpoint:
     Value: !GetAtt MediSlotDatabase.Endpoint.Address
@@ -322,9 +357,11 @@ Outputs:
     Value: !Ref IdempotencyTable
   AuthTokensTableName:
     Value: !Ref AuthTokensTable
-  WaitlistTableName:
-    Value: !Ref WaitlistTable
-  HoldOffersTableName:
-    Value: !Ref HoldOffersTable
+  WaitlistEntriesTableName:
+    Value: !Ref WaitlistEntriesTable
+  OffersTableName:
+    Value: !Ref OffersTable
+  DBInstanceIdentifier:
+    Value: !Ref MediSlotDatabase
   NotificationLogTableName:
     Value: !Ref NotificationLogTable

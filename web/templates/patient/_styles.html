@@ -90,4 +90,15 @@ button.danger-btn{background:var(--err)}button.danger-btn:hover{background:#8c1d
 @media(max-width:860px){.week{grid-template-columns:repeat(4,minmax(0,1fr))}.datesearch,.datesearch details>div{grid-template-columns:minmax(0,1fr)}}
 @media(max-width:1020px){.searchbar,.slotbar{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media(max-width:560px){.searchbar,.slotbar{grid-template-columns:minmax(0,1fr)}.searchbar .span2{grid-column:auto}.dochero{flex-direction:column;align-items:flex-start}}
+/* Milestone 6: waitlists, held seats, reschedule */
+.dhead .wl-join{margin:0}.dhead .wl-join button{padding:8px 14px;font-size:14px;margin:0}
+.appt-card.offer{border-color:#c98a12;box-shadow:0 0 0 3px rgba(201,138,18,.12)}
+.appt-card.offer .foot form{margin:0}.appt-card.offer .foot button{margin:0}
+/* Milestone 7: doctor week view */
+.weekgrid{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:12px;margin-top:18px}
+.weekgrid .wd{border:1.5px solid var(--line);border-radius:14px;padding:12px;background:#fff;min-height:150px}
+.weekgrid .wd h4{margin:0 0 6px;font-size:15px}.weekgrid .wd small{display:block;color:var(--muted)}
+.weekgrid .wd ul{list-style:none;margin:8px 0 0;padding:0;font-size:13px}.weekgrid .wd li{padding:3px 0;border-top:1px dashed var(--line)}
+.slot .patients{margin:8px 0 0;padding:0;list-style:none;font-size:14px}.slot .patients li{padding:4px 0;border-top:1px dashed var(--line)}
+@media(max-width:1020px){.weekgrid{grid-template-columns:repeat(2,minmax(0,1fr))}}
 </style>

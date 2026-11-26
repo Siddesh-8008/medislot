@@ -18,11 +18,12 @@
   <ul class="todo">
    <li><a href="/patient/doctors"><span class="tick" style="background:#3a8dd6;border-color:#3a8dd6">{{ icon('search') }}</span><span class="t"><b>Find a doctor</b><span>Search with any mix of filters and browse their free slots.</span></span><span class="go">Start →</span></a></li>
    <li><a href="/patient/appointments"><span class="tick" style="background:#2c9a73;border-color:#2c9a73">{{ icon('calendar') }}</span><span class="t"><b>My appointments</b><span>See what you have booked, or cancel with a refund.</span></span><span class="go">Open →</span></a></li>
+   <li><a href="/patient/waitlists"><span class="tick" style="background:#c98a12;border-color:#c98a12">{{ icon('clock') }}</span><span class="t"><b>Waitlists &amp; offers</b><span>A day is full? Wait for it - we hold the next free seat for you.</span></span><span class="go">Open →</span></a></li>
    <li><a href="/patient/profile"><span class="tick" style="background:#46b3a5;border-color:#46b3a5">{{ icon('user') }}</span><span class="t"><b>Check your profile</b><span>Keep your phone number and details up to date.</span></span><span class="go">Open →</span></a></li>
   </ul>
   {% if profile %}<div class="tiles"><div class="tile"><small>Name</small><strong style="font-size:22px;padding-top:10px">{{ profile.firstName }} {{ profile.lastName }}</strong></div><div class="tile"><small>Phone</small><strong style="font-size:22px;padding-top:10px">{{ profile.phone or '—' }}</strong></div></div>
   {% else %}<div class="banner error" style="margin-top:28px"><span>Your profile could not be loaded right now. Please refresh in a moment.</span></div>{% endif %}
-  <p class="soon">Pick a doctor, choose a free slot and press <b>Book</b>. Cancelling well ahead of time gets you a bigger refund.</p>
+  <p class="soon">Pick a doctor, choose a free slot and press <b>Book</b>. Need another time later? Open the appointment and reschedule it (up to 6 hours before). Cancelling well ahead of time gets you a bigger refund.</p>
 
 {% elif page=='profile' %}
   {% if not profile and not form %}
@@ -105,9 +106,12 @@
    {% if week %}<nav class="week" aria-label="Week at a glance">{% for w in week %}<a class="wday {{ w.state }} {{ 'today' if w.today }}" href="{{ '#'~w.id if w.has_slots else '#' }}"><small>{{ 'Today' if w.today else w.weekday }}</small><b>{{ w.day }}</b><small style="letter-spacing:0;text-transform:none;font-weight:500">{{ w.month }}</small><span>{{ w.label }}</span></a>{% endfor %}</nav>{% endif %}
    {% if days %}
     <div class="legend" style="margin-top:14px"><span style="--c:var(--teal)"><i></i>Free</span><span style="--c:#c98a12"><i></i>Few seats left</span><span style="--c:#a7b9bd"><i></i>Full</span></div>
-    {% if family %}<div class="bookfor"><label for="book-for" style="display:inline">Booking for</label><select id="book-for"><option value="">Me</option>{% for f in family %}<option value="{{f.id}}">{{f.name}} ({{f.relation}})</option>{% endfor %}</select><span style="font-weight:500">Then pick a time below.</span></div>{% endif %}
+    {% if family %}<div class="bookfor" title="Applies to booking and to joining a waitlist"><label for="book-for" style="display:inline">Booking for</label><select id="book-for"><option value="">Me</option>{% for f in family %}<option value="{{f.id}}">{{f.name}} ({{f.relation}})</option>{% endfor %}</select><span style="font-weight:500">Then pick a time below.</span></div>{% endif %}
     {% for day in days %}
-     <section class="dayblock" id="{{ day.id }}"><div class="dhead"><h3>{{ day.title }}</h3><p>{{ day.free }} of {{ day.total }} slot{{ '' if day.total==1 else 's' }} free</p></div>
+     <section class="dayblock" id="{{ day.id }}"><div class="dhead"><h3>{{ day.title }}</h3><p>{{ day.free }} of {{ day.total }} slot{{ '' if day.total==1 else 's' }} free</p>
+      {% if day.waitlist and day.date >= today %}<form method="post" action="/patient/waitlists" class="wl-join" onsubmit="var f=document.getElementById('book-for'),i=this.querySelector('[name=dependentId]');if(f&&i)i.value=f.value;this.querySelector('button').disabled=true">
+       <input type="hidden" name="doctorId" value="{{ doc.doctorId }}"><input type="hidden" name="date" value="{{ day.date }}"><input type="hidden" name="back" value="{{ here }}">{% if family %}<input type="hidden" name="dependentId" value="">{% endif %}
+       <button class="ghost" title="We hold the next seat that frees up on this day for you">Join the waitlist for this day</button></form>{% endif %}</div>
      {% for grp in day.groups %}
       <div class="part">{{grp.label}} <small>{{ grp.cards|length }} slot{{ '' if grp.cards|length==1 else 's' }}</small></div>
       <div class="times">{% for s in grp.cards %}
@@ -144,6 +148,16 @@
    <section class="panel"><h2>Refund</h2><dl class="kv"><dt>Refunded</dt><dd><b>{{a.refund.amount}}</b> ({{a.refund.refundPercent}}%)</dd><dt>Not refunded</dt><dd>{{a.refund.deducted}}</dd>
     <dt>Why</dt><dd>{{ 'The doctor cancelled this slot - always a full refund.' if a.refund.reason=='DOCTOR_CANCEL' else 'Refund tier: ' ~ a.refund.tier|replace('_',' ')|title }}</dd></dl></section>
   {% elif a.cancellable %}
+   {% if reschedule %}<details class="panel" {{ 'open' if reschedule.allowed and reschedule.days }}><summary>Reschedule to another time</summary>
+    {% if not reschedule.allowed %}<p class="lead" style="margin-top:14px">{{ reschedule.reason or 'This appointment cannot be rescheduled.' }}</p>
+    {% elif reschedule.error %}<p class="lead" style="margin-top:14px">{{ reschedule.error }}</p>
+    {% elif reschedule.days %}<p class="lead" style="margin-top:14px">Free times with the same doctor for the same consultation in the next two weeks. Your fee and refund rules stay the same.{% if a.reschedules %} Rescheduled {{ a.reschedules }} of 2 times so far.{% endif %}</p>
+     {% for day in reschedule.days %}<div class="part">{{ day.title }}</div><div class="times">{% for s in day.slots %}
+      <form method="post" action="/patient/appointments/{{a.id}}/reschedule" class="tform" onsubmit="this.querySelector('button').disabled=true;return confirm('Move your appointment to {{ day.title }} at {{ s.start }}?')">
+       <input type="hidden" name="targetSlotId" value="{{ s.id }}"><input type="hidden" name="key" value="{{ s.key }}">
+       <button class="tchip open"><b>{{ s.start }}</b><small>until {{ s.end }}</small><span class="go">Move here</span></button></form>{% endfor %}</div>{% endfor %}
+    {% else %}<p class="lead" style="margin-top:14px">No other free times in the next two weeks. You can <a href="/patient/doctors/{{a.doctor_id}}">join a waitlist</a> for a full day.</p>{% endif %}
+   </details>{% endif %}
    <details class="panel danger"><summary>Cancel this appointment</summary>
     {% if a.preview %}<p class="lead" style="margin-top:14px">Cancel now and get <b>{{a.preview.amount}}</b> back ({{a.preview.refundPercent}}%){% if a.preview.until and a.preview.refundPercent>0 %} - this applies until {{a.preview.until}}{% endif %}.</p>{% endif %}
     <form method="post" action="/patient/appointments/{{a.id}}/cancel" onsubmit="return confirm('Cancel this appointment?')">
@@ -161,6 +175,25 @@
    {% if prev_url or next_url %}<div class="winnav"><span>{% if prev_url %}<a class="btn ghost" href="{{prev_url}}">← Previous</a>{% endif %}</span><span>{% if next_url %}<a class="btn ghost" href="{{next_url}}">Next →</a>{% endif %}</span></div>{% endif %}
    {% else %}<div class="empty" style="margin-top:28px"><b>No refunds yet</b>When you cancel an appointment, the refund is shown here.</div>{% endif %}
   {% endif %}
+{% elif page=='waitlists' %}
+  {% if error %}<div class="banner error"><span>{{ error }}</span></div>{% endif %}
+  {% set held = items|selectattr('offer')|list %}
+  {% if held %}<h2 class="sub-h" style="margin-top:0">Seats held for you</h2><div class="appts">{% for e in held %}
+   <div class="appt-card offer"><div class="top"><div><b>{{ e.offer.localDate }} at {{ e.offer.localStart }}</b><small>{{ e.doctorName }} · for {{ e['for'] }}</small></div><span class="pill warn">Held · {{ e.offer.left }} left</span></div>
+    <div class="meta"><span>Accept before {{ e.offer.until or e.offer.expiresAt }} or it goes to the next person in line.</span></div>
+    <div class="foot" style="gap:10px;display:flex;flex-wrap:wrap">
+     <form method="post" action="/patient/offers/{{ e.offer.offerId }}/accept" onsubmit="this.querySelector('button').disabled=true"><button>Accept and book</button></form>
+     <form method="post" action="/patient/offers/{{ e.offer.offerId }}/decline" onsubmit="return confirm('Give this seat to the next person?')"><button class="ghost">Decline</button></form></div></div>{% endfor %}</div>{% endif %}
+  <h2 class="sub-h"{% if not held %} style="margin-top:0"{% endif %}>Days you are waiting for</h2>
+  {% set waiting = items|rejectattr('offer')|list %}
+  {% if waiting %}<div class="tbl-wrap"><table><thead><tr><th>Day</th><th>Doctor</th><th>For</th><th>Status</th><th>Place in line</th><th></th></tr></thead><tbody>
+   {% for e in waiting %}<tr><td>{{ e.day }}</td><td><a href="/patient/doctors/{{ e.doctorId }}?on={{ e.date }}">{{ e.doctorName }}</a></td><td>{{ e['for'] }}</td><td><span class="pill {{ e.tone }}">{{ e.label }}</span></td><td>{{ e.position or '—' }}</td>
+    <td><form method="post" action="/patient/waitlists/{{ e.waitlistId }}/leave" onsubmit="return confirm('Leave this waitlist?')"><button class="ghost">Leave</button></form></td></tr>{% endfor %}
+  </tbody></table></div>
+  {% elif not held and not error %}<div class="empty"><b>You are not on any waitlist</b>When every slot on a day is taken, open the doctor's page and press “Join the waitlist for this day”.</div>{% endif %}
+  <aside class="side-note" style="margin-top:28px"><h3>How waitlists work</h3><ul><li>You wait for a whole day with one doctor, not one time slot.</li><li>When a seat frees up it is held for the first person in line for {{ hold_minutes }} minutes - nobody else can book it meanwhile.</li><li>If you do not accept in time, it goes to the next person.</li><li>You can be on up to {{ max_active }} waitlists at once.</li></ul></aside>
+  {% if recent %}<h2 class="sub-h">Earlier</h2><div class="tbl-wrap"><table><thead><tr><th>Day</th><th>Doctor</th><th>For</th><th>Outcome</th></tr></thead><tbody>
+   {% for e in recent %}<tr><td>{{ e.day }}</td><td>{{ e.doctorName }}</td><td>{{ e['for'] }}</td><td><span class="pill {{ e.tone }}">{{ e.label }}</span></td></tr>{% endfor %}</tbody></table></div>{% endif %}
 {% elif page=='family' %}
   {% if error %}<div class="banner error"><span>{{ error }}</span></div>{% endif %}
   <div class="cols wide-left"><section class="panel"><h2>Your family members</h2><p class="lead">Book appointments for them from your own account. Each person can have their own appointment at the same time as you.</p>

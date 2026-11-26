@@ -412,3 +412,82 @@ def query_doctor_slots(table, doctor_id, start_from_iso, start_before_iso, open_
         if "LastEvaluatedKey" not in res:
             return items
         kwargs["ExclusiveStartKey"] = res["LastEvaluatedKey"]
+
+
+# --------------------------------------------------------------------------- Milestone 6: shared low-level helpers
+# Used by the waitlist, notifications and reminders Lambdas (the booking Lambda keeps its own copies, unchanged).
+def ddb_av(v):
+    """Python value -> DynamoDB low-level attribute value."""
+    if v is None:
+        return {"NULL": True}
+    if isinstance(v, bool):
+        return {"BOOL": v}
+    if isinstance(v, (int, Decimal)):
+        return {"N": str(v)}
+    if isinstance(v, float):
+        return {"N": repr(v)}
+    if isinstance(v, dict):
+        return {"M": {k: ddb_av(x) for k, x in v.items()}}
+    if isinstance(v, (list, tuple)):
+        return {"L": [ddb_av(x) for x in v]}
+    return {"S": str(v)}
+
+
+def ddb_py(av):
+    """DynamoDB low-level attribute value -> Python value (whole numbers become int)."""
+    (kind, v), = av.items()
+    if kind == "N":
+        d = Decimal(v)
+        return int(d) if d == d.to_integral_value() else d
+    if kind == "M":
+        return {k: ddb_py(x) for k, x in v.items()}
+    if kind == "L":
+        return [ddb_py(x) for x in v]
+    if kind == "NULL":
+        return None
+    return v
+
+
+def ddb_item(raw):
+    return {k: ddb_py(v) for k, v in (raw or {}).items()}
+
+
+def ddb_vals(**kw):
+    return {":" + k: ddb_av(v) for k, v in kw.items()}
+
+
+def aws_error_code(exc):
+    return (getattr(exc, "response", None) or {}).get("Error", {}).get("Code")
+
+
+def cancellation_reasons(exc):
+    """['None' | 'ConditionalCheckFailed' | ...] for a TransactionCanceledException, one per transaction item."""
+    return [r.get("Code") for r in ((getattr(exc, "response", None) or {}).get("CancellationReasons") or [])]
+
+
+def put_metric(name, value=1, unit="Count", **dimensions):
+    """CloudWatch metric through Embedded Metric Format (one JSON line on stdout; no API call, no extra IAM).
+    Namespace MediSlot. Always published dimensioned by Environment only (what dashboards and alarms use) and, when
+    extra dimensions are given, ALSO by Environment + those dimensions (for the per-type breakdown)."""
+    env = os.environ.get("ENVIRONMENT", "dev")
+    extra = {k: str(v) for k, v in dimensions.items()}
+    sets = [["Environment"]] + ([["Environment", *extra]] if extra else [])
+    doc = {"_aws": {"Timestamp": int(time.time() * 1000), "CloudWatchMetrics": [{
+        "Namespace": "MediSlot", "Dimensions": sets, "Metrics": [{"Name": name, "Unit": unit}]}]},
+        "Environment": env, **extra, name: value}
+    print(json.dumps(doc), flush=True)
+
+
+def iso_utc(dt):
+    """Aware datetime -> 'YYYY-MM-DDTHH:MM:SS.ffffffZ' (microseconds kept so ISO strings sort in time order)."""
+    return dt.astimezone(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+def parse_iso_utc(value):
+    """ISO text ('...Z' / '+00:00'), naive datetime (UTC) or aware datetime -> aware UTC datetime."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+    dt = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+    return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)

@@ -12,6 +12,12 @@ Parameters:
     Default: 30
     Description: How many days CloudWatch keeps Lambda and API Gateway logs.
     AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365]
+  NotificationEmail:
+    Type: String
+    Default: ''
+    Description: Optional e-mail address subscribed to the patient notification topic (demo / checkpoint). Leave empty for none.
+Conditions:
+  HasNotificationEmail: !Not [!Equals [!Ref NotificationEmail, '']]
 Resources:
   LambdaExecutionBasePolicy:
     Type: AWS::IAM::ManagedPolicy
@@ -28,6 +34,8 @@ Resources:
             Resource:
               - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/medislot-${Environment}-*:*'
               - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/medislot/${Environment}/lambda/*:*'
+          # IAM audit (Milestone 7): the only '*' resources in the project. X-Ray and the VPC network-interface
+          # actions do not support resource-level permissions, so AWS accepts no narrower resource for them.
           - Effect: Allow
             Action: [xray:PutTraceSegments, xray:PutTelemetryRecords]
             Resource: '*'
@@ -104,7 +112,7 @@ Resources:
             Statement:
               - {Effect: Allow, Action: [ssm:GetParameter], Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/medislot/${Environment}/auth/jwt-secret'}
               - {Effect: Allow, Action: [dynamodb:GetItem], Resource: !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/MediSlot-${Environment}-AuthTokens'}
-              - {Effect: Allow, Action: [kms:Decrypt], Resource: '*'}
+              - {Effect: Allow, Action: [kms:Decrypt], Resource: !Sub 'arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:key/*', Condition: {StringEquals: {'kms:ViaService': !Sub 'ssm.${AWS::Region}.amazonaws.com'}}}
   AuthenticationRole:
     Type: AWS::IAM::Role
     Properties:
@@ -118,7 +126,7 @@ Resources:
             Statement:
               - {Effect: Allow, Action: [ssm:GetParameter], Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/medislot/${Environment}/*'}
               - {Effect: Allow, Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem], Resource: !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/MediSlot-${Environment}-AuthTokens'}
-              - {Effect: Allow, Action: [kms:Decrypt], Resource: '*'}
+              - {Effect: Allow, Action: [kms:Decrypt], Resource: !Sub 'arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:key/*', Condition: {StringEquals: {'kms:ViaService': !Sub 'ssm.${AWS::Region}.amazonaws.com'}}}
   AuthenticationFunction:
     Type: AWS::Lambda::Function
     Properties:
@@ -171,7 +179,7 @@ Resources:
             Version: '2012-10-17'
             Statement:
               - {Effect: Allow, Action: [ssm:GetParameter], Resource: [!Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/medislot/${Environment}/db/*', !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/medislot/${Environment}/auth/jwt-secret']}
-              - {Effect: Allow, Action: [kms:Decrypt], Resource: '*'}
+              - {Effect: Allow, Action: [kms:Decrypt], Resource: !Sub 'arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:key/*', Condition: {StringEquals: {'kms:ViaService': !Sub 'ssm.${AWS::Region}.amazonaws.com'}}}
   RdsConnectionCheckFunction:
     Type: AWS::Lambda::Function
     Properties:
@@ -267,7 +275,8 @@ Resources:
                   - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/medislot/${Environment}/auth/jwt-secret'
               - Effect: Allow
                 Action: [kms:Decrypt]
-                Resource: '*'
+                Resource: !Sub 'arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:key/*'
+                Condition: {StringEquals: {'kms:ViaService': !Sub 'ssm.${AWS::Region}.amazonaws.com'}}
               - Effect: Allow
                 Action: [s3:PutObject]
                 Resource: !Sub 'arn:${AWS::Partition}:s3:::medislot-${Environment}-doctor-photos-${AWS::AccountId}-${AWS::Region}/doctors/*'
@@ -324,7 +333,8 @@ Resources:
                   - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/medislot/${Environment}/db/*'
               - Effect: Allow
                 Action: [kms:Decrypt]
-                Resource: '*'
+                Resource: !Sub 'arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:key/*'
+                Condition: {StringEquals: {'kms:ViaService': !Sub 'ssm.${AWS::Region}.amazonaws.com'}}
               - Effect: Allow
                 Action: [dynamodb:PutItem, dynamodb:UpdateItem]
                 Resource: !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/MediSlot-${Environment}-Slots'
@@ -406,7 +416,8 @@ Resources:
                 Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/medislot/${Environment}/db/*'
               - Effect: Allow
                 Action: [kms:Decrypt]
-                Resource: '*'
+                Resource: !Sub 'arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:key/*'
+                Condition: {StringEquals: {'kms:ViaService': !Sub 'ssm.${AWS::Region}.amazonaws.com'}}
               - Effect: Allow
                 Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem]
                 Resource: !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/MediSlot-${Environment}-AuthTokens'
@@ -459,7 +470,8 @@ Resources:
                 Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/medislot/${Environment}/db/*'
               - Effect: Allow
                 Action: [kms:Decrypt]
-                Resource: '*'
+                Resource: !Sub 'arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:key/*'
+                Condition: {StringEquals: {'kms:ViaService': !Sub 'ssm.${AWS::Region}.amazonaws.com'}}
               - Effect: Allow
                 Action: [dynamodb:Query]
                 Resource: !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/MediSlot-${Environment}-Slots'
@@ -517,7 +529,7 @@ Resources:
       EventBusName: !Ref BookingEventBus
       State: ENABLED
       EventPattern:
-        source: [medislot.booking]
+        source: [{prefix: 'medislot.'}]
       Targets:
         - Id: booking-events-log
           Arn: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/events/medislot-${Environment}-booking'
@@ -544,7 +556,8 @@ Resources:
                   - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/medislot/${Environment}/booking/*'
               - Effect: Allow
                 Action: [kms:Decrypt]
-                Resource: '*'
+                Resource: !Sub 'arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:key/*'
+                Condition: {StringEquals: {'kms:ViaService': !Sub 'ssm.${AWS::Region}.amazonaws.com'}}
               # Slot seat counters: read (consistent) and conditional updates only. No Put/Delete on slots.
               - Effect: Allow
                 Action: [dynamodb:GetItem, dynamodb:UpdateItem]
@@ -555,6 +568,20 @@ Resources:
               - Effect: Allow
                 Action: [events:PutEvents]
                 Resource: !GetAtt BookingEventBus.Arn
+              # Milestone 6: start the reschedule saga and wait for its result.
+              - Effect: Allow
+                Action: [states:StartExecution]
+                Resource: !Sub 'arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:medislot-${Environment}-reschedule-saga'
+              - Effect: Allow
+                Action: [states:DescribeExecution]
+                Resource: !Sub 'arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:execution:medislot-${Environment}-reschedule-saga:*'
+              # Milestone 6: accepting a hold offer (offer item + the waitlist entry it came from).
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:UpdateItem]
+                Resource: !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/MediSlot-${Environment}-Offers'
+              - Effect: Allow
+                Action: [dynamodb:UpdateItem]
+                Resource: !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/MediSlot-${Environment}-WaitlistEntries'
   BookingFunction:
     Type: AWS::Lambda::Function
     Properties:
@@ -576,6 +603,10 @@ Resources:
           EVENT_BUS_NAME: !Ref BookingEventBus
           SLOTS_TABLE: !Sub 'MediSlot-${Environment}-Slots'
           IDEMPOTENCY_TABLE: !Sub 'MediSlot-${Environment}-Idempotency'
+          OFFERS_TABLE: !Sub 'MediSlot-${Environment}-Offers'
+          WAITLIST_TABLE: !Sub 'MediSlot-${Environment}-WaitlistEntries'
+          # Built from the name (not !Ref) because the state machine itself references this function's ARN.
+          RESCHEDULE_STATE_MACHINE_ARN: !Sub 'arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:medislot-${Environment}-reschedule-saga'
       VpcConfig:
         SecurityGroupIds: [!ImportValue {Fn::Sub: 'MediSlot-${Environment}-LambdaSecurityGroupId'}]
         SubnetIds:
@@ -625,6 +656,652 @@ Resources:
          {"type":"metric","x":12,"y":6,"width":12,"height":6,"properties":{"title":"Things that must stay at zero","region":"${AWS::Region}","stat":"Sum","period":300,"view":"timeSeries",
           "metrics":[["MediSlot","EventPublishFailures","Environment","${Environment}"],["MediSlot","SeatReleaseFailures","Environment","${Environment}"],["MediSlot","IdempotentReplays","Environment","${Environment}"]]}}
         ]}
+  # ==============================================================================================================
+  # Milestone 6: reschedule saga (Step Functions), waitlist + hold offers, notifications (EventBridge -> SQS -> Lambda
+  # -> SNS, one DLQ per consumer), reminders and the no-show sweeper.
+  # ==============================================================================================================
+  WaitlistLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/medislot/${Environment}/lambda/waitlist'
+      RetentionInDays: !Ref LogRetentionDays
+  NotificationsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/medislot/${Environment}/lambda/notifications'
+      RetentionInDays: !Ref LogRetentionDays
+  RemindersLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/medislot/${Environment}/lambda/reminders'
+      RetentionInDays: !Ref LogRetentionDays
+
+  # ---- SNS: every patient notification is published here (message attributes eventType / patientId / audience,
+  # so a subscriber - email for the demo, an SMS/e-mail fan-out service in production - can filter).
+  PatientNotificationsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub 'medislot-${Environment}-patient-notifications'
+      DisplayName: MediSlot
+      KmsMasterKeyId: alias/aws/sns
+  PatientNotificationsEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasNotificationEmail
+    Properties:
+      TopicArn: !Ref PatientNotificationsTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # ---- SQS buffers between EventBridge and each consumer, each with its own dead-letter queue.
+  NotificationsDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub 'medislot-${Environment}-notifications-dlq'
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+  NotificationsQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub 'medislot-${Environment}-notifications'
+      VisibilityTimeout: 180                     # 6 x the consumer timeout (AWS guidance for Lambda event sources)
+      MessageRetentionPeriod: 345600
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt NotificationsDLQ.Arn
+        maxReceiveCount: 5
+  WaitlistEventsDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub 'medislot-${Environment}-waitlist-events-dlq'
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+  WaitlistEventsQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub 'medislot-${Environment}-waitlist-events'
+      VisibilityTimeout: 180
+      MessageRetentionPeriod: 345600
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt WaitlistEventsDLQ.Arn
+        maxReceiveCount: 5
+
+  # ---- EventBridge rules: the eight notification events, and the seat events the waitlist reacts to.
+  NotificationEventsRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub 'medislot-${Environment}-notification-events'
+      Description: Patient notifications (booked, cancelled, rescheduled, hold offered / expired, 24 h and 2 h reminders).
+      EventBusName: !Ref BookingEventBus
+      State: ENABLED
+      EventPattern:
+        source: [{prefix: 'medislot.'}]
+        detail-type: [AppointmentBooked, AppointmentCancelled, AppointmentRescheduled, HoldOfferIssued, HoldOfferExpired,
+                      AppointmentReminder24h, AppointmentReminder2h]
+      Targets:
+        - {Id: notifications-queue, Arn: !GetAtt NotificationsQueue.Arn, RetryPolicy: {MaximumRetryAttempts: 20, MaximumEventAgeInSeconds: 86400}}
+  NoShowNotificationRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub 'medislot-${Environment}-no-show-notifications'
+      Description: The eighth notification - an appointment marked NO_SHOW (by the doctor or the no-show sweeper).
+      EventBusName: !Ref BookingEventBus
+      State: ENABLED
+      EventPattern:
+        source: [{prefix: 'medislot.'}]
+        detail-type: [AppointmentStatusChanged]
+        detail: {status: [NO_SHOW]}
+      Targets:
+        - {Id: notifications-queue, Arn: !GetAtt NotificationsQueue.Arn, RetryPolicy: {MaximumRetryAttempts: 20, MaximumEventAgeInSeconds: 86400}}
+  WaitlistEventsRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub 'medislot-${Environment}-waitlist-events'
+      Description: A freed seat is offered to the first waitlisted patient; a cancelled slot withdraws its offers.
+      EventBusName: !Ref BookingEventBus
+      State: ENABLED
+      EventPattern:
+        source: [medislot.booking]
+        detail-type: [SlotSeatFreed, SlotCancelled]
+      Targets:
+        - {Id: waitlist-queue, Arn: !GetAtt WaitlistEventsQueue.Arn, RetryPolicy: {MaximumRetryAttempts: 20, MaximumEventAgeInSeconds: 86400}}
+  NotificationsQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref NotificationsQueue]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: events.amazonaws.com}
+            Action: sqs:SendMessage
+            Resource: !GetAtt NotificationsQueue.Arn
+            Condition: {ArnEquals: {'aws:SourceArn': [!GetAtt NotificationEventsRule.Arn, !GetAtt NoShowNotificationRule.Arn]}}
+  WaitlistEventsQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref WaitlistEventsQueue]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: events.amazonaws.com}
+            Action: sqs:SendMessage
+            Resource: !GetAtt WaitlistEventsQueue.Arn
+            Condition: {ArnEquals: {'aws:SourceArn': !GetAtt WaitlistEventsRule.Arn}}
+
+  # ---- Waitlist Lambda (API + SQS consumer + expiry sweeper). In the VPC: it reads RDS to validate a join.
+  WaitlistRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'MediSlot-${Environment}-WaitlistRole'
+      AssumeRolePolicyDocument: {Version: '2012-10-17', Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: sts:AssumeRole}]}
+      ManagedPolicyArns: [!Ref LambdaExecutionBasePolicy]
+      Policies:
+        - PolicyName: WaitlistRuntimeAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [ssm:GetParameter, ssm:GetParameters]
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/medislot/${Environment}/db/*'
+                  - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/medislot/${Environment}/waitlist/*'
+                  - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/medislot/${Environment}/booking/max-per-doctor-per-day'
+              - Effect: Allow
+                Action: [kms:Decrypt]
+                Resource: !Sub 'arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:key/*'
+                Condition: {StringEquals: {'kms:ViaService': !Sub 'ssm.${AWS::Region}.amazonaws.com'}}
+              # Slot seat counters: holds only ever change held_count (conditional updates, never Put/Delete).
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:UpdateItem, dynamodb:Query]
+                Resource: !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/MediSlot-${Environment}-Slots'
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:UpdateItem, dynamodb:Query]
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/MediSlot-${Environment}-WaitlistEntries'
+                  - !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/MediSlot-${Environment}-WaitlistEntries/index/GSI_Patient'
+                  - !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/MediSlot-${Environment}-Offers'
+                  - !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/MediSlot-${Environment}-Offers/index/GSI_Status'
+              - Effect: Allow
+                Action: [events:PutEvents]
+                Resource: !GetAtt BookingEventBus.Arn
+              - Effect: Allow
+                Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:GetQueueAttributes, sqs:ChangeMessageVisibility]
+                Resource: !GetAtt WaitlistEventsQueue.Arn
+  WaitlistFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'medislot-${Environment}-waitlist'
+      Description: Waitlists per doctor-day, exclusive hold offers on freed seats, expiry sweeper.
+      LoggingConfig: {LogFormat: Text, LogGroup: !Ref WaitlistLogGroup}
+      Runtime: python3.12
+      Handler: lambda_function.handler
+      Role: !GetAtt WaitlistRole.Arn
+      Timeout: 30
+      MemorySize: 512
+      TracingConfig: {Mode: Active}
+      Code: {S3Bucket: !Ref ArtifactBucket, S3Key: !Sub '${ArtifactPrefix}/waitlist.zip'}
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          EVENT_BUS_NAME: !Ref BookingEventBus
+          SLOTS_TABLE: !Sub 'MediSlot-${Environment}-Slots'
+          WAITLIST_TABLE: !Sub 'MediSlot-${Environment}-WaitlistEntries'
+          OFFERS_TABLE: !Sub 'MediSlot-${Environment}-Offers'
+      VpcConfig:
+        SecurityGroupIds: [!ImportValue {Fn::Sub: 'MediSlot-${Environment}-LambdaSecurityGroupId'}]
+        SubnetIds:
+          - !ImportValue {Fn::Sub: 'MediSlot-${Environment}-PrivateSubnet1Id'}
+          - !ImportValue {Fn::Sub: 'MediSlot-${Environment}-PrivateSubnet2Id'}
+  WaitlistEventsMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt WaitlistEventsQueue.Arn
+      FunctionName: !Ref WaitlistFunction
+      BatchSize: 10
+      MaximumBatchingWindowInSeconds: 1
+      FunctionResponseTypes: [ReportBatchItemFailures]
+  WaitlistApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref WaitlistFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*/*/waitlists*'
+  WaitlistDeclineInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref WaitlistFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*/POST/offers/*/decline'
+  BookingOfferAcceptInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref BookingFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*/POST/offers/*/accept'
+
+  # ---- Notification dispatcher. Outside the VPC on purpose: it only needs DynamoDB (dispatch log) and SNS.
+  NotificationsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'MediSlot-${Environment}-NotificationsRole'
+      AssumeRolePolicyDocument: {Version: '2012-10-17', Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: sts:AssumeRole}]}
+      ManagedPolicyArns: [!Ref LambdaExecutionBasePolicy]
+      Policies:
+        - PolicyName: NotificationsRuntimeAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem]
+                Resource: !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/MediSlot-${Environment}-NotificationLog'
+              - Effect: Allow
+                Action: [sns:Publish]
+                Resource: !Ref PatientNotificationsTopic
+              - Effect: Allow
+                Action: [kms:GenerateDataKey, kms:Decrypt]
+                Resource: !Sub 'arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:key/*'
+                Condition: {StringEquals: {'kms:ViaService': !Sub 'sns.${AWS::Region}.amazonaws.com'}}
+              - Effect: Allow
+                Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:GetQueueAttributes, sqs:ChangeMessageVisibility]
+                Resource: !GetAtt NotificationsQueue.Arn
+  NotificationsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'medislot-${Environment}-notifications'
+      Description: Exactly-once patient notifications - SQS consumer, DynamoDB dispatch log, SNS delivery.
+      LoggingConfig: {LogFormat: Text, LogGroup: !Ref NotificationsLogGroup}
+      Runtime: python3.12
+      Handler: lambda_function.handler
+      Role: !GetAtt NotificationsRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      TracingConfig: {Mode: Active}
+      Code: {S3Bucket: !Ref ArtifactBucket, S3Key: !Sub '${ArtifactPrefix}/notifications.zip'}
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          NOTIFICATION_LOG_TABLE: !Sub 'MediSlot-${Environment}-NotificationLog'
+          PATIENT_TOPIC_ARN: !Ref PatientNotificationsTopic
+  NotificationsMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt NotificationsQueue.Arn
+      FunctionName: !Ref NotificationsFunction
+      BatchSize: 10
+      MaximumBatchingWindowInSeconds: 1
+      FunctionResponseTypes: [ReportBatchItemFailures]
+
+  # ---- Reminder dispatcher + no-show sweeper (RDS reads/updates, publishes to the bus).
+  RemindersRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'MediSlot-${Environment}-RemindersRole'
+      AssumeRolePolicyDocument: {Version: '2012-10-17', Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: sts:AssumeRole}]}
+      ManagedPolicyArns: [!Ref LambdaExecutionBasePolicy]
+      Policies:
+        - PolicyName: RemindersRuntimeAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [ssm:GetParameter]
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/medislot/${Environment}/db/*'
+                  - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/medislot/${Environment}/booking/no-show-grace-hours'
+              - Effect: Allow
+                Action: [kms:Decrypt]
+                Resource: !Sub 'arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:key/*'
+                Condition: {StringEquals: {'kms:ViaService': !Sub 'ssm.${AWS::Region}.amazonaws.com'}}
+              - Effect: Allow
+                Action: [events:PutEvents]
+                Resource: !GetAtt BookingEventBus.Arn
+  RemindersFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'medislot-${Environment}-reminders'
+      Description: 24 h and 2 h appointment reminders, and the no-show sweeper.
+      LoggingConfig: {LogFormat: Text, LogGroup: !Ref RemindersLogGroup}
+      Runtime: python3.12
+      Handler: lambda_function.handler
+      Role: !GetAtt RemindersRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      TracingConfig: {Mode: Active}
+      Code: {S3Bucket: !Ref ArtifactBucket, S3Key: !Sub '${ArtifactPrefix}/reminders.zip'}
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          EVENT_BUS_NAME: !Ref BookingEventBus
+      VpcConfig:
+        SecurityGroupIds: [!ImportValue {Fn::Sub: 'MediSlot-${Environment}-LambdaSecurityGroupId'}]
+        SubnetIds:
+          - !ImportValue {Fn::Sub: 'MediSlot-${Environment}-PrivateSubnet1Id'}
+          - !ImportValue {Fn::Sub: 'MediSlot-${Environment}-PrivateSubnet2Id'}
+
+  # ---- EventBridge Scheduler: offer expiry every minute, reminders every 15 minutes, no-show sweep every 30 minutes.
+  Milestone6ScheduleRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'MediSlot-${Environment}-M6ScheduleRole'
+      AssumeRolePolicyDocument: {Version: '2012-10-17', Statement: [{Effect: Allow, Principal: {Service: scheduler.amazonaws.com}, Action: sts:AssumeRole}]}
+      Policies:
+        - PolicyName: InvokeScheduledJobs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [lambda:InvokeFunction]
+                Resource: [!GetAtt WaitlistFunction.Arn, !GetAtt RemindersFunction.Arn]
+  OfferExpirySchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub 'medislot-${Environment}-offer-expiry'
+      Description: Expire hold offers and pass the seat to the next patient in line.
+      State: ENABLED
+      ScheduleExpression: rate(1 minute)
+      FlexibleTimeWindow: {Mode: 'OFF'}
+      Target: {Arn: !GetAtt WaitlistFunction.Arn, RoleArn: !GetAtt Milestone6ScheduleRole.Arn, Input: '{"action":"sweep"}'}
+  ReminderSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub 'medislot-${Environment}-reminders'
+      Description: Publish 24 h and 2 h appointment reminders (deduplicated by the notification dispatch log).
+      State: ENABLED
+      ScheduleExpression: rate(15 minutes)
+      FlexibleTimeWindow: {Mode: 'OFF'}
+      Target: {Arn: !GetAtt RemindersFunction.Arn, RoleArn: !GetAtt Milestone6ScheduleRole.Arn, Input: '{"action":"reminders"}'}
+  NoShowSweepSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub 'medislot-${Environment}-no-show-sweep'
+      Description: Mark CONFIRMED appointments that ended long ago without an outcome as NO_SHOW.
+      State: ENABLED
+      ScheduleExpression: rate(30 minutes)
+      FlexibleTimeWindow: {Mode: 'OFF'}
+      Target: {Arn: !GetAtt RemindersFunction.Arn, RoleArn: !GetAtt Milestone6ScheduleRole.Arn, Input: '{"action":"noShowSweep"}'}
+
+  # ---- Reschedule saga. STANDARD workflow so every execution (including the compensation branch) keeps a full,
+  # reviewable execution history. Each Task calls the booking Lambda with {"action": "<step>", "input": <state>}.
+  RescheduleStateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'MediSlot-${Environment}-RescheduleSagaRole'
+      AssumeRolePolicyDocument: {Version: '2012-10-17', Statement: [{Effect: Allow, Principal: {Service: states.amazonaws.com}, Action: sts:AssumeRole}]}
+      Policies:
+        - PolicyName: RescheduleSagaAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [lambda:InvokeFunction]
+                Resource: !GetAtt BookingFunction.Arn
+              # X-Ray has no resource-level permissions: '*' is the only valid resource for these actions.
+              - Effect: Allow
+                Action: [xray:PutTraceSegments, xray:PutTelemetryRecords, xray:GetSamplingRules, xray:GetSamplingTargets]
+                Resource: '*'
+  RescheduleStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub 'medislot-${Environment}-reschedule-saga'
+      StateMachineType: STANDARD
+      RoleArn: !GetAtt RescheduleStateMachineRole.Arn
+      TracingConfiguration: {Enabled: true}
+      DefinitionSubstitutions:
+        BookingFunctionArn: !GetAtt BookingFunction.Arn
+      Definition:
+        Comment: MediSlot reschedule saga - claim the new seat, move the appointment, release the old seat; on any failure after the claim, move it back and give the new seat back.
+        StartAt: Validate
+        States:
+          Validate:
+            Type: Task
+            Resource: '${BookingFunctionArn}'
+            Parameters: {action: rescheduleValidate, input.$: '$'}
+            ResultPath: $.validate
+            Retry:
+              - {ErrorEquals: [Lambda.ServiceException, Lambda.AWSLambdaException, Lambda.SdkClientException, Lambda.TooManyRequestsException, OperationalError, InterfaceError, ClientError], IntervalSeconds: 1, MaxAttempts: 3, BackoffRate: 2}
+            Catch:
+              - {ErrorEquals: [States.ALL], ResultPath: $.error, Next: RecordFailure}
+            Next: IsValid
+          IsValid:
+            Type: Choice
+            Choices:
+              - {Variable: $.validate.ok, BooleanEquals: true, Next: ClaimTargetSeat}
+            Default: RecordFailure
+          ClaimTargetSeat:
+            Type: Task
+            Resource: '${BookingFunctionArn}'
+            Parameters: {action: rescheduleClaimTarget, input.$: '$'}
+            ResultPath: $.claim
+            Retry:
+              - {ErrorEquals: [Lambda.ServiceException, Lambda.AWSLambdaException, Lambda.SdkClientException, Lambda.TooManyRequestsException, ClientError], IntervalSeconds: 1, MaxAttempts: 3, BackoffRate: 2}
+            Catch:
+              - {ErrorEquals: [States.ALL], ResultPath: $.error, Next: ClaimFailed}
+            Next: IsClaimed
+          ClaimFailed:
+            Type: Pass
+            Result: CLAIM_TARGET
+            ResultPath: $.failedStep
+            Next: CompensateRevertMove
+          IsClaimed:
+            Type: Choice
+            Choices:
+              - {Variable: $.claim.ok, BooleanEquals: true, Next: MoveAppointment}
+            Default: RecordFailure
+          MoveAppointment:
+            Type: Task
+            Resource: '${BookingFunctionArn}'
+            Parameters: {action: rescheduleMove, input.$: '$'}
+            ResultPath: $.move
+            Retry:
+              - {ErrorEquals: [Lambda.ServiceException, Lambda.AWSLambdaException, Lambda.SdkClientException, Lambda.TooManyRequestsException, OperationalError, InterfaceError, ClientError], IntervalSeconds: 1, MaxAttempts: 3, BackoffRate: 2}
+            Catch:
+              - {ErrorEquals: [States.ALL], ResultPath: $.error, Next: MoveFailed}
+            Next: IsMoved
+          IsMoved:
+            Type: Choice
+            Choices:
+              - {Variable: $.move.ok, BooleanEquals: true, Next: ReleaseOriginalSeat}
+            Default: MoveFailed
+          MoveFailed:
+            Type: Pass
+            Result: MOVE_APPOINTMENT
+            ResultPath: $.failedStep
+            Next: CompensateRevertMove
+          ReleaseOriginalSeat:
+            Type: Task
+            Resource: '${BookingFunctionArn}'
+            Parameters: {action: rescheduleReleaseOriginal, input.$: '$'}
+            ResultPath: $.release
+            Retry:
+              - {ErrorEquals: [SeatReleaseError], IntervalSeconds: 1, MaxAttempts: 2, BackoffRate: 2}
+              - {ErrorEquals: [Lambda.ServiceException, Lambda.AWSLambdaException, Lambda.SdkClientException, Lambda.TooManyRequestsException, ClientError], IntervalSeconds: 1, MaxAttempts: 3, BackoffRate: 2}
+            Catch:
+              - {ErrorEquals: [States.ALL], ResultPath: $.error, Next: ReleaseFailed}
+            Next: Finalize
+          ReleaseFailed:
+            Type: Pass
+            Result: RELEASE_ORIGINAL
+            ResultPath: $.failedStep
+            Next: CompensateRevertMove
+          Finalize:
+            Type: Task
+            Resource: '${BookingFunctionArn}'
+            Parameters: {action: rescheduleFinalize, input.$: '$'}
+            ResultPath: $.finalize
+            Retry:
+              - {ErrorEquals: [States.ALL], IntervalSeconds: 1, MaxAttempts: 3, BackoffRate: 2}
+            Catch:
+              - {ErrorEquals: [States.ALL], ResultPath: $.finalizeError, Next: Rescheduled}
+            Next: Rescheduled
+          Rescheduled:
+            Type: Succeed
+          CompensateRevertMove:
+            Type: Task
+            Resource: '${BookingFunctionArn}'
+            Parameters: {action: rescheduleRevertMove, input.$: '$'}
+            ResultPath: $.revert
+            Retry:
+              - {ErrorEquals: [States.ALL], IntervalSeconds: 2, MaxAttempts: 5, BackoffRate: 2}
+            Catch:
+              - {ErrorEquals: [States.ALL], ResultPath: $.compensationError, Next: CompensationFailed}
+            Next: AfterRevert
+          AfterRevert:
+            Type: Choice
+            Choices:
+              - {Variable: $.revert.outcome, StringEquals: completed_forward, Next: Finalize}
+              - {Variable: $.revert.releaseTarget, BooleanEquals: true, Next: CompensateReleaseTargetSeat}
+            Default: RecordCompensated
+          CompensateReleaseTargetSeat:
+            Type: Task
+            Resource: '${BookingFunctionArn}'
+            Parameters: {action: rescheduleReleaseTarget, input.$: '$'}
+            ResultPath: $.releaseTarget
+            Retry:
+              - {ErrorEquals: [States.ALL], IntervalSeconds: 2, MaxAttempts: 5, BackoffRate: 2}
+            Catch:
+              - {ErrorEquals: [States.ALL], ResultPath: $.compensationError, Next: CompensationFailed}
+            Next: RecordCompensated
+          RecordCompensated:
+            Type: Task
+            Resource: '${BookingFunctionArn}'
+            Parameters: {action: rescheduleRecordFailure, input.$: '$'}
+            ResultPath: $.recorded
+            Retry:
+              - {ErrorEquals: [States.ALL], IntervalSeconds: 1, MaxAttempts: 3, BackoffRate: 2}
+            Catch:
+              - {ErrorEquals: [States.ALL], ResultPath: $.recordError, Next: Compensated}
+            Next: Compensated
+          Compensated:
+            Type: Fail
+            Error: RescheduleCompensated
+            Cause: The appointment could not be moved. It was kept at its original time and the new seat was given back.
+          RecordFailure:
+            Type: Task
+            Resource: '${BookingFunctionArn}'
+            Parameters: {action: rescheduleRecordFailure, input.$: '$'}
+            ResultPath: $.recorded
+            Retry:
+              - {ErrorEquals: [States.ALL], IntervalSeconds: 1, MaxAttempts: 3, BackoffRate: 2}
+            Catch:
+              - {ErrorEquals: [States.ALL], ResultPath: $.recordError, Next: Rejected}
+            Next: Rejected
+          Rejected:
+            Type: Succeed
+          CompensationFailed:
+            Type: Task
+            Resource: '${BookingFunctionArn}'
+            Parameters: {action: rescheduleCompensationFailed, input.$: '$'}
+            ResultPath: $.recorded
+            Retry:
+              - {ErrorEquals: [States.ALL], IntervalSeconds: 1, MaxAttempts: 2, BackoffRate: 2}
+            Catch:
+              - {ErrorEquals: [States.ALL], ResultPath: $.recordError, Next: CompensationFailedEnd}
+            Next: CompensationFailedEnd
+          CompensationFailedEnd:
+            Type: Fail
+            Error: RescheduleCompensationFailed
+            Cause: Compensation could not finish - the appointment needs a manual check (SagaCompensationFailures alarm).
+
+  # ---- Milestone 6 API routes (same REST API, stage and JWT authorizer).
+  AppointmentRescheduleResource:
+    Type: AWS::ApiGateway::Resource
+    Properties: {RestApiId: !Ref RestApi, ParentId: !Ref AppointmentIdResource, PathPart: 'reschedule'}
+  WaitlistsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties: {RestApiId: !Ref RestApi, ParentId: !GetAtt RestApi.RootResourceId, PathPart: 'waitlists'}
+  WaitlistIdResource:
+    Type: AWS::ApiGateway::Resource
+    Properties: {RestApiId: !Ref RestApi, ParentId: !Ref WaitlistsResource, PathPart: '{waitlistId}'}
+  OffersResource:
+    Type: AWS::ApiGateway::Resource
+    Properties: {RestApiId: !Ref RestApi, ParentId: !GetAtt RestApi.RootResourceId, PathPart: 'offers'}
+  OfferIdResource:
+    Type: AWS::ApiGateway::Resource
+    Properties: {RestApiId: !Ref RestApi, ParentId: !Ref OffersResource, PathPart: '{offerId}'}
+  OfferAcceptResource:
+    Type: AWS::ApiGateway::Resource
+    Properties: {RestApiId: !Ref RestApi, ParentId: !Ref OfferIdResource, PathPart: 'accept'}
+  OfferDeclineResource:
+    Type: AWS::ApiGateway::Resource
+    Properties: {RestApiId: !Ref RestApi, ParentId: !Ref OfferIdResource, PathPart: 'decline'}
+  AppointmentReschedulePostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref AppointmentRescheduleResource
+      HttpMethod: POST
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BookingFunction.Arn}/invocations'
+  OfferAcceptPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref OfferAcceptResource
+      HttpMethod: POST
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BookingFunction.Arn}/invocations'
+  OfferDeclinePostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref OfferDeclineResource
+      HttpMethod: POST
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${WaitlistFunction.Arn}/invocations'
+  WaitlistsGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref WaitlistsResource
+      HttpMethod: GET
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${WaitlistFunction.Arn}/invocations'
+  WaitlistsPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref WaitlistsResource
+      HttpMethod: POST
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${WaitlistFunction.Arn}/invocations'
+  WaitlistIdDeleteMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref WaitlistIdResource
+      HttpMethod: DELETE
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${WaitlistFunction.Arn}/invocations'
+
   # ---- Doctor dashboard endpoints: every path and HTTP method is its own API Gateway method in this
   # same REST API (same stage, same authorizer as /auth/*, /doctor and /patient). All of them
   # invoke the doctor-domain Lambda, which checks that the caller has the DOCTOR role.
@@ -1384,9 +2061,15 @@ Resources:
     Properties: {FunctionName: !Ref ProtectedFunction, Action: lambda:InvokeFunction, Principal: apigateway.amazonaws.com, SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*/GET/*'}
   # NOTE: API Gateway only publishes a NEW snapshot when this resource is REPLACED. Changing its Description does not.
   # So the logical ID carries the milestone: rename it (ApiDeploymentM5, ...) whenever routes are added or changed.
-  ApiDeploymentM6Blackout:
+  ApiDeploymentM7:
     Type: AWS::ApiGateway::Deployment
     DependsOn:
+      - AppointmentReschedulePostMethod
+      - OfferAcceptPostMethod
+      - OfferDeclinePostMethod
+      - WaitlistsGetMethod
+      - WaitlistsPostMethod
+      - WaitlistIdDeleteMethod
       - PatientsMeDependentsGetMethod
       - PatientsMeDependentsPostMethod
       - PatientsMeDependentIdPatchMethod
@@ -1442,7 +2125,7 @@ Resources:
     Type: AWS::ApiGateway::Stage
     Properties:
       RestApiId: !Ref RestApi
-      DeploymentId: !Ref ApiDeploymentM6Blackout
+      DeploymentId: !Ref ApiDeploymentM7
       StageName: !Ref Environment
       TracingEnabled: true
       AccessLogSetting:
@@ -1481,6 +2164,19 @@ Outputs:
   BookingMetricsDashboardName:
     Description: CloudWatch dashboard with BookingConflictRetries and CancellationsByTier.
     Value: !Ref BookingMetricsDashboard
+  WaitlistFunctionName: {Value: !Ref WaitlistFunction}
+  NotificationsFunctionName: {Value: !Ref NotificationsFunction}
+  RemindersFunctionName: {Value: !Ref RemindersFunction}
+  RescheduleStateMachineArn:
+    Description: The reschedule saga (Step Functions STANDARD - open it to review execution history and compensation).
+    Value: !Ref RescheduleStateMachine
+  PatientNotificationsTopicArn:
+    Value: !Ref PatientNotificationsTopic
+  NotificationsQueueName: {Value: !GetAtt NotificationsQueue.QueueName}
+  NotificationsDLQName: {Value: !GetAtt NotificationsDLQ.QueueName}
+  WaitlistEventsQueueName: {Value: !GetAtt WaitlistEventsQueue.QueueName}
+  WaitlistEventsDLQName: {Value: !GetAtt WaitlistEventsDLQ.QueueName}
+  RestApiId: {Value: !Ref RestApi}
   AuthenticationFunctionName: {Value: !Ref AuthenticationFunction}
   AuthorizerFunctionName: {Value: !Ref AuthorizerFunction}
   RdsConnectionCheckFunctionName: {Value: !Ref RdsConnectionCheckFunction}
